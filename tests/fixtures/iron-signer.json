@@ -1,0 +1,4 @@
+{
+  "source": "/api/anime/|1700000000|01020304",
+  "expectedSignature": "b435b80abdedc7ebaaa6e61372623f9478ad7d61fad03758a7e30fdce76cad6e"
+}

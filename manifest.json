@@ -1,0 +1,8 @@
+{
+  "id": "oscar",
+  "name": "OscarTV",
+  "version": "1.0.0",
+  "filename": "plugins/oscartv.js",
+  "apiVersion": 1,
+  "capabilities": ["home", "search", "details", "streams"]
+}

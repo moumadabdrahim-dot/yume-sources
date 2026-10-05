@@ -1,28 +1,34 @@
 # OscarTV Yume plugin
 
-This independent repository contains the single-file OscarTV plugin for Yume Plugin API v1. Production runs in Yume's QuickJS runtime and uses its built-in `fetch`, `CryptoJS`, and Cheerio-compatible bridge. Node.js is used only for local tests.
+This repository publishes the OscarTV plugin for Yume Plugin API v2. Production executes the single-file plugin in Yume's QuickJS runtime using its built-in `fetch`, `CryptoJS`, and Cheerio-compatible bridge. Node.js is used only for local and live smoke tests.
 
 ## Runtime files
 
-- `manifest.json` — the single-plugin manifest shape supported by Yume API v1.
-- `plugins/oscartv.js` — self-contained runtime plugin.
-- `tests/` — local deterministic tests and signer vector.
+- `manifest.json` — v2 manifest with independent movies, series, and anime catalogs.
+- `plugins/oscartv-v2.js` — self-contained API v2 runtime plugin.
+- `plugins/oscartv.js` — retained API v1 rollout file for clients with a cached old manifest.
+- `tests/` — deterministic API mapping/signer tests, live smoke, and the signer vector.
 
-## Observed Oscar API contract (read-only CloudStream reference)
+## Verified API contract
 
 Base/image host: `https://ostvapp.cam`.
 
-- Home/search catalogs: `GET /api/movies/`, `/api/series/`, `/api/anime/` with `page`, `limit`, and optional `search`.
+- Catalogs: `GET /api/movies/`, `/api/series/`, `/api/anime/` with `page`, `limit`, and optional `search`. Each Yume catalog request calls exactly one matching endpoint.
 - Movie details and embedded watch links: `GET /api/movies/show.php?id=…`.
 - Series details: `GET /api/series/show.php?id=…`; seasons: `/api/seasons/?series_id=…`; episode pages: `/api/episodes/?season_id=…&per_page=100&page=…`.
 - Anime details (including embedded seasons): `/api/anime/show.php?id=…`; episode pages: `/api/anime/episodes/?season_id=…&per_page=100&page=…`.
 - Episode links: series `/api/episodes/show.php?id=…`, then `/api/watch_links/?episode_id=…`; anime `/api/anime/episodes/show.php?id=…`.
-- Iron request signature: HMAC-SHA256 over `rawPath|unixTimestamp|nonce`; derived key and constants reproduce the reference implementation's deterministic vector. API requests use `okhttp/4.12.0` and the Iron headers.
+- Iron signature: HMAC-SHA256 over `rawPath|unixTimestamp|nonce`; key derivation and constants are verified against `tests/fixtures/iron-signer.json`. API requests use `okhttp/4.12.0` and the Iron headers.
 
-The reference resolver delegates arbitrary hosts to CloudStream's dynamic extractor system; the old source does not enumerate a stable host list. This plugin intentionally has only bounded Oscar-specific handling: direct media URLs, SeriesMP4 iframe wrappers, explicit HTML media elements, and Yandex direct/redirect media when the returned URL or MIME identifies playable media. It does not include CloudStream or a generic extractor framework. Unknown third-party embed hosts can therefore remain unresolved.
+Catalog cursors are Oscar's positive numeric page numbers encoded as strings. The host treats them as opaque and only the plugin decodes them. Metadata includes only source-provided titles, posters, banner, release year, rating, story, genres, and native IDs; no TMDB lookup or inferred badges are used.
 
-Oscar's current network/API availability must be verified through the live QuickJS-on-device test; local unit tests do not claim live service success.
+The old CloudStream resolver delegates arbitrary hosts to a dynamic extractor system and does not enumerate a stable host list. This plugin only handles direct media, SeriesMP4 iframe wrappers, explicit HTML media nodes, and Yandex direct/redirect media when the final URL or MIME identifies playable media. No CloudStream dependency or generic extractor framework is included; unknown embed hosts can remain unresolved.
 
-## Local tests
+The v1 file remains available during rollout. The v2 live service and physical-device behavior must be verified independently; unit tests do not claim production API success.
 
-Run `node --test tests/oscartv.test.cjs` from this directory.
+## Tests
+
+From this directory:
+
+- `node --test tests/oscartv.test.cjs tests/oscartv-v2.test.cjs`
+- `node tests/live-smoke.cjs` (bounded requests to the live API)

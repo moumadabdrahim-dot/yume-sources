@@ -1,8 +1,34 @@
 {
   "id": "oscar",
   "name": "OscarTV",
-  "version": "1.0.0",
-  "filename": "plugins/oscartv.js",
-  "apiVersion": 1,
-  "capabilities": ["home", "search", "details", "streams"]
+  "version": "2.0.0",
+  "filename": "plugins/oscartv-v2.js",
+  "apiVersion": 2,
+  "capabilities": ["details", "streams"],
+  "catalogs": [
+    {
+      "id": "movies",
+      "type": "movie",
+      "title": "أحدث الأفلام",
+      "capabilities": ["home", "browse", "search", "pagination"],
+      "filters": [],
+      "presentation": { "posterShape": "portrait" }
+    },
+    {
+      "id": "series",
+      "type": "series",
+      "title": "أحدث المسلسلات",
+      "capabilities": ["home", "browse", "search", "pagination"],
+      "filters": [],
+      "presentation": { "posterShape": "portrait" }
+    },
+    {
+      "id": "anime",
+      "type": "anime",
+      "title": "أحدث الأنمي",
+      "capabilities": ["home", "browse", "search", "pagination"],
+      "filters": [],
+      "presentation": { "posterShape": "portrait" }
+    }
+  ]
 }

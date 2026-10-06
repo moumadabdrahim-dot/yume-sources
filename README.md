@@ -20,7 +20,7 @@ Base/image host: `https://ostvapp.cam`.
 - Episode links: series `/api/episodes/show.php?id=…`, then `/api/watch_links/?episode_id=…`; anime `/api/anime/episodes/show.php?id=…`.
 - Iron signature: HMAC-SHA256 over `rawPath|unixTimestamp|nonce`; key derivation and constants are verified against `tests/fixtures/iron-signer.json`. API requests use `okhttp/4.12.0` and the Iron headers.
 
-Catalog cursors are Oscar's positive numeric page numbers encoded as strings. The host treats them as opaque and only the plugin decodes them. Metadata includes only source-provided titles, posters, banner, release year, rating, story, genres, and native IDs; no TMDB lookup or inferred badges are used.
+Catalog cursors are Oscar's positive numeric page numbers encoded as strings. The host treats them as opaque and only the plugin decodes them. Metadata includes source-provided titles, posters, banner, release year, rating, story, genres, native IDs, and validated `tmdb_id` / `imdb_id` values when Oscar supplies them in a response. The plugin does not make extra details requests for catalog items or perform TMDB lookup; external IDs pass through as `externalIds.tmdb` and `externalIds.imdb`.
 
 The old CloudStream resolver delegates arbitrary hosts to a dynamic extractor system and does not enumerate a stable host list. This plugin only handles direct media, SeriesMP4 iframe wrappers, explicit HTML media nodes, and Yandex direct/redirect media when the final URL or MIME identifies playable media. No CloudStream dependency or generic extractor framework is included; unknown embed hosts can remain unresolved.
 

@@ -73,6 +73,36 @@ test('catalog descriptors map movies, series, and anime to one native-ID-preserv
   assert.ok(requests.every(({ options }) => options.headers['X-Iron-Sig'] && options.headers['X-Iron-Ts'] && options.headers['X-Iron-Nonce']));
 });
 
+test('external TMDB and IMDb IDs are validated and mapped without changing native identity', () => {
+  const h = loadPlugin(async () => { throw new Error('external ID mapping must not make a request'); }).__test;
+  const valid = h.mapMedia({ id: 31, title_en: 'With IDs', tmdb_id: 307106, imdb_id: ' tt1234567 ' }, 'series');
+  assert.equal(valid.externalIds.tmdb, '307106');
+  assert.equal(valid.externalIds.imdb, 'tt1234567');
+  assert.equal(valid.nativeId, 'series:31');
+
+  const stringId = h.mapMedia({ id: 32, tmdb_id: '42' }, 'movie');
+  assert.equal(stringId.externalIds.tmdb, '42');
+  assert.equal(stringId.nativeId, 'movie:32');
+
+  for (const value of [null, '', '  ', 0, '0', -1, '-1', 'garbage', 1.5, '1.5', true, '1e2']) {
+    assert.equal(h.externalIdsOf({ tmdb_id: value }), undefined, `invalid TMDB id ${String(value)}`);
+  }
+  assert.equal(h.externalIdsOf({ imdb_id: '' }), undefined);
+  assert.equal(h.externalIdsOf({ imdb_id: 'not-an-imdb-id' }), undefined);
+  assert.deepEqual(JSON.parse(JSON.stringify(h.externalIdsOf({ imdb_id: ' tt7654321 ' }))), { imdb: 'tt7654321' });
+  assert.deepEqual(JSON.parse(JSON.stringify(h.externalIdsOf({ tmdb_id: 9, imdb_id: 'tt1234567' }))), { tmdb: '9', imdb: 'tt1234567' });
+  assert.equal(h.mapMedia({ id: 33 }, 'anime').externalIds, undefined);
+});
+
+test('details retain validated external IDs when Oscar details supplies them', () => {
+  const h = loadPlugin(async () => { throw new Error('details mapping must not make a request'); }).__test;
+  const details = h.detailsItem({ id: 55, title_en: 'Movie', tmdb_id: '1284046', imdb_id: 'tt32268691' }, 'movie', 55);
+  assert.equal(details.nativeId, 'movie:55');
+  assert.deepEqual(JSON.parse(JSON.stringify(details.externalIds)), { tmdb: '1284046', imdb: 'tt32268691' });
+  const ignored = h.detailsItem({ id: 56, tmdb_id: 'garbage', imdb_id: '' }, 'movie', 56);
+  assert.equal(ignored.externalIds, undefined);
+});
+
 test('opaque pagination cursor and query are forwarded to one catalog request', async () => {
   let observed;
   const plugin = loadPlugin(async (url) => {

@@ -145,6 +145,20 @@
     if (typeof value === "string") return value.split(/[,،|]/).map(text).filter(Boolean);
     return [];
   }
+  function externalIdsOf(raw) {
+    if (!raw || typeof raw !== "object") return undefined;
+    var tmdbValue = raw.tmdb_id;
+    var tmdbId = null;
+    if (typeof tmdbValue === "number") tmdbId = positiveInt(tmdbValue);
+    else if (typeof tmdbValue === "string" && /^\d+$/.test(tmdbValue.trim())) tmdbId = positiveInt(tmdbValue.trim());
+    var imdbId = optional(raw.imdb_id);
+    if (!imdbId || !/^tt[0-9]+$/i.test(imdbId)) imdbId = null;
+    if (!tmdbId && !imdbId) return undefined;
+    var externalIds = {};
+    if (tmdbId) externalIds.tmdb = String(tmdbId);
+    if (imdbId) externalIds.imdb = imdbId;
+    return externalIds;
+  }
   function mapMedia(raw, type) {
     var id = positiveInt(raw && raw.id);
     if (!id) return null;
@@ -154,6 +168,7 @@
       poster: imageUrl(raw.poster) || undefined, backdrop: imageUrl(raw.banner) || undefined,
       year: positiveInt(raw.release_year) || positiveInt(raw.season_year) || undefined,
       rating: isFinite(Number(raw.rating)) && optional(raw.rating) !== null ? Number(raw.rating) : undefined,
+      externalIds: externalIdsOf(raw),
       description: optional(raw.story) || undefined, genres: genresOf(raw)
     };
   }
@@ -275,7 +290,8 @@
     return { nativeId: item.nativeId, type: item.type, title: item.title,
       originalTitle: item.originalTitle, poster: item.poster, backdrop: item.backdrop,
       description: item.description, year: item.year, rating: item.rating,
-      genres: item.genres || [], runtime: positiveInt(raw.runtime) || positiveInt(raw.episode_duration) || undefined };
+      genres: item.genres || [], externalIds: item.externalIds,
+      runtime: positiveInt(raw.runtime) || positiveInt(raw.episode_duration) || undefined };
   }
   function qualityOf(value) {
     var source = text(value);
@@ -397,6 +413,7 @@
     root.module.exports.__test = { parseId: parseId, nativeId: nativeId, deriveIronKey: deriveIronKey,
       sign: sign, signedPath: signedPath, directMedia: directMedia, qualityOf: qualityOf,
       mapMedia: mapMedia, detailsItem: detailsItem, imageUrl: imageUrl, isSeriesMp4: isSeriesMp4,
+      externalIdsOf: externalIdsOf,
       getCatalog: getCatalog, catalogConfig: CATALOG_CONFIG, serverTitle: serverTitle };
   }
 })(typeof globalThis !== "undefined" ? globalThis : this);

@@ -1,7 +1,7 @@
 {
   "id": "oscar",
   "name": "OscarTV",
-  "version": "2.0.1",
+  "version": "2.0.2",
   "filename": "plugins/oscartv-v2.js",
   "apiVersion": 2,
   "capabilities": ["details", "streams"],

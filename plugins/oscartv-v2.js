@@ -141,8 +141,21 @@
   function titleOf(item, id) { return optional(item.title_ar) || optional(item.title_en) || optional(item.title_jp) || ("عنوان غير متوفر " + id); }
   function genresOf(item) {
     var value = item.genres;
-    if (Array.isArray(value)) return value.map(text).filter(Boolean);
-    if (typeof value === "string") return value.split(/[,،|]/).map(text).filter(Boolean);
+    function genreName(entry) {
+      if (typeof entry === "string") {
+        var label = optional(entry);
+        return label === "[object Object]" ? null : label;
+      }
+      // Oscar's live genre objects use `name` for the localized display value.
+      // Never stringify an object: that would expose `[object Object]` in Details.
+      if (entry && typeof entry === "object" && !Array.isArray(entry) && typeof entry.name === "string") {
+        var name = optional(entry.name);
+        return name === "[object Object]" ? null : name;
+      }
+      return null;
+    }
+    if (Array.isArray(value)) return value.map(genreName).filter(Boolean);
+    if (typeof value === "string") return value.split(/[,،|]/).map(genreName).filter(Boolean);
     return [];
   }
   function externalIdsOf(raw) {

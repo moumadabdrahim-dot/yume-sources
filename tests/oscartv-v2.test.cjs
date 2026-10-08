@@ -103,6 +103,47 @@ test('details retain validated external IDs when Oscar details supplies them', (
   assert.equal(ignored.externalIds, undefined);
 });
 
+test('Oscar genres normalize live object, text-array, and delimited-string shapes without object leakage', () => {
+  const h = loadPlugin(async () => { throw new Error('genre normalization must not make a request'); }).__test;
+  const liveMovie = h.mapMedia({ id: 4433, genres: [
+    { id: 1, name: 'دراما', slug: 'drama' },
+    { id: 5, name: 'رعب', slug: 'horror' }
+  ] }, 'movie');
+  assert.deepEqual(JSON.parse(JSON.stringify(liveMovie.genres)), ['دراما', 'رعب']);
+
+  const textArray = h.mapMedia({ id: 4431, genres: ['تشويق وإثارة', 'دراما'] }, 'movie');
+  assert.deepEqual(JSON.parse(JSON.stringify(textArray.genres)), ['تشويق وإثارة', 'دراما']);
+  const seriesDetails = h.detailsItem({ id: 1662, genres: [
+    { id: 7, name: 'غموض', slug: 'mystery' }, { id: 53, name: 'كوميديا', slug: 'genre_1775469420' }
+  ] }, 'series', 1662);
+  assert.deepEqual(JSON.parse(JSON.stringify(seriesDetails.genres)), ['غموض', 'كوميديا']);
+  const delimited = h.detailsItem({ id: 573, genres: 'Time Travel,أكشن،خيال|مدرسي' }, 'anime', 573);
+  assert.deepEqual(JSON.parse(JSON.stringify(delimited.genres)), ['Time Travel', 'أكشن', 'خيال', 'مدرسي']);
+
+  for (const malformed of [null, 7, {}, [{ id: 8 }], ['  ', null, 9, { name: {} }], '[object Object]']) {
+    const item = h.mapMedia({ id: 10, genres: malformed }, 'series');
+    assert.ok(item.genres.every(value => typeof value === 'string' && value.trim()));
+    assert.ok(item.genres.every(value => value !== '[object Object]'));
+  }
+});
+
+test('movie, series, and anime catalogs keep Oscar genres as strings for home and search results', async () => {
+  const plugin = loadPlugin(async (url) => {
+    const type = new URL(url).pathname.includes('/series/') ? 'series' : new URL(url).pathname.includes('/anime/') ? 'anime' : 'movie';
+    const genres = type === 'movie'
+      ? [{ id: 1, name: 'دراما', slug: 'drama' }]
+      : type === 'series' ? ['غموض', 'دراما'] : 'Time Travel,أكشن';
+    return apiResponse([{ id: type === 'movie' ? 4433 : 17, title_ar: 'عنوان', genres }]);
+  });
+  for (const [catalogId, type] of [['movies', 'movie'], ['series', 'series'], ['anime', 'anime']]) {
+    for (const query of [undefined, 'عنوان']) {
+      const page = await plugin.getCatalog({ catalogId, type, query, filters: {} });
+      assert.ok(page.items[0].genres.every(value => typeof value === 'string'));
+      assert.ok(page.items[0].genres.every(value => value !== '[object Object]'));
+    }
+  }
+});
+
 test('opaque pagination cursor and query are forwarded to one catalog request', async () => {
   let observed;
   const plugin = loadPlugin(async (url) => {

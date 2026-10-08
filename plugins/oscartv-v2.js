@@ -177,7 +177,9 @@
     if (!id) return null;
     return {
       nativeId: nativeId(type, id), type: type, title: titleOf(raw, id),
-      originalTitle: optional(raw.title_en) || optional(raw.title_jp) || undefined,
+      originalTitle: (type === "anime"
+        ? optional(raw.title_jp) || optional(raw.title_en)
+        : optional(raw.title_en) || optional(raw.title_jp)) || undefined,
       poster: imageUrl(raw.poster) || undefined, backdrop: imageUrl(raw.banner) || undefined,
       year: positiveInt(raw.release_year) || positiveInt(raw.season_year) || undefined,
       rating: isFinite(Number(raw.rating)) && optional(raw.rating) !== null ? Number(raw.rating) : undefined,

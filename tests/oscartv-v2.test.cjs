@@ -103,6 +103,58 @@ test('details retain validated external IDs when Oscar details supplies them', (
   assert.equal(ignored.externalIds, undefined);
 });
 
+test('anime original title prefers Japanese and falls back to English without changing display identity', () => {
+  const h = loadPlugin(async () => { throw new Error('title mapping must not make a request'); }).__test;
+  const anime = h.mapMedia({
+    id: 519,
+    title_ar: 'Mushoku Tensei: Isekai Ittara Honki Dasu',
+    title_en: 'Mushoku Tensei: Isekai Ittara Honki Dasu',
+    title_jp: '\u7121\u8077\u8EE2\u751F \uFF5E\u7570\u4E16\u754C\u884C\u3063\u305F\u3089\u672C\u6C17\u3060\u3059\uFF5E'
+  }, 'anime');
+  assert.equal(anime.originalTitle, '無職転生 ～異世界行ったら本気だす～');
+  assert.equal(anime.title, 'Mushoku Tensei: Isekai Ittara Honki Dasu');
+  assert.equal(anime.nativeId, 'anime:519');
+
+  const animeWithoutJapanese = h.mapMedia({ id: 520, title_ar: 'عرض عربي', title_en: 'English title' }, 'anime');
+  assert.equal(animeWithoutJapanese.originalTitle, 'English title');
+  assert.equal(animeWithoutJapanese.title, 'عرض عربي');
+  assert.equal(animeWithoutJapanese.nativeId, 'anime:520');
+});
+
+test('movie and series original title mapping remains English-first', () => {
+  const h = loadPlugin(async () => { throw new Error('title mapping must not make a request'); }).__test;
+  for (const type of ['movie', 'series']) {
+    const item = h.mapMedia({ id: 64, title_ar: 'اسم العرض', title_en: 'English title', title_jp: 'Original title' }, type);
+    assert.equal(item.originalTitle, 'English title');
+    assert.equal(item.title, 'اسم العرض');
+    assert.equal(item.nativeId, `${type}:64`);
+  }
+});
+
+test('anime details return Japanese original title while preserving visible title and Oscar identity', async () => {
+  const requests = [];
+  const plugin = loadPlugin(async (url) => {
+    requests.push(new URL(url));
+    return apiResponse({
+      id: 519,
+      title_ar: 'Mushoku Tensei: Isekai Ittara Honki Dasu',
+      title_en: 'Mushoku Tensei: Isekai Ittara Honki Dasu',
+      title_jp: '\u7121\u8077\u8EE2\u751F \uFF5E\u7570\u4E16\u754C\u884C\u3063\u305F\u3089\u672C\u6C17\u3060\u3059\uFF5E',
+      release_year: 2021,
+      seasons: []
+    });
+  });
+  const result = await plugin.getDetails({ id: 'anime:519' });
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0].pathname, '/api/anime/show.php');
+  assert.equal(requests[0].searchParams.get('id'), '519');
+  assert.equal(result.item.originalTitle, '無職転生 ～異世界行ったら本気だす～');
+  assert.equal(result.item.title, 'Mushoku Tensei: Isekai Ittara Honki Dasu');
+  assert.equal(result.item.nativeId, 'anime:519');
+  assert.equal(result.item.type, 'anime');
+  assert.equal(result.item.year, 2021);
+});
+
 test('Oscar genres normalize live object, text-array, and delimited-string shapes without object leakage', () => {
   const h = loadPlugin(async () => { throw new Error('genre normalization must not make a request'); }).__test;
   const liveMovie = h.mapMedia({ id: 4433, genres: [

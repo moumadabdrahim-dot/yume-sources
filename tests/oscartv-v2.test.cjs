@@ -41,6 +41,18 @@ function loadPlugin(fetchImpl) {
 function apiResponse(data, pagination = {}) {
   return { ok: true, status: 200, json: async () => ({ status: 'success', data, pagination }) };
 }
+function httpResponse({ status = 200, url, contentType = '', body = '', headers = {} }) {
+  return {
+    ok: status >= 200 && status < 300,
+    status,
+    url,
+    headers: { get: name => {
+      const key = String(name).toLowerCase();
+      return key === 'content-type' ? contentType : (headers[key] || null);
+    } },
+    text: async () => body
+  };
+}
 
 test('v2 exports catalog/details/streams and preserves the deterministic Iron signer', () => {
   const plugin = loadPlugin(async () => { throw new Error('unexpected network'); });
@@ -227,4 +239,310 @@ test('missing titles and stream labels do not leak the internal plugin name', as
   assert.doesNotMatch(page.items[0].title, /OscarTV/i);
   assert.equal(plugin.__test.serverTitle({ server_name: 'OscarTV HD' }), 'Server');
   assert.equal(plugin.__test.serverTitle({ server_name: 'Mirror 1' }), 'Mirror 1');
+});
+
+test('SeriesMP4 detection accepts the base domain and real subdomains only', () => {
+  const h = loadPlugin(async () => { throw new Error('classification must not fetch'); }).__test;
+  for (const url of [
+    'https://seriesmp4.com/watch/1',
+    'https://cdn.seriesmp4.com/file.mp4',
+    'https://newcdn.seriesmp4.com/video?id=1'
+  ]) assert.equal(h.isSeriesMp4(url), true, url);
+  for (const url of [
+    'https://fake-seriesmp4.com/watch/1',
+    'https://seriesmp4.com.evil.test/watch/1',
+    'https://notseriesmp4.com/watch/1'
+  ]) assert.equal(h.isSeriesMp4(url), false, url);
+});
+
+test('HTML content type overrides a misleading direct declaration', () => {
+  const h = loadPlugin(async () => { throw new Error('classification must not fetch'); }).__test;
+  assert.equal(h.directMedia('https://newcdn.seriesmp4.com/watch/1', 'text/html; charset=UTF-8', 'direct'), false);
+  assert.equal(h.directMedia('https://cdn.test/watch?id=1'), false, 'a direct declaration is not media evidence');
+  assert.equal(h.directMedia('https://cdn.test/media', 'video/mp4', ''), true);
+  assert.equal(h.directMedia('https://cdn.test/media', 'application/vnd.apple.mpegurl', ''), true);
+});
+
+test('wrapper parsing resolves a relative iframe and preserves media headers', async () => {
+  const requests = [];
+  const plugin = loadPlugin(async (url, options) => {
+    requests.push({ url, options });
+    if (url === 'https://newcdn.seriesmp4.com/watch/1') {
+      return httpResponse({ status: 200, url, contentType: 'text/html', body: '<html><iframe src="/media/video.mp4?token=ok"></iframe></html>' });
+    }
+    if (url === 'https://newcdn.seriesmp4.com/media/video.mp4?token=ok') {
+      return httpResponse({ status: 206, url, contentType: 'video/mp4', body: 'partial' });
+    }
+    throw new Error(`unexpected URL ${url}`);
+  });
+  const streams = await plugin.__test.resolveLink({
+    url: 'https://newcdn.seriesmp4.com/watch/1', type: 'direct', deep_link: '?ua=FixtureUA', quality: '1080p'
+  });
+  assert.equal(streams.length, 1);
+  assert.equal(streams[0].url, 'https://newcdn.seriesmp4.com/media/video.mp4?token=ok');
+  assert.equal(streams[0].headers['User-Agent'], 'FixtureUA');
+  assert.equal(streams[0].headers.Referer, 'https://newcdn.seriesmp4.com/watch/1');
+  assert.equal(streams[0].headers.Range, undefined);
+  assert.equal(requests[0].options.headers.Range, 'bytes=0-65535');
+  assert.equal(requests[1].options.headers.Referer, 'https://newcdn.seriesmp4.com/watch/1');
+  assert.equal(requests[1].options.headers.Range, 'bytes=0-65535');
+});
+
+test('wrapper resolution rejects HTTP 403, 404, and 416 final responses', async () => {
+  for (const status of [403, 404, 416]) {
+    const plugin = loadPlugin(async (url) => {
+      if (url.includes('seriesmp4.com')) {
+        return httpResponse({ status: 200, url, contentType: 'text/html', body: '<iframe src="https://downloader.disk.yandex.ru/file.mp4"></iframe>' });
+      }
+      return httpResponse({ status, url, contentType: 'text/html', body: '<html>denied</html>' });
+    });
+    const streams = await plugin.__test.resolveLink({ url: 'https://newcdn.seriesmp4.com/watch/dead', type: 'direct' });
+    assert.equal(streams.length, 0, `status ${status}`);
+  }
+});
+
+test('HTTP 206 with a real media content type remains playable', async () => {
+  const plugin = loadPlugin(async (url) => httpResponse({ status: 206, url, contentType: 'video/mp4', body: 'partial' }));
+  const streams = await plugin.__test.resolveLink({ url: 'https://newcdn.seriesmp4.com/media/valid.mp4', type: 'direct' });
+  assert.equal(streams.length, 1);
+  assert.equal(streams[0].url, 'https://newcdn.seriesmp4.com/media/valid.mp4');
+  assert.equal(streams[0].type, 'video');
+});
+
+test('extensionless direct declarations are probed and HTML responses are rejected', async () => {
+  const url = 'https://cdn.example.test/watch?id=opaque';
+  const requests = [];
+  const plugin = loadPlugin(async (requestUrl, options) => {
+    requests.push({ requestUrl, options });
+    return httpResponse({ status: 200, url: requestUrl, contentType: 'text/html', body: '<html>login page</html>' });
+  });
+  const streams = await plugin.__test.resolveLink({ url, type: 'direct' });
+  assert.equal(streams.length, 0);
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0].options.headers.Range, 'bytes=0-65535');
+});
+
+test('HTML wrapper bodies are never returned as playable streams', async () => {
+  const plugin = loadPlugin(async (url) => httpResponse({
+    status: 206,
+    url,
+    contentType: 'text/html; charset=UTF-8',
+    body: '<html><body>No playable source</body></html>'
+  }));
+  const streams = await plugin.__test.resolveLink({ url: 'https://newcdn.seriesmp4.com/file.mp4', type: 'direct' });
+  assert.equal(streams.length, 0);
+});
+
+test('a broken wrapper does not suppress a following valid HLS source', async () => {
+  const requests = [];
+  const plugin = loadPlugin(async (rawUrl) => {
+    const url = new URL(rawUrl);
+    requests.push(url.toString());
+    if (url.hostname === 'ostvapp.cam') {
+      return apiResponse({ id: 3383, watch_links: [
+        { url: 'https://newcdn.seriesmp4.com/watch/dead', type: 'direct', server_name: 'Mirror 1' },
+        { url: 'https://cdn.mediaoscar.com/live/valid.m3u8?token=signed', type: 'direct', server_name: 'Mirror 2' }
+      ] });
+    }
+    return httpResponse({ status: 403, url: url.toString(), contentType: 'text/html', body: '<html>denied</html>' });
+  });
+  const result = await plugin.getStreams({ id: 'anime_episode:3383' });
+  assert.equal(result.streams.length, 1);
+  assert.equal(result.streams[0].url, 'https://cdn.mediaoscar.com/live/valid.m3u8?token=signed');
+  assert.equal(result.streams[0].type, 'm3u8');
+  assert.equal(requests.filter(url => url.includes('cdn.mediaoscar.com')).length, 0, 'known direct HLS must not receive a probe request');
+});
+
+test('valid mediaoscar direct links remain unchanged and preserve signed URLs and User-Agent', async () => {
+  let fetches = 0;
+  const plugin = loadPlugin(async () => { fetches += 1; throw new Error('direct media must not fetch'); });
+  const url = 'https://cdn.mediaoscar.com/path/master.m3u8?token=abc&expires=123';
+  const streams = await plugin.__test.resolveLink({ url, type: 'direct', deep_link: '?ua=OscarMediaUA' });
+  assert.equal(fetches, 0);
+  assert.equal(streams.length, 1);
+  assert.equal(streams[0].url, url);
+  assert.equal(streams[0].type, 'm3u8');
+  assert.equal(streams[0].headers['User-Agent'], 'OscarMediaUA');
+});
+
+test('followed redirect uses the final response URL and preserves the original stream headers', async () => {
+  const requests = [];
+  const finalUrl = 'https://cdn.example.test/redirected.mp4?sig=fixture';
+  const plugin = loadPlugin(async (url, options) => {
+    requests.push({ url, options });
+    if (url === 'https://newcdn.seriesmp4.com/watch/redirect') {
+      return httpResponse({ status: 206, url: finalUrl, contentType: 'video/mp4', body: 'partial', headers: { location: finalUrl } });
+    }
+    throw new Error(`unexpected URL ${url}`);
+  });
+  const streams = await plugin.__test.resolveLink({ url: 'https://newcdn.seriesmp4.com/watch/redirect', type: 'direct', deep_link: '?ua=RedirectUA' });
+  assert.equal(streams.length, 1);
+  assert.equal(streams[0].url, finalUrl);
+  assert.equal(streams[0].headers['User-Agent'], 'RedirectUA');
+  assert.equal(requests[0].options.redirect, 'follow');
+});
+
+test('SeriesMP4 bounded body fallback follows only a Yandex media URL and ignores ad/tracking/script links', async () => {
+  const wrapper = 'https://newcdn.seriesmp4.com/watch/body-link';
+  const media = 'https://downloader.disk.yandex.ru/disk/fixture.mp4?token=abc&expires=123';
+  const requests = [];
+  const body = [
+    '<html><body>',
+    '<a href="https://ads.example.test/ads/pixel.mp4">ad</a>',
+    '<a href="https://downloader.disk.yandex.ru/tracking/pixel.mp4">tracker</a>',
+    '<script>var ignored = "https://downloader.disk.yandex.ru/script-only.mp4";</script>',
+    `<p>video source: ${media.replace(/&/g, '&amp;')}</p>`,
+    '</body></html>'
+  ].join('');
+  const plugin = loadPlugin(async (url, options) => {
+    requests.push({ url, options });
+    if (url === wrapper) return httpResponse({ status: 200, url, contentType: 'text/html', body });
+    if (url === media) return httpResponse({ status: 206, url, contentType: 'video/mp4', body: 'partial' });
+    throw new Error(`unexpected URL ${url}`);
+  });
+  const streams = await plugin.__test.resolveLink({ url: wrapper, type: 'direct', deep_link: '?user_agent=BodyUA' });
+  assert.equal(streams.length, 1);
+  assert.equal(streams[0].url, media);
+  assert.equal(streams[0].headers['User-Agent'], 'BodyUA');
+  assert.equal(streams[0].headers.Referer, wrapper);
+  assert.deepEqual(requests.map(request => request.url), [wrapper, media]);
+  assert.ok(requests.every(request => request.options.headers.Range === 'bytes=0-65535'));
+});
+
+test('SeriesMP4 absolute body fallback rejects non-Yandex hosts and ad paths without probing them', async () => {
+  const wrapper = 'https://seriesmp4.com/watch/unsafe-body';
+  const requests = [];
+  const plugin = loadPlugin(async (url, options) => {
+    requests.push({ url, options });
+    return httpResponse({ status: 200, url, contentType: 'text/html', body: [
+      '<html><body>',
+    'https://yandex.ru.evil.test/video.mp4',
+    'https://downloader.disk.yandex.ru/ads/creative.mp4',
+    'https://downloader.disk.yandex.ru/tracking/pixel.mp4',
+      '</body></html>'
+    ].join('') });
+  });
+  const streams = await plugin.__test.resolveLink({ url: wrapper, type: 'direct' });
+  assert.equal(streams.length, 0);
+  assert.deepEqual(requests.map(request => request.url), [wrapper]);
+});
+
+test('TDM custom schemes are never emitted as Media3 stream URLs', async () => {
+  let fetches = 0;
+  const plugin = loadPlugin(async () => { fetches += 1; throw new Error('custom URI must not be fetched'); });
+  const custom = 'tdmvideo://play?url=https%3A%2F%2Fcdn.example.test%2Fmovie.mp4&ua=FixtureUA';
+  assert.equal(plugin.__test.isHttpUrl(custom), false);
+  assert.equal(plugin.__test.isHttpUrl('https:///missing-host.mp4'), false);
+  assert.equal(plugin.__test.directMedia(custom, '', 'direct'), false);
+  assert.equal((await plugin.__test.resolveLink({ url: custom, type: 'direct' })).length, 0);
+  assert.equal(fetches, 0);
+});
+
+test('deep_link remains metadata for User-Agent while the HTTP url is the playable target', async () => {
+  let fetches = 0;
+  const plugin = loadPlugin(async () => { fetches += 1; throw new Error('direct media must not fetch'); });
+  const url = 'https://cdn.mediaoscar.com/live/master.m3u8?token=signed';
+  const streams = await plugin.__test.resolveLink({
+    url,
+    deep_link: 'tdmvideo://play?url=https%3A%2F%2Fother.example%2Fvideo.mp4&user_agent=Fixture%20Player',
+    type: 'direct'
+  });
+  assert.equal(fetches, 0);
+  assert.equal(streams.length, 1);
+  assert.equal(streams[0].url, url);
+  assert.equal(streams[0].headers['User-Agent'], 'Fixture Player');
+});
+
+test('Yandex aliases are boundary-matched and HTTP failures remain failures', async () => {
+  const h = loadPlugin(async () => { throw new Error('classification must not fetch'); }).__test;
+  assert.equal(h.isYandex('https://yandex.ru/video.mp4'), true);
+  assert.equal(h.isYandex('https://downloader.disk.yandex.ru/video.mp4'), true);
+  assert.equal(h.isYandex('https://storage.yandexcloud.net/video.mp4'), false, 'unconfirmed alias is not added');
+  assert.equal(h.isYandex('https://yandex.ru.evil.test/video.mp4'), false);
+  assert.equal(h.isYandex('https://notyandex.ru/video.mp4'), false);
+
+  const denied = loadPlugin(async (url) => httpResponse({ status: 403, url, contentType: 'text/html', body: '<html>denied</html>' }));
+  assert.equal((await denied.__test.resolveLink({ url: 'https://downloader.disk.yandex.ru/disk/denied', type: 'direct' })).length, 0);
+});
+
+test('MIME-only HLS is returned with the HLS stream type', async () => {
+  const wrapper = 'https://newcdn.seriesmp4.com/watch/mime-hls';
+  const finalUrl = 'https://cdn.example.test/live?id=fixture';
+  const plugin = loadPlugin(async (url) => {
+    if (url === wrapper) return httpResponse({ status: 200, url: finalUrl, contentType: 'application/vnd.apple.mpegurl', body: '#EXTM3U\n' });
+    throw new Error(`unexpected URL ${url}`);
+  });
+  const streams = await plugin.__test.resolveLink({ url: wrapper, type: 'direct' });
+  assert.equal(streams.length, 1);
+  assert.equal(streams[0].url, finalUrl);
+  assert.equal(streams[0].type, 'm3u8');
+});
+
+test('a nested wrapper loop terminates without repeating a request', async () => {
+  const a = 'https://newcdn.seriesmp4.com/watch/a';
+  const b = 'https://player.example.test/watch/b';
+  const requests = [];
+  const plugin = loadPlugin(async (url) => {
+    requests.push(url);
+    if (url === a) return httpResponse({ status: 200, url, contentType: 'text/html', body: `<iframe src="${b}"></iframe>` });
+    if (url === b) return httpResponse({ status: 200, url, contentType: 'text/html', body: `<iframe src="${a}"></iframe>` });
+    throw new Error(`unexpected URL ${url}`);
+  });
+  assert.equal((await plugin.__test.resolveLink({ url: a, type: 'direct' })).length, 0);
+  assert.deepEqual(requests, [a, b]);
+});
+
+test('an extension-looking final URL that responds with HTML is rejected', async () => {
+  const wrapper = 'https://newcdn.seriesmp4.com/watch/html-final';
+  const finalUrl = 'https://downloader.disk.yandex.ru/disk/final.mp4';
+  const plugin = loadPlugin(async (url) => {
+    if (url === wrapper) return httpResponse({ status: 200, url: finalUrl, contentType: 'text/html', body: '<html>not media</html>' });
+    throw new Error(`unexpected URL ${url}`);
+  });
+  assert.equal((await plugin.__test.resolveLink({ url: wrapper, type: 'direct' })).length, 0);
+});
+
+test('bounded FetchBridge-style truncated HTML can resolve only a link in the returned prefix', async () => {
+  const wrapper = 'https://newcdn.seriesmp4.com/watch/truncated';
+  const media = 'https://downloader.disk.yandex.ru/disk/early.mp4';
+  const prefix = `<html><body>${media}</body></html>`;
+  const boundedBridgeBody = prefix + 'x'.repeat(1024 * 1024 - prefix.length) + '\n...[truncated]';
+  const plugin = loadPlugin(async (url) => {
+    if (url === wrapper) return httpResponse({ status: 200, url, contentType: 'text/html', body: boundedBridgeBody });
+    if (url === media) return httpResponse({ status: 206, url, contentType: 'video/mp4', body: 'partial' });
+    throw new Error(`unexpected URL ${url}`);
+  });
+  const streams = await plugin.__test.resolveLink({ url: wrapper, type: 'direct' });
+  assert.equal(streams.length, 1);
+  assert.equal(streams[0].url, media);
+});
+
+test('production script stays free of Node-only and browser-only APIs', () => {
+  assert.doesNotMatch(source, /\brequire\s*\(|\bBuffer\b|\bprocess\b|\bcheerio\b|\bdocument\b|\bwindow\b/);
+  assert.match(source, /root\s*&&\s*root\.module/);
+});
+
+test('native episode identifiers are parsed as their original Oscar integer', () => {
+  const h = loadPlugin(async () => { throw new Error('parsing must not fetch'); }).__test;
+  assert.deepEqual(JSON.parse(JSON.stringify(h.parseId('series_episode:93051'))), { type: 'series_episode', id: 93051 });
+  assert.deepEqual(JSON.parse(JSON.stringify(h.parseId('anime_episode:8123'))), { type: 'anime_episode', id: 8123 });
+});
+
+test('STREAMS forwards the typed native episode number to Oscar without deriving it from season or index', async () => {
+  const requests = [];
+  const plugin = loadPlugin(async (rawUrl) => {
+    const url = new URL(rawUrl);
+    requests.push(url);
+    if (url.hostname === 'ostvapp.cam' && url.pathname === '/api/episodes/show.php') {
+      return apiResponse({ id: 93051, watch_links: [
+        { url: 'https://cdn.mediaoscar.com/video/episode.mp4?token=fixture', type: 'direct' }
+      ] });
+    }
+    throw new Error(`unexpected URL ${url}`);
+  });
+  const result = await plugin.getStreams({ id: 'series_episode:93051' });
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0].searchParams.get('id'), '93051');
+  assert.equal(result.streams.length, 1);
+  assert.equal(result.streams[0].url, 'https://cdn.mediaoscar.com/video/episode.mp4?token=fixture');
 });

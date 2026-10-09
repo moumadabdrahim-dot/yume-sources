@@ -317,19 +317,26 @@
     var name = text(link && link.server_name);
     return name && !/oscar/i.test(name) ? name : "Server";
   }
-  function directMedia(url, contentType, declaredType) {
+  function directMedia(url, contentType) {
+    if (!isHttpUrl(url)) return false;
     var value = String(url || "").split(/[?#]/)[0];
-    return String(declaredType || "").toLowerCase() === "direct" || /\.(mp4|m3u8|webm|mkv)$/i.test(value) || /^(video\/|application\/(vnd\.apple\.mpegurl|x-mpegurl)|audio\/mpegurl)/i.test(String(contentType || ""));
+    var mime = String(contentType || "").toLowerCase();
+    if (/text\/html|application\/xhtml\+xml/.test(mime)) return false;
+    return /\.(mp4|m3u8|webm|mkv)$/i.test(value) || /^(video\/|application\/(vnd\.apple\.mpegurl|x-mpegurl)|audio\/mpegurl)/i.test(mime);
   }
+  function isHttpUrl(url) { return /^https?:\/\/[^/?#\s]+(?:[/?#]|$)/i.test(String(url || "").trim()); }
   function hostOf(url) {
     try { if (typeof URL !== "undefined") return new URL(String(url)).hostname.toLowerCase(); } catch (_) {}
     return String(url || "").replace(/^https?:\/\//i, "").split(/[/:?#]/)[0].toLowerCase();
   }
-  function isSeriesMp4(url) { return hostOf(url) === "cdn.seriesmp4.com"; }
+  function isSeriesMp4(url) {
+    var host = hostOf(url);
+    return host === "seriesmp4.com" || /\.seriesmp4\.com$/i.test(host);
+  }
   function isYandex(url) { var host = hostOf(url); return /(^|\.)yandex\.(ru|net)$/i.test(host); }
   function mediaUa(link) {
     var deep = text(link && link.deep_link);
-    var match = /(?:\?|&)ua=([^&]+)/i.exec(deep);
+    var match = /(?:\?|&)(?:ua|user_agent)=([^&]+)/i.exec(deep);
     if (!match) return MEDIA_UA;
     try { return decodeURIComponent(match[1].replace(/\+/g, "%20")) || MEDIA_UA; } catch (_) { return match[1] || MEDIA_UA; }
   }
@@ -342,63 +349,133 @@
     if (href.charAt(0) === "/") return "https://" + hostOf(base) + href;
     return base.replace(/[^/]*$/, "") + href;
   }
-  function obviousAd(url) { return /(?:\/ads?\/|\/advert(?:isement)?\/|adserver|doubleclick|googlesyndication)/i.test(url); }
-  async function resolveWrapper(url, headers, depth) {
+  function obviousAd(url) {
+    return /(?:\/ads?\/|\/advert(?:isement)?\/|adserver|doubleclick|googlesyndication|(?:^|[/.?&=_-])(?:tracking|analytics|pixel)(?:[/.?&=_-]|$))/i.test(String(url || ""));
+  }
+  function decodeHtmlAttribute(value) {
+    return String(value || "")
+      .replace(/&amp;/gi, "&").replace(/&quot;/gi, '"').replace(/&#39;|&apos;/gi, "'")
+      .replace(/&#x([0-9a-f]+);/gi, function (_, hexValue) { return String.fromCharCode(parseInt(hexValue, 16)); })
+      .replace(/&#([0-9]+);/g, function (_, numberValue) { return String.fromCharCode(parseInt(numberValue, 10)); });
+  }
+  function extractHtmlSources(html, tagPattern) {
+    var source = String(html || "");
+    var pattern = new RegExp("<(?:" + tagPattern + ")\\b[^>]*\\bsrc\\s*=\\s*(?:\\\"([^\\\"]*)\\\"|'([^']*)'|([^\\s\\\"'=<>`]+))", "gi");
+    var values = [];
+    var match;
+    while ((match = pattern.exec(source)) !== null) {
+      var value = decodeHtmlAttribute(match[1] || match[2] || match[3]);
+      if (value && values.indexOf(value) < 0) values.push(value);
+    }
+    return values;
+  }
+  function extractAbsoluteHttpUrls(html) {
+    var source = String(html || "")
+      .replace(/<!--[\s\S]*?-->/g, " ")
+      .replace(/<(script|style|noscript|template)\b[^>]*>[\s\S]*?<\/\1\s*>/gi, " ");
+    var matches = source.match(/https?:\/\/[^\s"'<>`]+/gi) || [];
+    var values = [];
+    matches.forEach(function (match) {
+      var value = decodeHtmlAttribute(match).replace(/[),.\]]+$/, "");
+      if (isHttpUrl(value) && values.indexOf(value) < 0) values.push(value);
+    });
+    return values;
+  }
+  function htmlResponse(contentType, body) {
+    return /text\/html|application\/xhtml\+xml/i.test(String(contentType || "")) || /^\s*(?:<!doctype\s+html|<html\b)/i.test(String(body || ""));
+  }
+  function responseAccepted(response) {
+    if (!response) return false;
+    var status = Number(response.status || 0);
+    return response.ok !== false && status >= 200 && status < 300;
+  }
+  function uniqueResolved(entries) {
+    var seen = {};
+    return entries.filter(function (entry) {
+      var key = entry && entry.url;
+      if (!key || seen[key]) return false;
+      seen[key] = true;
+      return true;
+    });
+  }
+  function streamType(url, contentType) {
+    return /\.m3u8(?:$|[?#])/i.test(String(url || "")) || /(?:mpegurl|vnd\.apple\.mpegurl)/i.test(String(contentType || ""))
+      ? "m3u8" : "video";
+  }
+  async function resolveWrapper(url, headers, depth, visited) {
+    if (!isHttpUrl(url)) return [];
     if (depth > 4) return [];
-    if (directMedia(url)) return [{ url: url, headers: headers }];
+    visited = visited || {};
+    if (visited[url]) return [];
+    visited[url] = true;
     var response;
-    try { response = await fetch(url, { method: "GET", headers: headers, redirect: "follow" }); }
+    var requestHeaders = {};
+    Object.keys(headers || {}).forEach(function (name) { requestHeaders[name] = headers[name]; });
+    // Wrapper targets are probed with a small Range so a successful media response is not read in full.
+    if (!requestHeaders.Range) requestHeaders.Range = "bytes=0-65535";
+    try { response = await fetch(url, { method: "GET", headers: requestHeaders, redirect: "follow" }); }
     catch (_) { return []; }
+    if (!responseAccepted(response)) return [];
     var finalUrl = response.url || url;
     var contentType = response.headers && response.headers.get ? response.headers.get("content-type") || "" : "";
-    if (directMedia(finalUrl, contentType)) return [{ url: finalUrl, headers: headers }];
-    if (isYandex(finalUrl)) {
-      if (/m3u8|video\//i.test(contentType) || /\.(mp4|m3u8|webm|mkv)(?:$|[?#])/i.test(finalUrl)) return [{ url: finalUrl, headers: headers }];
-      return [];
-    }
     var html = "";
-    try { html = await response.text(); } catch (_) { return []; }
-    if (typeof require !== "function") return [];
-    var cheerio = require("cheerio");
-    var $ = cheerio.load(html);
-    var frames = [];
-    $("iframe[src]").each(function (_, element) {
-      var src = $(element).attr("src");
-      var resolved = normalizeUrl(finalUrl, src);
-      if (resolved && frames.indexOf(resolved) < 0) frames.push(resolved);
-    });
-    var cleanFrames = frames.filter(function (frame) { return !obviousAd(frame); });
-    if (cleanFrames.length) frames = cleanFrames;
+    try { html = typeof response.text === "function" ? await response.text() : ""; } catch (_) { return []; }
+    if (directMedia(finalUrl, contentType) && !htmlResponse(contentType, html)) {
+      var mediaHeaders = {};
+      Object.keys(headers || {}).forEach(function (name) { mediaHeaders[name] = headers[name]; });
+      return [{ url: finalUrl, headers: mediaHeaders, contentType: contentType }];
+    }
+    if (isYandex(finalUrl) && !htmlResponse(contentType, html)) return [];
+    if (!htmlResponse(contentType, html) && !/<(?:iframe|video|source)\b/i.test(html)) return [];
+    var frames = extractHtmlSources(html, "iframe").map(function (src) { return normalizeUrl(finalUrl, src); }).filter(Boolean);
+    frames = frames.filter(function (frame) { return !obviousAd(frame); });
     var found = [];
     for (var i = 0; i < frames.length; i++) {
       var frameUrl = frames[i];
-      // The prior resolver treated SeriesMP4 as a wrapper regardless of its URL suffix.
-      var nested = await resolveWrapper(frameUrl, { "User-Agent": headers["User-Agent"] || MEDIA_UA, "Referer": finalUrl }, depth + 1);
+      var nested = await resolveWrapper(frameUrl, { "User-Agent": headers["User-Agent"] || MEDIA_UA, "Referer": finalUrl }, depth + 1, visited);
       found = found.concat(nested);
     }
-    if (found.length) return found;
+    if (found.length) return uniqueResolved(found);
     // Bounded site-specific fallback: extract explicit media declarations from the wrapper HTML.
-    var mediaNodes = $("video[src], video source[src], source[src]");
-    mediaNodes.each(function (_, element) {
-      var src = $(element).attr("src");
+    var mediaSources = extractHtmlSources(html, "video|source");
+    for (var mediaIndex = 0; mediaIndex < mediaSources.length; mediaIndex++) {
+      var src = mediaSources[mediaIndex];
       var resolved = normalizeUrl(finalUrl, src);
-      if (resolved && directMedia(resolved)) found.push({ url: resolved, headers: { "User-Agent": headers["User-Agent"] || MEDIA_UA, "Referer": finalUrl } });
-    });
-    return found;
+      if (resolved && !obviousAd(resolved) && directMedia(resolved)) {
+        var media = await resolveWrapper(resolved, { "User-Agent": headers["User-Agent"] || MEDIA_UA, "Referer": finalUrl }, depth + 1, visited);
+        found = found.concat(media);
+      }
+    }
+    if (!found.length && isSeriesMp4(url) && htmlResponse(contentType, html)) {
+      // TDM's resolver confirms SeriesMP4 pages can expose an absolute final URL in the body.
+      // Keep the fallback host-bounded: only the exact Yandex suffixes already recognized above
+      // are followed, and each candidate must pass the same status/MIME/media checks recursively.
+      var absoluteUrls = extractAbsoluteHttpUrls(html);
+      for (var absoluteIndex = 0; absoluteIndex < absoluteUrls.length; absoluteIndex++) {
+        var absoluteUrl = absoluteUrls[absoluteIndex];
+        if (!isYandex(absoluteUrl) || obviousAd(absoluteUrl)) continue;
+        var absoluteMedia = await resolveWrapper(absoluteUrl, {
+          "User-Agent": headers["User-Agent"] || MEDIA_UA,
+          "Referer": finalUrl
+        }, depth + 1, visited);
+        found = found.concat(absoluteMedia);
+      }
+    }
+    return uniqueResolved(found);
   }
   async function resolveLink(link) {
     var url = text(link.url);
-    if (!url) return [];
+    if (!isHttpUrl(url)) return [];
     var headers = { "User-Agent": mediaUa(link) };
-    if (isSeriesMp4(url) || !directMedia(url, "", link.type)) {
+    if (isSeriesMp4(url) || isYandex(url) || !directMedia(url, "")) {
       var resolved = await resolveWrapper(url, headers, 0);
       return resolved.map(function (entry) {
         return { url: entry.url, headers: entry.headers || headers, title: serverTitle(link),
-          provider: "Source", quality: qualityOf(link.quality), type: /\.m3u8(?:$|[?#])/i.test(entry.url) ? "m3u8" : "video" };
+          provider: "Source", quality: qualityOf(link.quality), type: streamType(entry.url, entry.contentType) };
       });
     }
     return [{ url: url, title: serverTitle(link), provider: "Source",
-      quality: qualityOf(link.quality), type: /\.m3u8(?:$|[?#])/i.test(url) ? "m3u8" : "video", headers: headers }];
+      quality: qualityOf(link.quality), type: streamType(url, ""), headers: headers }];
   }
   async function getStreams(args) {
     var parsed = parseId(args && args.id);
@@ -429,6 +506,9 @@
       sign: sign, signedPath: signedPath, directMedia: directMedia, qualityOf: qualityOf,
       mapMedia: mapMedia, detailsItem: detailsItem, imageUrl: imageUrl, isSeriesMp4: isSeriesMp4,
       externalIdsOf: externalIdsOf,
-      getCatalog: getCatalog, catalogConfig: CATALOG_CONFIG, serverTitle: serverTitle };
+      getCatalog: getCatalog, catalogConfig: CATALOG_CONFIG, serverTitle: serverTitle,
+      normalizeUrl: normalizeUrl, extractHtmlSources: extractHtmlSources,
+      extractAbsoluteHttpUrls: extractAbsoluteHttpUrls, isHttpUrl: isHttpUrl, isYandex: isYandex,
+      streamType: streamType, resolveWrapper: resolveWrapper, resolveLink: resolveLink };
   }
 })(typeof globalThis !== "undefined" ? globalThis : this);

@@ -7,6 +7,7 @@ const crypto = require('node:crypto');
 
 const root = path.resolve(__dirname, '..');
 const source = fs.readFileSync(path.join(root, 'plugins/oscartv-v2.js'), 'utf8');
+const manifest = JSON.parse(fs.readFileSync(path.join(root, 'manifest.json'), 'utf8'));
 function wordArray(bytes) {
   const value = Buffer.from(bytes);
   const words = [];
@@ -54,14 +55,78 @@ function httpResponse({ status = 200, url, contentType = '', body = '', headers 
   };
 }
 
-test('v2 exports catalog/details/streams and preserves the deterministic Iron signer', () => {
+test('v2 exports aggregate Home/catalog/details/streams and preserves the deterministic Iron signer', () => {
   const plugin = loadPlugin(async () => { throw new Error('unexpected network'); });
   const vector = JSON.parse(fs.readFileSync(path.join(root, 'tests/fixtures/iron-signer.json'), 'utf8'));
   const [pathPart, timestamp, nonce] = vector.source.split('|');
-  assert.equal(plugin.getHome, undefined);
+  assert.equal(typeof plugin.getHome, 'function');
   assert.equal(plugin.search, undefined);
   assert.equal(typeof plugin.getCatalog, 'function');
   assert.equal(plugin.__test.sign(pathPart, timestamp, nonce), vector.expectedSignature);
+});
+
+test('getHome makes one home request plus the existing anime catalog request and maps only approved sections', async () => {
+  const requests = [];
+  const apiHome = {
+    sections: [
+      { section_type: 'movies_top', items: [{ id: 11, title_ar: 'رائج فيلم', poster: '/top.jpg' }] },
+      { section_type: 'movies', content_filters: { category_id: 3 }, items: [{ id: 12, title_ar: 'فيلم عربي' }] },
+      { section_type: 'movies', content_filters: { category_id: 18 }, items: [{ id: 99, title_ar: 'Excluded category' }] },
+      { section_type: 'ongoing_series', content_category_filter: 1, items: [{ id: 13, title_ar: 'مسلسل مستمر' }] },
+      { section_type: 'latest_additions', content_category_filter: 1, items: [{ id: 14, title_ar: 'إضافة حديثة' }] },
+      { section_type: 'latest_additions', content_category_filter: 4, items: [{ id: 98, title_ar: 'Excluded additions' }] },
+      { section_type: 'movies_spotlight', items: [
+        { item_type: 'movie', item_id: 15, title_ar: 'مختار', bg_image: '/wide.jpg', logo_image: '/logo.png' },
+        { item_type: 'series', item_id: 16, title_ar: 'Wrong spotlight type' }
+      ] },
+      { section_type: 'series_spotlight', items: [{ item_type: 'series', item_id: 17, title_ar: 'مسلسل مختار' }] },
+      { section_type: 'live_tv', items: [{ id: 18, title_ar: 'Excluded live' }] },
+      { section_type: 'sports', items: [{ id: 19, title_ar: 'Excluded sports' }] }
+    ]
+  };
+  const plugin = loadPlugin(async (url, options) => {
+    const parsed = new URL(url);
+    requests.push(parsed);
+    if (parsed.pathname === '/api/v2/home.php') return apiResponse(apiHome);
+    if (parsed.pathname === '/api/anime/') return apiResponse([{ id: 46, title_ar: 'أنمي' }], { page: 1, page_count: 4, total: 80, per_page: 18 });
+    throw new Error(`unexpected request ${parsed.pathname}`);
+  });
+  const result = await plugin.getHome();
+  const home = JSON.parse(JSON.stringify(result));
+  assert.deepEqual(requests.map(url => url.pathname), ['/api/v2/home.php', '/api/anime/']);
+  assert.equal(requests[0].searchParams.get('app_version'), '15');
+  assert.deepEqual(home.sections.map(section => section.id), [
+    'movies_top', 'movies_arabic', 'ongoing_series_arabic', 'latest_additions_arabic',
+    'movies_spotlight', 'series_spotlight', 'anime'
+  ]);
+  assert.deepEqual(home.sections.map(section => section.title), [
+    'رائج', 'جديد السينما العربية', 'الدراما العربية المستمرة', 'وصل حديثًا: مسلسلات عربية',
+    'أفلام مختارة', 'مسلسلات مختارة', 'جديد الأنمي'
+  ]);
+  assert.deepEqual(home.sections.flatMap(section => section.items.map(item => item.nativeId)), [
+    'movie:11', 'movie:12', 'series:13', 'series:14', 'movie:15', 'series:17', 'anime:46'
+  ]);
+  assert.equal(home.sections[4].items[0].backdrop, 'https://ostvapp.cam/wide.jpg');
+  assert.equal(home.sections[4].items[0].logo, 'https://ostvapp.cam/logo.png');
+  assert.equal(home.sections[0].items[0].pluginId, undefined);
+  assert.equal(home.sections[6].hasMore, true);
+});
+
+test('manifest keeps the release version and configures deterministic Yume titles and artwork shapes', () => {
+  assert.equal(manifest.version, '2.0.6');
+  assert.ok(manifest.capabilities.includes('home'));
+  const rows = Object.fromEntries(manifest.catalogs.map(row => [row.id, row]));
+  assert.equal(rows.movies_top.title, 'رائج');
+  assert.equal(rows.movies_top.homeOrder, -100000);
+  assert.equal(rows.movies_arabic.title, 'جديد السينما العربية');
+  assert.equal(rows.ongoing_series_arabic.title, 'الدراما العربية المستمرة');
+  assert.equal(rows.latest_additions_arabic.title, 'وصل حديثًا: مسلسلات عربية');
+  assert.equal(rows.movies_spotlight.title, 'أفلام مختارة');
+  assert.equal(rows.movies_spotlight.presentation.posterShape, 'landscape');
+  assert.equal(rows.series_spotlight.title, 'مسلسلات مختارة');
+  assert.equal(rows.series_spotlight.presentation.posterShape, 'landscape');
+  assert.equal(rows.anime.title, 'جديد الأنمي');
+  assert.equal(rows.anime.homeOrder, 600);
 });
 
 test('catalog descriptors map movies, series, and anime to one native-ID-preserving page each', async () => {

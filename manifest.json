@@ -1,10 +1,10 @@
 {
   "id": "oscar",
   "name": "OscarTV",
-  "version": "2.0.5",
+  "version": "2.0.6",
   "filename": "plugins/oscartv-v2.js",
   "apiVersion": 2,
-  "capabilities": ["details", "streams"],
+  "capabilities": ["home", "details", "streams"],
   "catalogs": [
     {
       "id": "movies",
@@ -12,7 +12,8 @@
       "title": "أحدث الأفلام",
       "capabilities": ["home", "browse", "search", "pagination"],
       "filters": [],
-      "presentation": { "posterShape": "portrait" }
+      "presentation": { "posterShape": "portrait" },
+      "homeFallback": true
     },
     {
       "id": "series",
@@ -20,15 +21,72 @@
       "title": "أحدث المسلسلات",
       "capabilities": ["home", "browse", "search", "pagination"],
       "filters": [],
-      "presentation": { "posterShape": "portrait" }
+      "presentation": { "posterShape": "portrait" },
+      "homeFallback": true
     },
     {
       "id": "anime",
       "type": "anime",
-      "title": "أحدث الأنمي",
+      "title": "جديد الأنمي",
       "capabilities": ["home", "browse", "search", "pagination"],
       "filters": [],
-      "presentation": { "posterShape": "portrait" }
+      "presentation": { "posterShape": "portrait" },
+      "homeOrder": 600,
+      "homeFallback": true
+    },
+    {
+      "id": "movies_top",
+      "type": "movie",
+      "title": "رائج",
+      "capabilities": ["home"],
+      "presentation": { "posterShape": "portrait" },
+      "homeOrder": -100000,
+      "homeFallback": false
+    },
+    {
+      "id": "movies_arabic",
+      "type": "movie",
+      "title": "جديد السينما العربية",
+      "capabilities": ["home"],
+      "presentation": { "posterShape": "portrait" },
+      "homeOrder": 100,
+      "homeFallback": false
+    },
+    {
+      "id": "ongoing_series_arabic",
+      "type": "series",
+      "title": "الدراما العربية المستمرة",
+      "capabilities": ["home"],
+      "presentation": { "posterShape": "portrait" },
+      "homeOrder": 200,
+      "homeFallback": false
+    },
+    {
+      "id": "latest_additions_arabic",
+      "type": "series",
+      "title": "وصل حديثًا: مسلسلات عربية",
+      "capabilities": ["home"],
+      "presentation": { "posterShape": "portrait" },
+      "homeOrder": 300,
+      "homeFallback": false
+    },
+    {
+      "id": "movies_spotlight",
+      "type": "movie",
+      "title": "أفلام مختارة",
+      "capabilities": ["home"],
+      "presentation": { "posterShape": "landscape" },
+      "homeOrder": 400,
+      "homeFallback": false
+    },
+    {
+      "id": "series_spotlight",
+      "type": "series",
+      "title": "مسلسلات مختارة",
+      "capabilities": ["home"],
+      "presentation": { "posterShape": "landscape" },
+      "homeOrder": 500,
+      "homeFallback": false
     }
   ]
 }

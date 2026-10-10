@@ -181,7 +181,8 @@
       originalTitle: (type === "anime"
         ? optional(raw.title_jp) || optional(raw.title_en)
         : optional(raw.title_en) || optional(raw.title_jp)) || undefined,
-      poster: imageUrl(raw.poster) || undefined, backdrop: imageUrl(raw.banner) || undefined,
+      poster: imageUrl(raw.poster) || undefined, backdrop: imageUrl(raw.banner || raw.bg_image) || undefined,
+      logo: imageUrl(raw.logo || raw.logo_image) || undefined,
       year: positiveInt(raw.release_year) || positiveInt(raw.season_year) || undefined,
       rating: isFinite(Number(raw.rating)) && optional(raw.rating) !== null ? Number(raw.rating) : undefined,
       externalIds: externalIdsOf(raw),
@@ -234,6 +235,75 @@
       items: result.items.map(function (item) { return mapMedia(item, catalog.type); }).filter(Boolean),
       page: { nextCursor: hasMore ? String(current + 1) : null, hasMore: hasMore, total: total || undefined }
     };
+  }
+  function homeFilter(section, key, expected) {
+    var filters = section && (section.content_filters || section.movieFilters);
+    if (!filters || typeof filters !== "object") return false;
+    var normalizedKey = key === "category_id" ? "categoryId" : key;
+    var value = filters[normalizedKey];
+    if (value === undefined && normalizedKey !== key) value = filters[key];
+    return String(value) === String(expected);
+  }
+  function homeItems(section, type, spotlight) {
+    if (!section) return [];
+    var value = spotlight
+      ? (Array.isArray(section.spotlightItems) ? section.spotlightItems : section.items)
+      : type === "movie"
+        ? (Array.isArray(section.movieItems) ? section.movieItems : section.items)
+        : (Array.isArray(section.seriesItems) ? section.seriesItems : section.items);
+    return Array.isArray(value) ? value : [];
+  }
+  function spotlightItem(raw, expectedType) {
+    var itemType = optional(raw && raw.item_type);
+    if (itemType !== expectedType) return null;
+    var id = positiveInt(raw.item_id);
+    if (!id) return null;
+    var mapped = mapMedia({
+      id: id,
+      title_ar: raw.title_ar,
+      title_en: raw.title_en,
+      title_jp: raw.title_jp,
+      poster: raw.poster,
+      banner: raw.banner || raw.bg_image,
+      logo: raw.logo || raw.logo_image,
+      release_year: raw.release_year,
+      season_year: raw.season_year,
+      rating: raw.rating,
+      story: raw.story,
+      genres: raw.genres,
+      tmdb_id: raw.tmdb_id,
+      imdb_id: raw.imdb_id
+    }, expectedType);
+    return mapped;
+  }
+  function mapHomeSection(id, title, rawSection, type, spotlight) {
+    var mapped = homeItems(rawSection, type, spotlight).map(function (raw) {
+      return spotlight ? spotlightItem(raw, type) : mapMedia(raw, type);
+    }).filter(Boolean).slice(0, 18);
+    return { id: id, title: title, items: mapped, hasMore: false };
+  }
+  async function getHome() {
+    var data = await objectData("/api/v2/home.php", { app_version: 15 });
+    var sourceSections = Array.isArray(data.sections) ? data.sections : [];
+    function findSection(predicate) {
+      for (var i = 0; i < sourceSections.length; i++) if (predicate(sourceSections[i])) return sourceSections[i];
+      return null;
+    }
+    var selected = [
+      mapHomeSection("movies_top", "رائج", findSection(function (s) { return s.section_type === "movies_top"; }), "movie", false),
+      mapHomeSection("movies_arabic", "جديد السينما العربية", findSection(function (s) { return s.section_type === "movies" && homeFilter(s, "category_id", 3); }), "movie", false),
+      mapHomeSection("ongoing_series_arabic", "الدراما العربية المستمرة", findSection(function (s) { return s.section_type === "ongoing_series" && String(s.content_category_filter) === "1"; }), "series", false),
+      mapHomeSection("latest_additions_arabic", "وصل حديثًا: مسلسلات عربية", findSection(function (s) { return s.section_type === "latest_additions" && String(s.content_category_filter !== undefined ? s.content_category_filter : s.category_filter) === "1"; }), "series", false),
+      mapHomeSection("movies_spotlight", "أفلام مختارة", findSection(function (s) { return s.section_type === "movies_spotlight"; }), "movie", true),
+      mapHomeSection("series_spotlight", "مسلسلات مختارة", findSection(function (s) { return s.section_type === "series_spotlight"; }), "series", true)
+    ];
+    try {
+      var anime = await getCatalog({ catalogId: "anime", type: "anime", limit: 18, filters: {} });
+      selected.push({ id: "anime", title: "جديد الأنمي", items: anime.items.slice(0, 18), hasMore: anime.page.hasMore, nextPage: anime.page.nextCursor || undefined });
+    } catch (_) {
+      selected.push({ id: "anime", title: "جديد الأنمي", items: [], hasMore: false });
+    }
+    return { sections: selected };
   }
   function mapEpisode(raw, type, seasonFallback, posterFallback) {
     var id = positiveInt(raw && raw.id);
@@ -576,7 +646,7 @@
     return { streams: await resolveLinks(links) };
   }
 
-  var plugin = { getCatalog: getCatalog, getDetails: getDetails, getStreams: getStreams,
+  var plugin = { getHome: getHome, getCatalog: getCatalog, getDetails: getDetails, getStreams: getStreams,
     resolveStreamOption: resolveStreamOption };
   if (root && root.module) root.module.exports = plugin;
   // The local node:test harness opts in; this property is absent in the Yume runtime.
@@ -585,7 +655,7 @@
       sign: sign, signedPath: signedPath, directMedia: directMedia, qualityOf: qualityOf,
       mapMedia: mapMedia, detailsItem: detailsItem, imageUrl: imageUrl, isSeriesMp4: isSeriesMp4,
       externalIdsOf: externalIdsOf,
-      getCatalog: getCatalog, catalogConfig: CATALOG_CONFIG, serverTitle: serverTitle,
+      getHome: getHome, mapHomeSection: mapHomeSection, getCatalog: getCatalog, catalogConfig: CATALOG_CONFIG, serverTitle: serverTitle,
       normalizeUrl: normalizeUrl, extractHtmlSources: extractHtmlSources,
       extractAbsoluteHttpUrls: extractAbsoluteHttpUrls, isHttpUrl: isHttpUrl, isYandex: isYandex,
       streamType: streamType, resolveWrapper: resolveWrapper, resolveLink: resolveLink,

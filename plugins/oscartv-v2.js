@@ -306,6 +306,9 @@
       originalTitle: item.originalTitle, poster: item.poster, backdrop: item.backdrop,
       description: item.description, year: item.year, rating: item.rating,
       genres: item.genres || [], externalIds: item.externalIds,
+      hasParentStreams: Array.isArray(raw.watch_links) && raw.watch_links.some(function (link) {
+        return isHttpUrl(link && link.url);
+      }),
       runtime: positiveInt(raw.runtime) || positiveInt(raw.episode_duration) || undefined };
   }
   function qualityOf(value) {
@@ -323,6 +326,9 @@
     var mime = String(contentType || "").toLowerCase();
     if (/text\/html|application\/xhtml\+xml/.test(mime)) return false;
     return /\.(mp4|m3u8|webm|mkv)$/i.test(value) || /^(video\/|application\/(vnd\.apple\.mpegurl|x-mpegurl)|audio\/mpegurl)/i.test(mime);
+  }
+  function mediaContentType(contentType) {
+    return /^(video\/|application\/(vnd\.apple\.mpegurl|x-mpegurl)|audio\/mpegurl)/i.test(String(contentType || "").toLowerCase());
   }
   function isHttpUrl(url) { return /^https?:\/\/[^/?#\s]+(?:[/?#]|$)/i.test(String(url || "").trim()); }
   function hostOf(url) {
@@ -411,19 +417,27 @@
     var response;
     var requestHeaders = {};
     Object.keys(headers || {}).forEach(function (name) { requestHeaders[name] = headers[name]; });
-    // Wrapper targets are probed with a small Range so a successful media response is not read in full.
-    if (!requestHeaders.Range) requestHeaders.Range = "bytes=0-65535";
+    // Confirmed SeriesMP4 wrappers reject Range intermittently while their normal GET
+    // returns a small HTML page. FetchBridge still caps every response body at 1 MiB.
+    // Other targets retain the bounded Range probe used by the hardened resolver.
+    var normalSeriesWrapperGet = isSeriesMp4(url) && (depth === 0 || !directMedia(url, ""));
+    if (!requestHeaders.Range && !normalSeriesWrapperGet) requestHeaders.Range = "bytes=0-65535";
     try { response = await fetch(url, { method: "GET", headers: requestHeaders, redirect: "follow" }); }
     catch (_) { return []; }
     if (!responseAccepted(response)) return [];
     var finalUrl = response.url || url;
     var contentType = response.headers && response.headers.get ? response.headers.get("content-type") || "" : "";
-    var html = "";
-    try { html = typeof response.text === "function" ? await response.text() : ""; } catch (_) { return []; }
-    if (directMedia(finalUrl, contentType) && !htmlResponse(contentType, html)) {
+    if (mediaContentType(contentType)) {
       var mediaHeaders = {};
       Object.keys(headers || {}).forEach(function (name) { mediaHeaders[name] = headers[name]; });
       return [{ url: finalUrl, headers: mediaHeaders, contentType: contentType }];
+    }
+    var html = "";
+    try { html = typeof response.text === "function" ? await response.text() : ""; } catch (_) { return []; }
+    if (directMedia(finalUrl, contentType) && !htmlResponse(contentType, html)) {
+      var extensionMediaHeaders = {};
+      Object.keys(headers || {}).forEach(function (name) { extensionMediaHeaders[name] = headers[name]; });
+      return [{ url: finalUrl, headers: extensionMediaHeaders, contentType: contentType }];
     }
     if (isYandex(finalUrl) && !htmlResponse(contentType, html)) return [];
     if (!htmlResponse(contentType, html) && !/<(?:iframe|video|source)\b/i.test(html)) return [];
@@ -432,7 +446,12 @@
     var found = [];
     for (var i = 0; i < frames.length; i++) {
       var frameUrl = frames[i];
-      var nested = await resolveWrapper(frameUrl, { "User-Agent": headers["User-Agent"] || MEDIA_UA, "Referer": finalUrl }, depth + 1, visited);
+      var frameHeaders = { "User-Agent": headers["User-Agent"] || MEDIA_UA };
+      // Live S1F evidence shows Yandex rejects the SeriesMP4 Referer with 403,
+      // while the same signed target succeeds without it. Keep this policy scoped
+      // to a verified SeriesMP4 -> Yandex transition only.
+      if (!(isSeriesMp4(finalUrl) && isYandex(frameUrl))) frameHeaders.Referer = finalUrl;
+      var nested = await resolveWrapper(frameUrl, frameHeaders, depth + 1, visited);
       found = found.concat(nested);
     }
     if (found.length) return uniqueResolved(found);
@@ -442,7 +461,9 @@
       var src = mediaSources[mediaIndex];
       var resolved = normalizeUrl(finalUrl, src);
       if (resolved && !obviousAd(resolved) && directMedia(resolved)) {
-        var media = await resolveWrapper(resolved, { "User-Agent": headers["User-Agent"] || MEDIA_UA, "Referer": finalUrl }, depth + 1, visited);
+        var mediaHeaders = { "User-Agent": headers["User-Agent"] || MEDIA_UA };
+        if (!(isSeriesMp4(finalUrl) && isYandex(resolved))) mediaHeaders.Referer = finalUrl;
+        var media = await resolveWrapper(resolved, mediaHeaders, depth + 1, visited);
         found = found.concat(media);
       }
     }
@@ -455,8 +476,7 @@
         var absoluteUrl = absoluteUrls[absoluteIndex];
         if (!isYandex(absoluteUrl) || obviousAd(absoluteUrl)) continue;
         var absoluteMedia = await resolveWrapper(absoluteUrl, {
-          "User-Agent": headers["User-Agent"] || MEDIA_UA,
-          "Referer": finalUrl
+          "User-Agent": headers["User-Agent"] || MEDIA_UA
         }, depth + 1, visited);
         found = found.concat(absoluteMedia);
       }
@@ -482,6 +502,8 @@
     var links = [];
     if (parsed.type === "movie") {
       links = (await objectData("/api/movies/show.php", { id: parsed.id })).watch_links || [];
+    } else if (parsed.type === "anime") {
+      links = (await objectData("/api/anime/show.php", { id: parsed.id })).watch_links || [];
     } else if (parsed.type === "series_episode") {
       try { links = (await objectData("/api/episodes/show.php", { id: parsed.id })).watch_links || []; } catch (_) { links = []; }
       if (!links.length) {
@@ -489,7 +511,7 @@
       }
     } else if (parsed.type === "anime_episode") {
       links = (await objectData("/api/anime/episodes/show.php", { id: parsed.id })).watch_links || [];
-    } else fail("streams require movie, series_episode, or anime_episode id");
+    } else fail("streams require movie, anime, series_episode, or anime_episode id");
     var streams = [];
     for (var i = 0; i < links.length; i++) {
       try { streams = streams.concat(await resolveLink(links[i])); }

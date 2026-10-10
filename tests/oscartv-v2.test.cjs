@@ -167,6 +167,26 @@ test('anime details return Japanese original title while preserving visible titl
   assert.equal(result.item.year, 2021);
 });
 
+test('anime details advertise parent streams only when valid parent watch links exist', async () => {
+  const responses = [
+    { id: 150, title_en: 'One Piece Fan Letter', seasons: [], watch_links: [
+      { url: 'https://cdn.mediaoscar.com/fan-letter/master.m3u8', quality: '1080p' }
+    ] },
+    { id: 151, title_en: 'Episode-only anime', seasons: [], watch_links: [] },
+    { id: 152, title_en: 'Malformed special', seasons: [], watch_links: [{ url: 'not-a-url' }] }
+  ];
+  const plugin = loadPlugin(async () => apiResponse(responses.shift()));
+
+  const playable = await plugin.getDetails({ id: 'anime:150' });
+  const episodeOnly = await plugin.getDetails({ id: 'anime:151' });
+  const malformed = await plugin.getDetails({ id: 'anime:152' });
+
+  assert.equal(playable.item.hasParentStreams, true);
+  assert.equal(playable.episodes.length, 0);
+  assert.equal(episodeOnly.item.hasParentStreams, false);
+  assert.equal(malformed.item.hasParentStreams, false);
+});
+
 test('Oscar genres normalize live object, text-array, and delimited-string shapes without object leakage', () => {
   const h = loadPlugin(async () => { throw new Error('genre normalization must not make a request'); }).__test;
   const liveMovie = h.mapMedia({ id: 4433, genres: [
@@ -283,9 +303,57 @@ test('wrapper parsing resolves a relative iframe and preserves media headers', a
   assert.equal(streams[0].headers['User-Agent'], 'FixtureUA');
   assert.equal(streams[0].headers.Referer, 'https://newcdn.seriesmp4.com/watch/1');
   assert.equal(streams[0].headers.Range, undefined);
-  assert.equal(requests[0].options.headers.Range, 'bytes=0-65535');
+  assert.equal(requests[0].options.headers.Range, undefined, 'SeriesMP4 wrapper uses one normal bounded GET');
   assert.equal(requests[1].options.headers.Referer, 'https://newcdn.seriesmp4.com/watch/1');
   assert.equal(requests[1].options.headers.Range, 'bytes=0-65535');
+});
+
+test('SeriesMP4 wrapper avoids the proven Range 416 and resolves Yandex without the rejected Referer', async () => {
+  const wrapper = 'https://newcdn.seriesmp4.com/watch/old-episode';
+  const yandex = 'https://downloader.disk.yandex.ru/disk/old-episode';
+  const finalUrl = 'https://downloader.disk.yandex.ru/disk/old-episode.mp4?token=signed';
+  const requests = [];
+  const plugin = loadPlugin(async (url, options) => {
+    requests.push({ url, options });
+    if (url === wrapper) {
+      if (options.headers.Range) return httpResponse({ status: 416, url, contentType: 'text/html', body: '<html>range rejected</html>' });
+      return httpResponse({ status: 200, url, contentType: 'text/html', body: `<html><iframe src="${yandex}"></iframe></html>` });
+    }
+    if (url === yandex) {
+      assert.equal(options.headers.Referer, undefined, 'SeriesMP4 Referer must not be inherited by Yandex');
+      assert.equal(options.headers.Range, 'bytes=0-65535');
+      assert.equal(options.redirect, 'follow');
+      return httpResponse({ status: 206, url: finalUrl, contentType: 'video/mp4', body: 'partial' });
+    }
+    throw new Error(`unexpected URL ${url}`);
+  });
+
+  const streams = await plugin.__test.resolveLink({ url: wrapper, type: 'direct', deep_link: '?ua=FixtureUA' });
+
+  assert.equal(streams.length, 1);
+  assert.equal(streams[0].url, finalUrl);
+  assert.equal(streams[0].headers['User-Agent'], 'FixtureUA');
+  assert.equal(streams[0].headers.Referer, undefined);
+  assert.equal(streams[0].headers.Range, undefined);
+  assert.equal(requests.length, 2);
+  assert.equal(requests[0].options.headers.Range, undefined);
+});
+
+test('confirmed media MIME is returned without asking JavaScript to read the media body', async () => {
+  let textReads = 0;
+  const plugin = loadPlugin(async (url, options) => ({
+    ok: true,
+    status: 206,
+    url,
+    headers: { get: name => String(name).toLowerCase() === 'content-type' ? 'video/mp4' : null },
+    text: async () => { textReads++; throw new Error('media body must not be read by resolver JavaScript'); }
+  }));
+
+  const streams = await plugin.__test.resolveLink({ url: 'https://downloader.disk.yandex.ru/disk/media', type: 'direct' });
+
+  assert.equal(streams.length, 1);
+  assert.equal(textReads, 0);
+  assert.equal(streams[0].headers.Range, undefined);
 });
 
 test('wrapper resolution rejects HTTP 403, 404, and 416 final responses', async () => {
@@ -353,6 +421,82 @@ test('a broken wrapper does not suppress a following valid HLS source', async ()
   assert.equal(requests.filter(url => url.includes('cdn.mediaoscar.com')).length, 0, 'known direct HLS must not receive a probe request');
 });
 
+test('movie 4444 and modern anime episode 10549 keep direct signed HLS unchanged without probes', async () => {
+  for (const nativeId of ['movie:4444', 'anime_episode:10549']) {
+    const requests = [];
+    const plugin = loadPlugin(async (rawUrl) => {
+      const url = new URL(rawUrl);
+      requests.push(url);
+      if (url.hostname === 'ostvapp.cam') {
+        return apiResponse({ id: Number(nativeId.split(':')[1]), watch_links: [
+          { url: 'https://cdn.mediaoscar.com/live/master.m3u8?token=signed&expires=123', type: 'direct', server_name: 'Mirror' }
+        ] });
+      }
+      throw new Error(`direct HLS must not be probed: ${url.hostname}`);
+    });
+
+    const result = await plugin.getStreams({ id: nativeId });
+
+    assert.equal(requests.length, 1, nativeId);
+    assert.equal(result.streams.length, 1, nativeId);
+    assert.equal(result.streams[0].url, 'https://cdn.mediaoscar.com/live/master.m3u8?token=signed&expires=123');
+    assert.equal(result.streams[0].type, 'm3u8');
+  }
+});
+
+test('anime parent streams use the anime details endpoint and preserve all advertised qualities', async () => {
+  const requests = [];
+  const plugin = loadPlugin(async (rawUrl) => {
+    const url = new URL(rawUrl);
+    requests.push(url);
+    assert.equal(url.pathname, '/api/anime/show.php');
+    assert.equal(url.searchParams.get('id'), '150');
+    return apiResponse({ id: 150, watch_links: ['1080p', '720p', '480p'].map(quality => ({
+      url: `https://cdn.mediaoscar.com/fan-letter/${quality}.m3u8?token=signed`,
+      type: 'direct',
+      quality,
+      server_name: 'Source'
+    })) });
+  });
+
+  const result = await plugin.getStreams({ id: 'anime:150' });
+
+  assert.equal(requests.length, 1);
+  assert.equal(result.streams.length, 3);
+  assert.deepEqual(Array.from(result.streams, stream => stream.quality), ['1080p', '720p', '480p']);
+  assert.ok(result.streams.every(stream => stream.type === 'm3u8'));
+  assert.ok(result.streams.every(stream => stream.provider === 'Source'));
+});
+
+test('anime episode 3383 fixture resolves SeriesMP4 iframe through Yandex and keeps native request identity', async () => {
+  const wrapper = 'https://newcdn.seriesmp4.com/watch/3383';
+  const yandex = 'https://downloader.disk.yandex.ru/disk/3383';
+  const finalUrl = 'https://downloader.disk.yandex.ru/disk/3383.mp4?token=signed';
+  const requests = [];
+  const plugin = loadPlugin(async (rawUrl, options) => {
+    const url = new URL(rawUrl);
+    requests.push({ url, options });
+    if (url.hostname === 'ostvapp.cam') {
+      assert.equal(url.pathname, '/api/anime/episodes/show.php');
+      assert.equal(url.searchParams.get('id'), '3383');
+      return apiResponse({ id: 3383, watch_links: [{ url: wrapper, type: 'direct', server_name: 'Mirror' }] });
+    }
+    if (rawUrl === wrapper) return httpResponse({ status: 200, url: rawUrl, contentType: 'text/html', body: `<iframe src="${yandex}"></iframe>` });
+    if (rawUrl === yandex) {
+      assert.equal(options.headers.Referer, undefined);
+      return httpResponse({ status: 206, url: finalUrl, contentType: 'video/mp4', body: 'partial' });
+    }
+    throw new Error(`unexpected host ${url.hostname}`);
+  });
+
+  const result = await plugin.getStreams({ id: 'anime_episode:3383' });
+
+  assert.equal(result.streams.length, 1);
+  assert.equal(result.streams[0].url, finalUrl);
+  assert.equal(result.streams[0].headers.Referer, undefined);
+  assert.equal(requests.length, 3);
+});
+
 test('valid mediaoscar direct links remain unchanged and preserve signed URLs and User-Agent', async () => {
   let fetches = 0;
   const plugin = loadPlugin(async () => { fetches += 1; throw new Error('direct media must not fetch'); });
@@ -404,9 +548,12 @@ test('SeriesMP4 bounded body fallback follows only a Yandex media URL and ignore
   assert.equal(streams.length, 1);
   assert.equal(streams[0].url, media);
   assert.equal(streams[0].headers['User-Agent'], 'BodyUA');
-  assert.equal(streams[0].headers.Referer, wrapper);
+  assert.equal(streams[0].headers.Referer, undefined);
+  assert.equal(streams[0].headers.Range, undefined);
   assert.deepEqual(requests.map(request => request.url), [wrapper, media]);
-  assert.ok(requests.every(request => request.options.headers.Range === 'bytes=0-65535'));
+  assert.equal(requests[0].options.headers.Range, undefined);
+  assert.equal(requests[1].options.headers.Range, 'bytes=0-65535');
+  assert.equal(requests[1].options.headers.Referer, undefined);
 });
 
 test('SeriesMP4 absolute body fallback rejects non-Yandex hosts and ad paths without probing them', async () => {

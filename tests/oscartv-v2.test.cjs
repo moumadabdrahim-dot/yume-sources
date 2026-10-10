@@ -693,3 +693,215 @@ test('STREAMS forwards the typed native episode number to Oscar without deriving
   assert.equal(result.streams.length, 1);
   assert.equal(result.streams[0].url, 'https://cdn.mediaoscar.com/video/episode.mp4?token=fixture');
 });
+
+test('STREAMS resolves at most two slow links concurrently and preserves advertised order and quality', async () => {
+  const delays = [90, 80, 70, 60];
+  let active = 0;
+  let peak = 0;
+  let bodyReads = 0;
+  const plugin = loadPlugin(async (rawUrl, options) => {
+    const url = new URL(rawUrl);
+    if (url.hostname === 'ostvapp.cam') {
+      return apiResponse({ id: 3383, watch_links: delays.map((_, index) => ({
+        url: `https://probe${index}.example/wrapper?signature=keep-${index}`,
+        type: 'direct',
+        quality: `${1080 - index * 180}p`,
+        server_name: `Mirror ${index + 1}`
+      })) });
+    }
+    const index = Number(url.hostname.match(/^probe(\d+)\./)[1]);
+    assert.equal(options.headers.Range, 'bytes=0-65535');
+    active += 1;
+    peak = Math.max(peak, active);
+    await new Promise(resolve => setTimeout(resolve, delays[index]));
+    active -= 1;
+    return {
+      ...httpResponse({
+        status: 206,
+        url: `https://media.example/video${index}.mp4?signature=keep-${index}`,
+        contentType: 'video/mp4'
+      }),
+      text: async () => { bodyReads += 1; return 'must not read a media body'; }
+    };
+  });
+
+  const started = performance.now();
+  const result = await plugin.getStreams({ id: 'anime_episode:3383' });
+  const elapsedMs = performance.now() - started;
+
+  assert.equal(peak, 2);
+  assert.ok(elapsedMs < 250, `bounded concurrency should beat the 300 ms sequential fixture, got ${elapsedMs} ms`);
+  assert.equal(bodyReads, 0, 'media response bodies must not be downloaded');
+  assert.deepEqual(Array.from(result.streams, stream => stream.title), ['Mirror 1', 'Mirror 2', 'Mirror 3', 'Mirror 4']);
+  assert.deepEqual(Array.from(result.streams, stream => stream.quality), ['1080p', '900p', '720p', '540p']);
+  assert.deepEqual(Array.from(result.streams, stream => stream.url), [0, 1, 2, 3].map(index => `https://media.example/video${index}.mp4?signature=keep-${index}`));
+  assert.equal(new Set(result.streams.map(stream => stream.url)).size, 4);
+});
+
+test('STREAMS isolates one resolver failure while the other worker continues', async () => {
+  let active = 0;
+  let peak = 0;
+  const plugin = loadPlugin(async rawUrl => {
+    const url = new URL(rawUrl);
+    if (url.hostname === 'ostvapp.cam') {
+      return apiResponse({ id: 3383, watch_links: [
+        { url: 'https://broken.example/wrapper', type: 'direct', server_name: 'Broken' },
+        { url: 'https://working.example/wrapper', type: 'direct', server_name: 'Working', quality: '720p' }
+      ] });
+    }
+    active += 1;
+    peak = Math.max(peak, active);
+    await new Promise(resolve => setTimeout(resolve, 20));
+    active -= 1;
+    if (url.hostname === 'broken.example') throw new Error('fixture failure');
+    return httpResponse({ status: 206, url: 'https://media.example/working.mp4', contentType: 'video/mp4' });
+  });
+
+  const result = await plugin.getStreams({ id: 'anime_episode:3383' });
+
+  assert.equal(peak, 2);
+  assert.equal(result.streams.length, 1);
+  assert.equal(result.streams[0].title, 'Working');
+  assert.equal(result.streams[0].quality, '720p');
+});
+
+test('direct HLS batches remain probe-free under bounded resolution', async () => {
+  const signedUrls = [0, 1, 2].map(index => `https://cdn.mediaoscar.com/fan-letter/${index}.m3u8?token=signed-${index}`);
+  let calls = 0;
+  const plugin = loadPlugin(async rawUrl => {
+    calls += 1;
+    const url = new URL(rawUrl);
+    assert.equal(url.hostname, 'ostvapp.cam', 'direct HLS must not be probed');
+    return apiResponse({ id: 150, watch_links: signedUrls.map((streamUrl, index) => ({
+      url: streamUrl,
+      type: 'direct',
+      quality: `${1080 - index * 360}p`,
+      server_name: `Source ${index + 1}`
+    })) });
+  });
+
+  const result = await plugin.getStreams({ id: 'anime:150' });
+
+  assert.equal(calls, 1);
+  assert.deepEqual(Array.from(result.streams, stream => stream.url), signedUrls);
+  assert.equal(result.streams.length, 3);
+});
+
+test('lazy stream options expose every advertised quality without resolving wrappers', async () => {
+  const requests = [];
+  const plugin = loadPlugin(async rawUrl => {
+    const url = new URL(rawUrl);
+    requests.push(url);
+    assert.equal(url.hostname, 'ostvapp.cam');
+    return apiResponse({ id: 3383, watch_links: [
+      { url: 'https://newcdn.seriesmp4.com/watch/one', type: 'direct', quality: '1080p', server_name: 'Mirror 1' },
+      { url: 'https://newcdn.seriesmp4.com/watch/two', type: 'direct', quality: '720p', server_name: 'Mirror 2' }
+    ] });
+  });
+
+  const result = await plugin.getStreams({ id: 'anime_episode:3383', mode: 'options' });
+
+  assert.equal(requests.length, 1, 'listing options must only call the Oscar API');
+  assert.equal(result.options.length, 2);
+  assert.deepEqual(Array.from(result.options, option => option.quality), ['1080p', '720p']);
+  assert.ok(result.options.every(option => option.token && !option.url));
+});
+
+test('lazy options preserve anime parent and movie server counts without probes', async () => {
+  const requests = [];
+  const plugin = loadPlugin(async rawUrl => {
+    const url = new URL(rawUrl);
+    requests.push(url);
+    assert.equal(url.hostname, 'ostvapp.cam');
+    const count = url.pathname === '/api/anime/show.php' ? 3 : 5;
+    return apiResponse({
+      id: Number(url.searchParams.get('id')),
+      watch_links: Array.from({ length: count }, (_, index) => ({
+        url: `https://cdn.mediaoscar.com/direct/${index}.m3u8?token=kept-${index}`,
+        type: 'direct',
+        quality: `${1080 - index * 120}p`,
+        server_name: `Source ${index + 1}`
+      }))
+    });
+  });
+
+  const parent = await plugin.getStreams({ id: 'anime:150', mode: 'options' });
+  const movie = await plugin.getStreams({ id: 'movie:4444', mode: 'options' });
+
+  assert.equal(parent.options.length, 3);
+  assert.equal(movie.options.length, 5);
+  assert.equal(requests.length, 2, 'each lazy listing must perform only its Oscar API request');
+  assert.deepEqual(requests.map(url => url.pathname), ['/api/anime/show.php', '/api/movies/show.php']);
+});
+
+test('only the selected lazy option is resolved and direct HLS keeps the fast path', async () => {
+  const wrapper = 'https://newcdn.seriesmp4.com/watch/selected';
+  const yandex = 'https://downloader.disk.yandex.ru/disk/selected';
+  const finalUrl = 'https://downloader.disk.yandex.ru/disk/selected.mp4?token=signed';
+  const directUrl = 'https://cdn.mediaoscar.com/live/direct.m3u8?token=signed';
+  const requests = [];
+  const plugin = loadPlugin(async (url, options) => {
+    requests.push({ url, options });
+    if (url === wrapper) return httpResponse({ status: 200, url, contentType: 'text/html', body: `<iframe src="${yandex}"></iframe>` });
+    if (url === yandex) return httpResponse({ status: 206, url: finalUrl, contentType: 'video/mp4', body: 'partial' });
+    throw new Error(`unexpected URL ${url}`);
+  });
+  const wrapperToken = plugin.__test.streamOption({ url: wrapper, type: 'direct', server_name: 'Mirror' }).token;
+  const directToken = plugin.__test.streamOption({ url: directUrl, type: 'direct', server_name: 'Direct' }).token;
+
+  const resolved = await plugin.resolveStreamOption({ id: 'anime_episode:3383', token: wrapperToken });
+  assert.equal(resolved.streams.length, 1);
+  assert.equal(resolved.streams[0].url, finalUrl);
+  assert.deepEqual(requests.map(request => request.url), [wrapper, yandex]);
+
+  requests.length = 0;
+  const direct = await plugin.resolveStreamOption({ id: 'anime_episode:10549', token: directToken });
+  assert.equal(direct.streams[0].url, directUrl);
+  assert.equal(requests.length, 0, 'direct HLS must not receive a probe during selected resolution');
+});
+
+test('invalid and failed lazy options stay isolated and can be retried', async () => {
+  let attempts = 0;
+  const wrapper = 'https://newcdn.seriesmp4.com/watch/retry';
+  const plugin = loadPlugin(async url => {
+    attempts += 1;
+    if (attempts === 1) return httpResponse({ status: 403, url, contentType: 'text/html', body: '<html>denied</html>' });
+    return httpResponse({ status: 206, url: 'https://media.example/retry.mp4', contentType: 'video/mp4', body: 'partial' });
+  });
+  const token = plugin.__test.streamOption({ url: wrapper, type: 'direct', server_name: 'Retry' }).token;
+
+  assert.deepEqual(Array.from((await plugin.resolveStreamOption({ id: 'anime_episode:3383', token })).streams), []);
+  const retry = await plugin.resolveStreamOption({ id: 'anime_episode:3383', token });
+  assert.equal(retry.streams[0].url, 'https://media.example/retry.mp4');
+  await assert.rejects(plugin.resolveStreamOption({ id: 'anime_episode:3383', token: '{"version":2}' }), /invalid stream option token/);
+});
+
+test('lazy listing separates time to server list from selected server resolution', async t => {
+  const links = [0, 1].map(index => ({
+    url: `https://slow${index}.example/wrapper`, type: 'direct', server_name: `Mirror ${index + 1}`
+  }));
+  const plugin = loadPlugin(async rawUrl => {
+    const url = new URL(rawUrl);
+    if (url.hostname === 'ostvapp.cam') {
+      await new Promise(resolve => setTimeout(resolve, 20));
+      return apiResponse({ id: 3383, watch_links: links });
+    }
+    await new Promise(resolve => setTimeout(resolve, 80));
+    return httpResponse({ status: 206, url: `https://media.example/${url.hostname}.mp4`, contentType: 'video/mp4' });
+  });
+
+  const legacyStart = performance.now();
+  await plugin.getStreams({ id: 'anime_episode:3383' });
+  const legacyMs = performance.now() - legacyStart;
+  const listStart = performance.now();
+  const listed = await plugin.getStreams({ id: 'anime_episode:3383', mode: 'options' });
+  const listMs = performance.now() - listStart;
+  const resolveStart = performance.now();
+  await plugin.resolveStreamOption({ id: 'anime_episode:3383', token: listed.options[0].token });
+  const resolveMs = performance.now() - resolveStart;
+
+  assert.ok(listMs < legacyMs, `options ${listMs}ms should beat full resolution ${legacyMs}ms`);
+  assert.ok(listMs < 70, `fixture option listing should be API-bound, got ${listMs}ms`);
+  assert.ok(resolveMs >= 60, `selected fixture should include its resolver delay, got ${resolveMs}ms`);
+  t.diagnostic(`fixture legacy=${legacyMs.toFixed(1)}ms list=${listMs.toFixed(1)}ms selectedResolve=${resolveMs.toFixed(1)}ms`);
+});

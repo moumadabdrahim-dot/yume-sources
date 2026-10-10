@@ -10,6 +10,7 @@
   var API_UA = "okhttp/4.12.0";
   var MEDIA_UA = "TDMuaPlayer";
   var MAX_PAGES = 1000;
+  var MAX_CONCURRENT_STREAM_RESOLUTIONS = 2;
 
   function fail(message) { throw new Error("Source: " + message); }
   function text(value) {
@@ -497,8 +498,32 @@
     return [{ url: url, title: serverTitle(link), provider: "Source",
       quality: qualityOf(link.quality), type: streamType(url, ""), headers: headers }];
   }
-  async function getStreams(args) {
-    var parsed = parseId(args && args.id);
+  async function resolveLinks(links) {
+    var resolvedByIndex = new Array(links.length);
+    var nextIndex = 0;
+    async function worker() {
+      while (true) {
+        var index = nextIndex++;
+        if (index >= links.length) return;
+        try { resolvedByIndex[index] = await resolveLink(links[index]); }
+        catch (error) {
+          resolvedByIndex[index] = [];
+          if (typeof console !== "undefined" && console.warn) console.warn("OscarTV stream resolution failed:", error.message || error);
+        }
+      }
+    }
+    var workers = [];
+    var workerCount = Math.min(MAX_CONCURRENT_STREAM_RESOLUTIONS, links.length);
+    for (var i = 0; i < workerCount; i++) workers.push(worker());
+    await Promise.all(workers);
+    var streams = [];
+    for (var resultIndex = 0; resultIndex < resolvedByIndex.length; resultIndex++) {
+      streams = streams.concat(resolvedByIndex[resultIndex] || []);
+    }
+    return streams;
+  }
+
+  async function watchLinksFor(parsed) {
     var links = [];
     if (parsed.type === "movie") {
       links = (await objectData("/api/movies/show.php", { id: parsed.id })).watch_links || [];
@@ -512,15 +537,47 @@
     } else if (parsed.type === "anime_episode") {
       links = (await objectData("/api/anime/episodes/show.php", { id: parsed.id })).watch_links || [];
     } else fail("streams require movie, anime, series_episode, or anime_episode id");
-    var streams = [];
-    for (var i = 0; i < links.length; i++) {
-      try { streams = streams.concat(await resolveLink(links[i])); }
-      catch (error) { if (typeof console !== "undefined" && console.warn) console.warn("OscarTV stream resolution failed:", error.message || error); }
+    return Array.isArray(links) ? links : [];
+  }
+  function streamOption(link, index) {
+    var safeLink = {
+      url: text(link && link.url),
+      deep_link: text(link && link.deep_link) || undefined,
+      type: text(link && link.type) || undefined,
+      quality: text(link && link.quality) || undefined,
+      server_name: text(link && link.server_name) || undefined
+    };
+    if (!isHttpUrl(safeLink.url)) return null;
+    return { token: JSON.stringify({ version: 1, ordinal: Number(index) || 0, link: safeLink }), title: serverTitle(link),
+      provider: "Source", quality: qualityOf(link && link.quality), type: text(link && link.type) || undefined };
+  }
+  function linkFromOptionToken(token) {
+    var parsed;
+    try { parsed = JSON.parse(String(token || "")); } catch (_) { return null; }
+    if (!parsed || parsed.version !== 1 || !parsed.link || !isHttpUrl(parsed.link.url)) return null;
+    return parsed.link;
+  }
+  async function resolveStreamOption(args) {
+    parseId(args && args.id);
+    var link = linkFromOptionToken(args && args.token);
+    if (!link) fail("invalid stream option token");
+    return { streams: await resolveLink(link) };
+  }
+  async function getStreams(args) {
+    var parsed = parseId(args && args.id);
+    var apiStartedAt = Date.now();
+    var links = await watchLinksFor(parsed);
+    var apiMs = Date.now() - apiStartedAt;
+    if (args && args.mode === "options") {
+      var parsingStartedAt = Date.now();
+      var options = links.map(streamOption).filter(Boolean);
+      return { options: options, timing: { apiMs: apiMs, parsingMs: Date.now() - parsingStartedAt } };
     }
-    return { streams: streams };
+    return { streams: await resolveLinks(links) };
   }
 
-  var plugin = { getCatalog: getCatalog, getDetails: getDetails, getStreams: getStreams };
+  var plugin = { getCatalog: getCatalog, getDetails: getDetails, getStreams: getStreams,
+    resolveStreamOption: resolveStreamOption };
   if (root && root.module) root.module.exports = plugin;
   // The local node:test harness opts in; this property is absent in the Yume runtime.
   if (root && root.__YUME_OSCAR_TESTING__ && root.module) {
@@ -531,6 +588,8 @@
       getCatalog: getCatalog, catalogConfig: CATALOG_CONFIG, serverTitle: serverTitle,
       normalizeUrl: normalizeUrl, extractHtmlSources: extractHtmlSources,
       extractAbsoluteHttpUrls: extractAbsoluteHttpUrls, isHttpUrl: isHttpUrl, isYandex: isYandex,
-      streamType: streamType, resolveWrapper: resolveWrapper, resolveLink: resolveLink };
+      streamType: streamType, resolveWrapper: resolveWrapper, resolveLink: resolveLink,
+      resolveLinks: resolveLinks, streamOption: streamOption, linkFromOptionToken: linkFromOptionToken,
+      resolveStreamOption: resolveStreamOption };
   }
 })(typeof globalThis !== "undefined" ? globalThis : this);

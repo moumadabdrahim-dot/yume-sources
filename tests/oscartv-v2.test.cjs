@@ -65,68 +65,93 @@ test('v2 exports aggregate Home/catalog/details/streams and preserves the determ
   assert.equal(plugin.__test.sign(pathPart, timestamp, nonce), vector.expectedSignature);
 });
 
-test('getHome makes one home request plus the existing anime catalog request and maps only approved sections', async () => {
+test('getHome loads the 11 ordered paginated catalog rows and returns only poster-ready items', async () => {
   const requests = [];
-  const apiHome = {
-    sections: [
-      { section_type: 'movies_top', items: [{ id: 11, title_ar: 'رائج فيلم', poster: '/top.jpg' }] },
-      { section_type: 'movies', content_filters: { category_id: 3 }, items: [{ id: 12, title_ar: 'فيلم عربي' }] },
-      { section_type: 'movies', content_filters: { category_id: 18 }, items: [{ id: 99, title_ar: 'Excluded category' }] },
-      { section_type: 'ongoing_series', content_category_filter: 1, items: [{ id: 13, title_ar: 'مسلسل مستمر' }] },
-      { section_type: 'latest_additions', content_category_filter: 1, items: [{ id: 14, title_ar: 'إضافة حديثة' }] },
-      { section_type: 'latest_additions', content_category_filter: 4, items: [{ id: 98, title_ar: 'Excluded additions' }] },
-      { section_type: 'movies_spotlight', items: [
-        { item_type: 'movie', item_id: 15, title_ar: 'مختار', bg_image: '/wide.jpg', logo_image: '/logo.png' },
-        { item_type: 'series', item_id: 16, title_ar: 'Wrong spotlight type' }
-      ] },
-      { section_type: 'series_spotlight', items: [{ item_type: 'series', item_id: 17, title_ar: 'مسلسل مختار' }] },
-      { section_type: 'live_tv', items: [{ id: 18, title_ar: 'Excluded live' }] },
-      { section_type: 'sports', items: [{ id: 19, title_ar: 'Excluded sports' }] }
-    ]
-  };
-  const plugin = loadPlugin(async (url, options) => {
+  const plugin = loadPlugin(async url => {
     const parsed = new URL(url);
     requests.push(parsed);
-    if (parsed.pathname === '/api/v2/home.php') return apiResponse(apiHome);
-    if (parsed.pathname === '/api/anime/') return apiResponse([{ id: 46, title_ar: 'أنمي' }], { page: 1, page_count: 4, total: 80, per_page: 18 });
-    throw new Error(`unexpected request ${parsed.pathname}`);
+    const ordinal = requests.length;
+    const type = parsed.pathname.includes('/anime/') ? 'anime' : parsed.pathname.includes('/series/') ? 'series' : 'movie';
+    await new Promise(resolve => setTimeout(resolve, ordinal));
+    return apiResponse(Array.from({ length: 4 }, (_, index) => ({
+      id: ordinal * 100 + index + 1,
+      title_en: `${type} ${ordinal}-${index}`,
+      poster: index === 3 ? null : `/poster-${ordinal}-${index}.jpg`,
+      banner: `/backdrop-${ordinal}-${index}.jpg`,
+      logo: `/logo-${ordinal}-${index}.png`
+    })), { page: 1, page_count: 4, total: 80, per_page: 18 });
   });
-  const result = await plugin.getHome();
-  const home = JSON.parse(JSON.stringify(result));
-  assert.deepEqual(requests.map(url => url.pathname), ['/api/v2/home.php', '/api/anime/']);
-  assert.equal(requests[0].searchParams.get('app_version'), '15');
-  assert.deepEqual(home.sections.map(section => section.id), [
-    'movies_top', 'movies_arabic', 'ongoing_series_arabic', 'latest_additions_arabic',
-    'movies_spotlight', 'series_spotlight', 'anime'
-  ]);
-  assert.deepEqual(home.sections.map(section => section.title), [
-    'رائج', 'جديد السينما العربية', 'الدراما العربية المستمرة', 'وصل حديثًا: مسلسلات عربية',
-    'أفلام مختارة', 'مسلسلات مختارة', 'جديد الأنمي'
-  ]);
-  assert.deepEqual(home.sections.flatMap(section => section.items.map(item => item.nativeId)), [
-    'movie:11', 'movie:12', 'series:13', 'series:14', 'movie:15', 'series:17', 'anime:46'
-  ]);
-  assert.equal(home.sections[4].items[0].backdrop, 'https://ostvapp.cam/wide.jpg');
-  assert.equal(home.sections[4].items[0].logo, 'https://ostvapp.cam/logo.png');
+  const home = JSON.parse(JSON.stringify(await plugin.getHome()));
+  const ids = ['movies_top', 'foreign_movies', 'foreign_series', 'foreign_latest', 'foreign_airing', 'asian_series', 'asian_latest', 'asian_airing', 'anime_picks', 'anime', 'anime_movies'];
+  const titles = ['رائج اليوم', 'أفلام أجنبية', 'مسلسلات أجنبية', 'أحدث الأجنبي', 'يعرض الآن', 'مسلسلات آسيوية', 'أحدث الآسيوي', 'يعرض الآن آسيوي', 'اخترنا لك', 'أحدث الأنمي', 'أفلام أنمي'];
+  assert.equal(requests.length, 11);
+  assert.deepEqual(home.sections.map(section => section.id), ids);
+  assert.deepEqual(home.sections.map(section => section.title), titles);
+  assert.equal(home.sections.every(section => section.items.length === 3), true);
+  assert.equal(home.sections.every(section => section.items.every(item => /^https:\/\//.test(item.poster))), true);
+  assert.equal(home.sections.every(section => section.hasMore === true && section.nextPage === '2'), true);
+  assert.equal(home.sections.some(section => /العربية|مختارة/.test(section.title)), false);
+  assert.equal(home.sections.some(section => ['movies_spotlight', 'series_spotlight'].includes(section.id)), false);
+  assert.equal(home.sections[0].items[0].nativeId, 'movie:101');
+  assert.equal(home.sections[2].items[0].nativeId, 'series:301');
+  assert.equal(home.sections[8].items[0].nativeId, 'anime:901');
   assert.equal(home.sections[0].items[0].pluginId, undefined);
-  assert.equal(home.sections[6].hasMore, true);
+  assert.deepEqual(requests.map(url => url.pathname), ['/api/movies/', '/api/movies/', '/api/series/', '/api/series/', '/api/series/', '/api/series/', '/api/series/', '/api/series/', '/api/anime/', '/api/anime/', '/api/anime/']);
+  assert.deepEqual(requests.map(url => Object.fromEntries(url.searchParams.entries())), [
+    { sort_by: 'views_today', page: '1', limit: '18' },
+    { category: '18', sort_by: 'newest', page: '1', limit: '18' },
+    { category: '4', sort_by: 'most_viewed', page: '1', limit: '18' },
+    { category: '4', sort_by: 'newest', page: '1', limit: '18' },
+    { category: '4', status: 'ongoing', sort_by: 'latest_episode', page: '1', limit: '18' },
+    { category: '5', sort_by: 'most_viewed', page: '1', limit: '18' },
+    { category: '5', sort_by: 'newest', page: '1', limit: '18' },
+    { category: '5', status: 'ongoing', sort_by: 'latest_episode', page: '1', limit: '18' },
+    { sort_by: 'rating', page: '1', limit: '18' },
+    { sort_by: 'newest', page: '1', limit: '18' },
+    { anime_type: 'movie', sort_by: 'newest', page: '1', limit: '18' }
+  ]);
 });
 
-test('manifest keeps the release version and configures deterministic Yume titles and artwork shapes', () => {
-  assert.equal(manifest.version, '2.0.6');
+test('getHome suppresses empty rows and rows where most catalog items have no portrait poster', async () => {
+  const plugin = loadPlugin(async url => {
+    const parsed = new URL(url);
+    const category = parsed.searchParams.get('category');
+    if (parsed.pathname === '/api/movies/' && parsed.searchParams.get('sort_by') === 'views_today') {
+      return apiResponse([], { page: 1, page_count: 1, total: 0, per_page: 18 });
+    }
+    const items = category === '18'
+      ? [{ id: 1, title_en: 'one', poster: '/one.jpg' }, { id: 2, title_en: 'two' }, { id: 3, title_en: 'three' }, { id: 4, title_en: 'four' }]
+      : [{ id: Number(category || 4) + 10, title_en: 'poster', poster: '/poster.jpg' }];
+    return apiResponse(items, { page: 1, page_count: 2, total: 20, per_page: 18 });
+  });
+  const home = JSON.parse(JSON.stringify(await plugin.getHome()));
+  assert.equal(home.sections.some(section => section.id === 'movies_top'), false);
+  assert.equal(home.sections.some(section => section.id === 'foreign_movies'), false);
+  assert.equal(home.sections.length, 9);
+  assert.equal(home.sections.every(section => section.items.length > 0 && section.items.every(item => item.poster)), true);
+});
+
+test('manifest exposes only the requested ordered Home catalogs with paginated browse targets', () => {
+  assert.equal(manifest.version, '2.0.7');
   assert.ok(manifest.capabilities.includes('home'));
+  const expected = [
+    ['movies_top', 'رائج اليوم'], ['foreign_movies', 'أفلام أجنبية'], ['foreign_series', 'مسلسلات أجنبية'],
+    ['foreign_latest', 'أحدث الأجنبي'], ['foreign_airing', 'يعرض الآن'], ['asian_series', 'مسلسلات آسيوية'],
+    ['asian_latest', 'أحدث الآسيوي'], ['asian_airing', 'يعرض الآن آسيوي'], ['anime_picks', 'اخترنا لك'],
+    ['anime', 'أحدث الأنمي'], ['anime_movies', 'أفلام أنمي']
+  ];
   const rows = Object.fromEntries(manifest.catalogs.map(row => [row.id, row]));
-  assert.equal(rows.movies_top.title, 'رائج');
-  assert.equal(rows.movies_top.homeOrder, -100000);
-  assert.equal(rows.movies_arabic.title, 'جديد السينما العربية');
-  assert.equal(rows.ongoing_series_arabic.title, 'الدراما العربية المستمرة');
-  assert.equal(rows.latest_additions_arabic.title, 'وصل حديثًا: مسلسلات عربية');
-  assert.equal(rows.movies_spotlight.title, 'أفلام مختارة');
-  assert.equal(rows.movies_spotlight.presentation.posterShape, 'landscape');
-  assert.equal(rows.series_spotlight.title, 'مسلسلات مختارة');
-  assert.equal(rows.series_spotlight.presentation.posterShape, 'landscape');
-  assert.equal(rows.anime.title, 'جديد الأنمي');
-  assert.equal(rows.anime.homeOrder, 600);
+  const homeRows = manifest.catalogs.filter(row => row.capabilities.includes('home'));
+  assert.deepEqual(homeRows.map(row => [row.id, row.title]), expected);
+  assert.equal(homeRows.every(row => row.capabilities.includes('browse') && row.capabilities.includes('pagination')), true);
+  assert.equal(homeRows.every(row => row.presentation?.posterShape === 'portrait'), true);
+  assert.equal(homeRows.every(row => row.homeFallback), true);
+  assert.deepEqual(homeRows.map(row => row.homeOrder), [...homeRows.map(row => row.homeOrder)].sort((a, b) => a - b));
+  assert.equal(manifest.catalogs.some(row => /العربية|مختارة/.test(row.title)), false);
+  assert.equal(rows.movies.capabilities.includes('home'), false);
+  assert.equal(rows.series.capabilities.includes('home'), false);
+  assert.equal(rows.movies.capabilities.includes('browse'), true);
+  assert.equal(rows.series.capabilities.includes('browse'), true);
 });
 
 test('catalog descriptors map movies, series, and anime to one native-ID-preserving page each', async () => {

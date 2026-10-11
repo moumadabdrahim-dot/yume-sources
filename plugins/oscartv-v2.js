@@ -140,10 +140,15 @@
       host: true, connection: true, "content-length": true, "transfer-encoding": true,
       "keep-alive": true, "proxy-connection": true, upgrade: true, te: true, trailer: true
     };
+    var allowedApiHeaders = {
+      accept: true, "user-agent": true, "x-iron-sig": true, "x-iron-ts": true,
+      "x-iron-nonce": true, "x-iron-diag": true
+    };
     var apiRequestHeaders = {};
     Object.keys(headerPayload.headers).forEach(function (name) {
       var value = headerPayload.headers[name];
-      if (!/^[!#$%&'*+.^_`|~0-9a-z-]+$/i.test(name) || blockedHeaders[name.toLowerCase()]) return;
+      var lowerName = name.toLowerCase();
+      if (!/^[!#$%&'*+.^_`|~0-9a-z-]+$/i.test(name) || blockedHeaders[lowerName] || !allowedApiHeaders[lowerName]) return;
       if (typeof value !== "string" && typeof value !== "number") return;
       apiRequestHeaders[name] = String(value);
     });

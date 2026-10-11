@@ -103,6 +103,33 @@ test('API requests obtain headers with a form POST, then GET the same URL with f
   assert.deepEqual(events.map(event => event.stage), ['fetch', 'fetch']);
 });
 
+test('unexpected provider credentials are never forwarded to the Oscar API', async () => {
+  const events = [];
+  const plugin = loadPlugin(async () => apiResponse([]), {
+    onFetch: (url, options) => events.push({ url, options }),
+    headerProviderFetch: async () => ({
+      ok: true,
+      status: 200,
+      json: async () => ({ headers: {
+        'X-Iron-Sig': 'expected-signature', 'X-Iron-Ts': '123', 'X-Iron-Nonce': 'abc',
+        Accept: 'application/json', 'User-Agent': 'expected-agent',
+        Authorization: 'unexpected-auth', Cookie: 'unexpected-cookie',
+        'Proxy-Authorization': 'unexpected-proxy-auth', 'X-Provider-Token': 'unexpected-token'
+      } })
+    })
+  });
+
+  await plugin.getCatalog({ catalogId: 'movies', type: 'movie', limit: 1 });
+  const forwardedHeaders = events[1].options.headers;
+  assert.deepEqual(Object.keys(forwardedHeaders).sort(), [
+    'Accept', 'User-Agent', 'X-Iron-Nonce', 'X-Iron-Sig', 'X-Iron-Ts'
+  ]);
+  assert.equal(forwardedHeaders.Authorization, undefined);
+  assert.equal(forwardedHeaders.Cookie, undefined);
+  assert.equal(forwardedHeaders['Proxy-Authorization'], undefined);
+  assert.equal(forwardedHeaders['X-Provider-Token'], undefined);
+});
+
 test('header-provider failures are explicit and never fall back to the old signer', async () => {
   let apiRequests = 0;
   const plugin = loadPlugin(async () => { apiRequests++; return apiResponse([]); }, {

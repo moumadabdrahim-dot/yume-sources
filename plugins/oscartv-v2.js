@@ -2,7 +2,9 @@
 (function (root) {
   "use strict";
 
-  var API = "https://ostvapp.cam";
+  var API = "https://ostv-11-11.xyz";
+  var HEADER_PROVIDER_URL = "https://flech.tn/scrapefinal/dramabox/step1_prepare_oscar.php";
+  var HEADER_PROVIDER_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36";
   var PLUGIN_ID = "oscar";
   var CERT_SHA256 = "6e2fcda8631eb49ebcba4ca8ef4c597abe84654c7d3e8096db32bdd21ecf763f";
   var PACKAGE_NAME = "com.drama.mp4";
@@ -11,6 +13,7 @@
   var MEDIA_UA = "TDMuaPlayer";
   var MAX_PAGES = 1000;
   var MAX_CONCURRENT_STREAM_RESOLUTIONS = 2;
+  var MAX_CONCURRENT_HOME_CATALOGS = 3;
 
   function fail(message) { throw new Error("Source: " + message); }
   function text(value) {
@@ -110,13 +113,50 @@
   }
   async function request(path, query) {
     var url = buildUrl(path, query);
+    if (url.indexOf(API + "/") !== 0) fail("refusing to send API headers to an unrelated host");
+    var headerResponse;
+    try {
+      headerResponse = await fetch(HEADER_PROVIDER_URL, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/x-www-form-urlencoded",
+          "User-Agent": HEADER_PROVIDER_UA
+        },
+        body: "url=" + encodeURIComponent(url),
+        redirect: "follow"
+      });
+    } catch (_) { fail("header provider network error"); }
+    if (!headerResponse || !headerResponse.ok) {
+      fail("header provider HTTP " + (headerResponse ? headerResponse.status : "no response"));
+    }
+    var headerPayload;
+    try { headerPayload = await headerResponse.json(); }
+    catch (_) { fail("header provider returned invalid JSON"); }
+    if (!headerPayload || typeof headerPayload !== "object") fail("header provider returned invalid JSON");
+    if (!headerPayload.headers || typeof headerPayload.headers !== "object" || Array.isArray(headerPayload.headers)) {
+      fail("header provider response is missing headers");
+    }
+    var blockedHeaders = {
+      host: true, connection: true, "content-length": true, "transfer-encoding": true,
+      "keep-alive": true, "proxy-connection": true, upgrade: true, te: true, trailer: true
+    };
+    var apiRequestHeaders = {};
+    Object.keys(headerPayload.headers).forEach(function (name) {
+      var value = headerPayload.headers[name];
+      if (!/^[!#$%&'*+.^_`|~0-9a-z-]+$/i.test(name) || blockedHeaders[name.toLowerCase()]) return;
+      if (typeof value !== "string" && typeof value !== "number") return;
+      apiRequestHeaders[name] = String(value);
+    });
+    if (!Object.keys(apiRequestHeaders).length) fail("header provider returned no usable API headers");
     var response;
     try {
-      response = await fetch(url, { method: "GET", headers: apiHeaders(url), redirect: "follow" });
-    } catch (error) { throw error; }
+      // Never allow the transport to forward provider credentials through a cross-host redirect.
+      response = await fetch(url, { method: "GET", headers: apiRequestHeaders, redirect: "manual" });
+    } catch (_) { fail("Oscar API network error for " + path); }
     if (!response || !response.ok) fail("HTTP " + (response ? response.status : "no response") + " for " + path);
     var envelope;
     try { envelope = await response.json(); } catch (error2) { fail("invalid JSON for " + path); }
+    if (!envelope || typeof envelope !== "object" || Array.isArray(envelope)) fail("invalid JSON for " + path);
     if (!envelope || String(envelope.status || "").toLowerCase() !== "success") {
       fail("API status failure for " + path + ": " + text(envelope && (envelope.message || envelope.error) || "unknown"));
     }
@@ -270,19 +310,35 @@
     return !/^https?:\/\/[^/]+\/(?:javascript|data|file):/i.test(url);
   }
   async function getHome() {
-    var sections = await Promise.all(HOME_CATALOGS.map(async function (catalog) {
-      var page = await getCatalog({ catalogId: catalog.id, type: catalog.type, limit: 18, filters: {} });
-      var items = page.items.filter(function (item) { return usableCardPoster(item.poster); });
-      // Hide a row when its source page is mostly unusable for the portrait card layout.
-      if (items.length === 0 || items.length * 2 < page.items.length) return null;
-      return {
-        id: catalog.id,
-        title: catalog.title,
-        items: items,
-        hasMore: page.page.hasMore,
-        nextPage: page.page.nextCursor || undefined
-      };
-    }));
+    var sections = new Array(HOME_CATALOGS.length);
+    var nextCatalogIndex = 0;
+    async function loadNextCatalog() {
+      while (true) {
+        var index = nextCatalogIndex++;
+        if (index >= HOME_CATALOGS.length) return;
+        var catalog = HOME_CATALOGS[index];
+        try {
+          var page = await getCatalog({ catalogId: catalog.id, type: catalog.type, limit: 18, filters: {} });
+          var items = page.items.filter(function (item) { return usableCardPoster(item.poster); });
+          // Hide a row when its source page is mostly unusable for the portrait card layout.
+          if (items.length === 0 || items.length * 2 < page.items.length) continue;
+          sections[index] = {
+            id: catalog.id,
+            title: catalog.title,
+            items: items,
+            hasMore: page.page.hasMore,
+            nextPage: page.page.nextCursor || undefined
+          };
+        } catch (_) {
+          // A failed catalog must not hide healthy Home rows.
+          sections[index] = null;
+        }
+      }
+    }
+    var workerCount = Math.min(MAX_CONCURRENT_HOME_CATALOGS, HOME_CATALOGS.length);
+    var workers = [];
+    for (var workerIndex = 0; workerIndex < workerCount; workerIndex++) workers.push(loadNextCatalog());
+    await Promise.all(workers);
     return { sections: sections.filter(Boolean) };
   }
   function mapEpisode(raw, type, seasonFallback, posterFallback) {

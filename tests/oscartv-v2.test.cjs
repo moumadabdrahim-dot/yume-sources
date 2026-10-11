@@ -32,9 +32,21 @@ const CryptoJS = {
   SHA256: value => wordArray(crypto.createHash('sha256').update(bytesOf(value)).digest()),
   HmacSHA256: (message, key) => wordArray(crypto.createHmac('sha256', bytesOf(key)).update(Buffer.from(String(message))).digest())
 };
-function loadPlugin(fetchImpl) {
+function loadPlugin(fetchImpl, options = {}) {
   const module = { exports: {} };
-  const context = { module, exports: module.exports, CryptoJS, __YUME_OSCAR_TESTING__: true, fetch: fetchImpl,
+  const headerProviderUrl = 'https://flech.tn/scrapefinal/dramabox/step1_prepare_oscar.php';
+  const fetchWithHeaderProvider = async (url, requestOptions = {}) => {
+    options.onFetch?.(url, requestOptions);
+    if (url === headerProviderUrl) {
+      if (options.headerProviderFetch) return options.headerProviderFetch(url, requestOptions);
+      return { ok: true, status: 200, json: async () => ({ headers: {
+        'X-Iron-Sig': 'test-signature', 'X-Iron-Ts': '123', 'X-Iron-Nonce': 'abc',
+        Accept: 'application/json', Host: 'ignored.example', Connection: 'keep-alive', 'Content-Length': '99'
+      } }) };
+    }
+    return fetchImpl(url, requestOptions);
+  };
+  const context = { module, exports: module.exports, CryptoJS, __YUME_OSCAR_TESTING__: true, fetch: fetchWithHeaderProvider,
     console, Date, URL, TextEncoder, Uint8Array, ArrayBuffer, isFinite, encodeURIComponent, decodeURIComponent };
   vm.runInNewContext(source, context, { filename: 'oscartv-v2.js' });
   return module.exports;
@@ -63,6 +75,80 @@ test('v2 exports aggregate Home/catalog/details/streams and preserves the determ
   assert.equal(plugin.search, undefined);
   assert.equal(typeof plugin.getCatalog, 'function');
   assert.equal(plugin.__test.sign(pathPart, timestamp, nonce), vector.expectedSignature);
+});
+
+test('API requests obtain headers with a form POST, then GET the same URL with filtered headers', async () => {
+  const events = [];
+  const plugin = loadPlugin(async () => {
+    return apiResponse([{ id: 4444, title_en: 'Reference movie', poster: '/poster.jpg' }], { page: 1, page_count: 1 });
+  }, { onFetch: (url, options) => events.push({ stage: 'fetch', url, options }) });
+
+  const result = await plugin.getCatalog({ catalogId: 'movies', type: 'movie', limit: 20 });
+  assert.equal(result.items[0].nativeId, 'movie:4444');
+  assert.equal(events.length, 2);
+  assert.equal(events[0].url, 'https://flech.tn/scrapefinal/dramabox/step1_prepare_oscar.php');
+  assert.equal(events[0].options.method, 'POST');
+  assert.equal(events[0].options.headers['Content-Type'], 'application/x-www-form-urlencoded');
+  assert.match(events[0].options.headers['User-Agent'], /Chrome\/141\.0\.0\.0/);
+  const requestedApiUrl = 'https://ostv-11-11.xyz/api/movies/?page=1&limit=20';
+  assert.equal(events[0].options.body, `url=${encodeURIComponent(requestedApiUrl)}`);
+  assert.equal(events[1].url, requestedApiUrl);
+  assert.equal(events[1].options.method, 'GET');
+  assert.equal(events[1].options.redirect, 'manual', 'API auth headers must not follow redirects to other hosts');
+  assert.equal(events[1].options.headers['X-Iron-Sig'], 'test-signature');
+  assert.equal(events[1].options.headers.Accept, 'application/json');
+  for (const name of ['Host', 'Connection', 'Content-Length']) {
+    assert.equal(events[1].options.headers[name], undefined, `${name} is controlled by the HTTP transport`);
+  }
+  assert.deepEqual(events.map(event => event.stage), ['fetch', 'fetch']);
+});
+
+test('header-provider failures are explicit and never fall back to the old signer', async () => {
+  let apiRequests = 0;
+  const plugin = loadPlugin(async () => { apiRequests++; return apiResponse([]); }, {
+    headerProviderFetch: async () => ({ ok: false, status: 503, json: async () => ({}) })
+  });
+  await assert.rejects(
+    plugin.getCatalog({ catalogId: 'movies', type: 'movie' }),
+    /header provider HTTP 503/
+  );
+  assert.equal(apiRequests, 0);
+
+  const missingHeadersPlugin = loadPlugin(async () => { apiRequests++; return apiResponse([]); }, {
+    headerProviderFetch: async () => ({ ok: true, status: 200, json: async () => ({}) })
+  });
+  await assert.rejects(
+    missingHeadersPlugin.getCatalog({ catalogId: 'movies', type: 'movie' }),
+    /header provider response is missing headers/
+  );
+  assert.equal(apiRequests, 0);
+
+  const invalidJsonPlugin = loadPlugin(async () => { apiRequests++; return apiResponse([]); }, {
+    headerProviderFetch: async () => ({ ok: true, status: 200, json: async () => { throw new Error('invalid JSON'); } })
+  });
+  await assert.rejects(
+    invalidJsonPlugin.getCatalog({ catalogId: 'movies', type: 'movie' }),
+    /header provider returned invalid JSON/
+  );
+  assert.equal(apiRequests, 0);
+});
+
+test('Oscar API HTTP and JSON failures remain distinguishable', async () => {
+  const deniedPlugin = loadPlugin(async (url) => ({
+    ok: false, status: 403, json: async () => ({ status: 'error' })
+  }));
+  await assert.rejects(deniedPlugin.getCatalog({ catalogId: 'movies', type: 'movie' }), /HTTP 403/);
+
+  const invalidJsonPlugin = loadPlugin(async () => ({
+    ok: true, status: 200, json: async () => { throw new Error('invalid JSON'); }
+  }));
+  await assert.rejects(invalidJsonPlugin.getCatalog({ catalogId: 'movies', type: 'movie' }), /invalid JSON/);
+
+  const redirectPlugin = loadPlugin(async (url, options) => {
+    assert.equal(options.redirect, 'manual');
+    return { ok: false, status: 302, json: async () => ({}) };
+  });
+  await assert.rejects(redirectPlugin.getCatalog({ catalogId: 'movies', type: 'movie' }), /HTTP 302/);
 });
 
 test('getHome loads the 11 ordered paginated catalog rows and returns only poster-ready items', async () => {
@@ -131,8 +217,33 @@ test('getHome suppresses empty rows and rows where most catalog items have no po
   assert.equal(home.sections.every(section => section.items.length > 0 && section.items.every(item => item.poster)), true);
 });
 
+test('getHome bounds request concurrency, preserves catalog order, and isolates partial failures', async () => {
+  let active = 0;
+  let peak = 0;
+  const plugin = loadPlugin(async (url) => {
+    const parsed = new URL(url);
+    active++;
+    peak = Math.max(peak, active);
+    await new Promise(resolve => setTimeout(resolve, 3));
+    active--;
+    if (parsed.searchParams.get('category') === '4' && parsed.searchParams.get('sort_by') === 'newest') {
+      throw new Error('one catalog is unavailable');
+    }
+    return apiResponse([{ id: Number(parsed.searchParams.get('page') || 1) + 100, title_en: 'Ready', poster: '/poster.jpg' }],
+      { page: 1, page_count: 1, total: 1, per_page: 18 });
+  });
+  const home = JSON.parse(JSON.stringify(await plugin.getHome()));
+  assert.ok(peak <= 3, `peak concurrent API requests was ${peak}`);
+  assert.equal(home.sections.length, 10);
+  assert.equal(home.sections.some(section => section.id === 'foreign_latest'), false);
+  assert.deepEqual(home.sections.map(section => section.id), [
+    'movies_top', 'foreign_movies', 'foreign_series', 'foreign_airing', 'asian_series', 'asian_latest',
+    'asian_airing', 'anime_picks', 'anime', 'anime_movies'
+  ]);
+});
+
 test('manifest exposes only the requested ordered Home catalogs with paginated browse targets', () => {
-  assert.equal(manifest.version, '2.0.7');
+  assert.equal(manifest.version, '2.0.8');
   assert.ok(manifest.capabilities.includes('home'));
   const expected = [
     ['movies_top', 'رائج اليوم'], ['foreign_movies', 'أفلام أجنبية'], ['foreign_series', 'مسلسلات أجنبية'],
@@ -172,7 +283,7 @@ test('catalog descriptors map movies, series, and anime to one native-ID-preserv
   }
   assert.equal(requests.length, 3);
   assert.deepEqual(requests.map(({ url }) => url.pathname), ['/api/movies/', '/api/series/', '/api/anime/']);
-  assert.ok(requests.every(({ options }) => options.headers['X-Iron-Sig'] && options.headers['X-Iron-Ts'] && options.headers['X-Iron-Nonce']));
+  assert.ok(requests.every(({ options }) => options.headers['X-Iron-Sig'] === 'test-signature' && options.headers['X-Iron-Ts'] === '123' && options.headers['X-Iron-Nonce'] === 'abc'));
 });
 
 test('external TMDB and IMDb IDs are validated and mapped without changing native identity', () => {
@@ -496,7 +607,7 @@ test('a broken wrapper does not suppress a following valid HLS source', async ()
   const plugin = loadPlugin(async (rawUrl) => {
     const url = new URL(rawUrl);
     requests.push(url.toString());
-    if (url.hostname === 'ostvapp.cam') {
+    if (url.hostname === 'ostv-11-11.xyz') {
       return apiResponse({ id: 3383, watch_links: [
         { url: 'https://newcdn.seriesmp4.com/watch/dead', type: 'direct', server_name: 'Mirror 1' },
         { url: 'https://cdn.mediaoscar.com/live/valid.m3u8?token=signed', type: 'direct', server_name: 'Mirror 2' }
@@ -517,7 +628,7 @@ test('movie 4444 and modern anime episode 10549 keep direct signed HLS unchanged
     const plugin = loadPlugin(async (rawUrl) => {
       const url = new URL(rawUrl);
       requests.push(url);
-      if (url.hostname === 'ostvapp.cam') {
+      if (url.hostname === 'ostv-11-11.xyz') {
         return apiResponse({ id: Number(nativeId.split(':')[1]), watch_links: [
           { url: 'https://cdn.mediaoscar.com/live/master.m3u8?token=signed&expires=123', type: 'direct', server_name: 'Mirror' }
         ] });
@@ -566,7 +677,7 @@ test('anime episode 3383 fixture resolves SeriesMP4 iframe through Yandex and ke
   const plugin = loadPlugin(async (rawUrl, options) => {
     const url = new URL(rawUrl);
     requests.push({ url, options });
-    if (url.hostname === 'ostvapp.cam') {
+    if (url.hostname === 'ostv-11-11.xyz') {
       assert.equal(url.pathname, '/api/anime/episodes/show.php');
       assert.equal(url.searchParams.get('id'), '3383');
       return apiResponse({ id: 3383, watch_links: [{ url: wrapper, type: 'direct', server_name: 'Mirror' }] });
@@ -770,7 +881,7 @@ test('STREAMS forwards the typed native episode number to Oscar without deriving
   const plugin = loadPlugin(async (rawUrl) => {
     const url = new URL(rawUrl);
     requests.push(url);
-    if (url.hostname === 'ostvapp.cam' && url.pathname === '/api/episodes/show.php') {
+    if (url.hostname === 'ostv-11-11.xyz' && url.pathname === '/api/episodes/show.php') {
       return apiResponse({ id: 93051, watch_links: [
         { url: 'https://cdn.mediaoscar.com/video/episode.mp4?token=fixture', type: 'direct' }
       ] });
@@ -791,7 +902,7 @@ test('STREAMS resolves at most two slow links concurrently and preserves adverti
   let bodyReads = 0;
   const plugin = loadPlugin(async (rawUrl, options) => {
     const url = new URL(rawUrl);
-    if (url.hostname === 'ostvapp.cam') {
+    if (url.hostname === 'ostv-11-11.xyz') {
       return apiResponse({ id: 3383, watch_links: delays.map((_, index) => ({
         url: `https://probe${index}.example/wrapper?signature=keep-${index}`,
         type: 'direct',
@@ -833,7 +944,7 @@ test('STREAMS isolates one resolver failure while the other worker continues', a
   let peak = 0;
   const plugin = loadPlugin(async rawUrl => {
     const url = new URL(rawUrl);
-    if (url.hostname === 'ostvapp.cam') {
+    if (url.hostname === 'ostv-11-11.xyz') {
       return apiResponse({ id: 3383, watch_links: [
         { url: 'https://broken.example/wrapper', type: 'direct', server_name: 'Broken' },
         { url: 'https://working.example/wrapper', type: 'direct', server_name: 'Working', quality: '720p' }
@@ -861,7 +972,7 @@ test('direct HLS batches remain probe-free under bounded resolution', async () =
   const plugin = loadPlugin(async rawUrl => {
     calls += 1;
     const url = new URL(rawUrl);
-    assert.equal(url.hostname, 'ostvapp.cam', 'direct HLS must not be probed');
+    assert.equal(url.hostname, 'ostv-11-11.xyz', 'direct HLS must not be probed');
     return apiResponse({ id: 150, watch_links: signedUrls.map((streamUrl, index) => ({
       url: streamUrl,
       type: 'direct',
@@ -882,7 +993,7 @@ test('lazy stream options expose every advertised quality without resolving wrap
   const plugin = loadPlugin(async rawUrl => {
     const url = new URL(rawUrl);
     requests.push(url);
-    assert.equal(url.hostname, 'ostvapp.cam');
+    assert.equal(url.hostname, 'ostv-11-11.xyz');
     return apiResponse({ id: 3383, watch_links: [
       { url: 'https://newcdn.seriesmp4.com/watch/one', type: 'direct', quality: '1080p', server_name: 'Mirror 1' },
       { url: 'https://newcdn.seriesmp4.com/watch/two', type: 'direct', quality: '720p', server_name: 'Mirror 2' }
@@ -902,7 +1013,7 @@ test('lazy options preserve anime parent and movie server counts without probes'
   const plugin = loadPlugin(async rawUrl => {
     const url = new URL(rawUrl);
     requests.push(url);
-    assert.equal(url.hostname, 'ostvapp.cam');
+    assert.equal(url.hostname, 'ostv-11-11.xyz');
     const count = url.pathname === '/api/anime/show.php' ? 3 : 5;
     return apiResponse({
       id: Number(url.searchParams.get('id')),
@@ -972,7 +1083,7 @@ test('lazy listing separates time to server list from selected server resolution
   }));
   const plugin = loadPlugin(async rawUrl => {
     const url = new URL(rawUrl);
-    if (url.hostname === 'ostvapp.cam') {
+    if (url.hostname === 'ostv-11-11.xyz') {
       await new Promise(resolve => setTimeout(resolve, 20));
       return apiResponse({ id: 3383, watch_links: links });
     }

@@ -1,0 +1,334 @@
+name: OscarTV release compatibility monitor
+
+on:
+  schedule:
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+    inputs:
+      release_channel:
+        description: "Stable is the production reference; beta runs are review-only."
+        required: true
+        type: choice
+        options:
+          - stable
+          - beta
+        default: stable
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: oscar-release-monitor-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  inspect-release:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    env:
+      OSCAR_CHANNEL: ${{ github.event.inputs.release_channel || 'stable' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: android-actions/setup-android@v3
+
+      - name: Install Android inspection tools
+        shell: pwsh
+        run: sdkmanager "build-tools;36.0.0"
+
+      - name: Find the previous release-state artifact
+        id: prior
+        shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $headers = @{ Authorization = "Bearer $env:GITHUB_TOKEN"; Accept = 'application/vnd.github+json'; 'User-Agent' = 'YumeTV-Oscar-compatibility-monitor' }
+          $uri = "https://api.github.com/repos/$env:GITHUB_REPOSITORY/actions/workflows/oscar-release-monitor.yml/runs?status=completed&per_page=20"
+          $runs = Invoke-RestMethod -Uri $uri -Headers $headers
+          $previous = @($runs.workflow_runs | Where-Object { [string]$_.id -ne $env:GITHUB_RUN_ID } | Sort-Object run_number -Descending | Select-Object -First 1)
+          if ($previous.Count -gt 0) {
+            "run_id=$($previous[0].id)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          }
+
+      - name: Restore previous release-state artifact
+        if: steps.prior.outputs.run_id != ''
+        id: restore-state
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: oscar-release-state
+          run-id: ${{ steps.prior.outputs.run_id }}
+          github-token: ${{ github.token }}
+          path: prior-release-state
+
+      - name: Inspect official release, APK identity and source compatibility
+        id: release
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $baseline = Get-Content -LiteralPath 'compatibility/oscar-app-baseline.json' -Raw | ConvertFrom-Json -AsHashtable
+          $channel = [string]$env:OSCAR_CHANNEL
+          if ($channel -notin @('stable', 'beta')) { throw "Unsupported release channel: $channel" }
+
+          $workspace = $env:GITHUB_WORKSPACE
+          $stateDir = Join-Path $workspace 'oscar-release-state'
+          $stateFile = Join-Path $stateDir 'release-state.json'
+          $baselineApk = Join-Path $stateDir 'reviewed-baseline.apk'
+          New-Item -ItemType Directory -Force -Path $stateDir | Out-Null
+
+          $restoredState = Join-Path $workspace 'prior-release-state/release-state.json'
+          $restoredBaseline = Join-Path $workspace 'prior-release-state/reviewed-baseline.apk'
+          if (Test-Path -LiteralPath $restoredBaseline) {
+            Copy-Item -LiteralPath $restoredBaseline -Destination $baselineApk -Force
+          }
+          if (Test-Path -LiteralPath $restoredState) {
+            $state = Get-Content -LiteralPath $restoredState -Raw | ConvertFrom-Json -AsHashtable
+          } else {
+            $state = [ordered]@{ schemaVersion = 1; channels = [ordered]@{} }
+          }
+          if (-not $state.channels) { $state.channels = [ordered]@{} }
+
+          $headers = @{ Accept = 'application/vnd.github+json'; 'User-Agent' = 'YumeTV-Oscar-compatibility-monitor' }
+          $repo = [string]$baseline.source.githubRepository
+          $releases = Invoke-RestMethod -Uri "https://api.github.com/repos/$repo/releases?per_page=100" -Headers $headers
+          if ($channel -eq 'stable') {
+            $candidateRelease = $releases | Where-Object { -not $_.draft -and -not $_.prerelease } |
+              Sort-Object { [DateTimeOffset]::Parse($_.published_at) } -Descending | Select-Object -First 1
+          } else {
+            $candidateRelease = $releases | Where-Object { -not $_.draft -and $_.prerelease } |
+              Sort-Object { [DateTimeOffset]::Parse($_.published_at) } -Descending | Select-Object -First 1
+          }
+          if (-not $candidateRelease) { throw "No published $channel OscarTV release was found." }
+
+          if ($channel -eq 'stable') {
+            $mobileCandidates = @($candidateRelease.assets | Where-Object name -eq $baseline.source.mobileAsset)
+          } else {
+            $mobileCandidates = @($candidateRelease.assets | Where-Object {
+              $_.name -match '^OscarTV_(?!SmartTV_).+\.apk$'
+            })
+          }
+          if ($mobileCandidates.Count -ne 1) { throw "Expected one $channel Android APK asset; found $($mobileCandidates.Count)." }
+          $mobileAsset = $mobileCandidates[0]
+          if (-not $mobileAsset.digest -or $mobileAsset.digest -notmatch '^sha256:[0-9a-fA-F]{64}$') {
+            throw 'The official Android APK asset has no SHA-256 digest; refusing to inspect an unverifiable APK.'
+          }
+          $tdmAsset = @($candidateRelease.assets | Where-Object name -eq $baseline.source.tdmAsset | Select-Object -First 1)
+          if ($tdmAsset.Count -gt 0 -and (-not $tdmAsset[0].digest -or $tdmAsset[0].digest -notmatch '^sha256:[0-9a-fA-F]{64}$')) {
+            throw 'The official TDM asset has no SHA-256 digest.'
+          }
+
+          $assetDigests = [ordered]@{}
+          $assetDigests[[string]$mobileAsset.name] = ([string]$mobileAsset.digest).ToLowerInvariant()
+          if ($tdmAsset.Count -gt 0) { $assetDigests[[string]$tdmAsset[0].name] = ([string]$tdmAsset[0].digest).ToLowerInvariant() }
+          $candidateRoleAssets = [ordered]@{ mobile = ([string]$mobileAsset.digest).ToLowerInvariant() }
+          if ($tdmAsset.Count -gt 0) { $candidateRoleAssets.tdm = ([string]$tdmAsset[0].digest).ToLowerInvariant() }
+
+          if (-not $state.channels.Contains('stable')) {
+            $stableAssets = [ordered]@{}
+            $stableAssets[[string]$baseline.source.mobileAsset] = "sha256:$($baseline.reviewedRelease.artifactSha256)"
+            if ($baseline.reviewedRelease.tdmArtifactSha256) {
+              $stableAssets[[string]$baseline.source.tdmAsset] = "sha256:$($baseline.reviewedRelease.tdmArtifactSha256)"
+            }
+            $state.channels['stable'] = [ordered]@{
+              tag = [string]$baseline.reviewedRelease.tag
+              assets = $stableAssets
+              source = 'reviewed compatibility baseline'
+            }
+          }
+
+          $previous = $state.channels[$channel]
+          $changeReasons = @()
+          $assetChanges = @()
+          if (-not $previous) {
+            $changeReasons += 'first observation for this release channel'
+          } elseif ([string]$previous.tag -ne [string]$candidateRelease.tag_name) {
+            $changeReasons += "release tag changed from $($previous.tag) to $($candidateRelease.tag_name)"
+          }
+          $previousAssets = if ($previous -and $previous.assets) { $previous.assets } else { @{} }
+          $assetNames = @(@($previousAssets.Keys) + @($assetDigests.Keys) | Sort-Object -Unique)
+          foreach ($assetName in $assetNames) {
+            $oldDigest = if ($previousAssets.Contains($assetName)) { [string]$previousAssets[$assetName] } else { $null }
+            $newDigest = if ($assetDigests.Contains($assetName)) { [string]$assetDigests[$assetName] } else { $null }
+            if ($oldDigest -ne $newDigest) {
+              $kind = if (-not $oldDigest) { 'added' } elseif (-not $newDigest) { 'removed' } else { 'digest-changed' }
+              $assetChanges += [ordered]@{ name = [string]$assetName; change = $kind; previousSha256 = $oldDigest; currentSha256 = $newDigest }
+              $changeReasons += "$assetName asset $kind"
+            }
+          }
+          $hasChange = $changeReasons.Count -gt 0
+
+          $pinnedBaselineHash = ([string]$baseline.reviewedRelease.artifactSha256).ToLowerInvariant()
+          if (-not (Test-Path -LiteralPath $baselineApk)) {
+            $baselineRelease = Invoke-RestMethod -Uri "https://api.github.com/repos/$repo/releases/tags/$($baseline.reviewedRelease.tag)" -Headers $headers
+            $baselineAsset = @($baselineRelease.assets | Where-Object name -eq $baseline.source.mobileAsset | Select-Object -First 1)
+            if ($baselineAsset.Count -eq 0 -or $baselineAsset[0].digest -ne "sha256:$pinnedBaselineHash") {
+              throw 'The reviewed baseline APK was replaced before it could be snapshotted; exact binary comparison is unavailable.'
+            }
+            Invoke-WebRequest -Uri $baselineAsset[0].browser_download_url -OutFile $baselineApk
+          }
+          if ((Get-FileHash -LiteralPath $baselineApk -Algorithm SHA256).Hash.ToLowerInvariant() -ne $pinnedBaselineHash) {
+            throw 'Saved reviewed baseline APK failed SHA-256 verification.'
+          }
+
+          if (-not $hasChange) {
+            $state | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $stateFile -Encoding utf8
+            "channel=$channel" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+            'has_change=false' | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+            Write-Host "No tag or APK/TDM asset digest change detected for $channel ($($candidateRelease.tag_name))."
+            exit 0
+          }
+
+          $root = Join-Path $env:RUNNER_TEMP 'oscar-tv-release-check'
+          New-Item -ItemType Directory -Force -Path $root | Out-Null
+          $candidateApk = Join-Path $root 'candidate.apk'
+          Invoke-WebRequest -Uri $mobileAsset.browser_download_url -OutFile $candidateApk
+          $candidateHash = (Get-FileHash -LiteralPath $candidateApk -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($candidateHash -ne ($mobileAsset.digest -replace '^sha256:', '').ToLowerInvariant()) {
+            throw 'Candidate APK failed the official GitHub SHA-256 digest check.'
+          }
+
+          $aapt = Join-Path $env:ANDROID_HOME 'build-tools\36.0.0\aapt.exe'
+          $apksigner = Join-Path $env:ANDROID_HOME 'build-tools\36.0.0\apksigner.bat'
+          if (-not (Test-Path $aapt) -or -not (Test-Path $apksigner)) { throw 'Android package inspection tools are unavailable.' }
+          function Read-AppIdentity([string]$apk, [string]$aaptPath, [string]$signerPath) {
+            $badging = (& $aaptPath dump badging $apk 2>&1 | Out-String)
+            $packageMatch = [regex]::Match($badging, "package: name='([^']+)' versionCode='([^']+)' versionName='([^']*)'")
+            if (-not $packageMatch.Success) { throw 'Could not read APK package and version metadata.' }
+            $signOutput = (& $signerPath verify --print-certs $apk 2>&1 | Out-String)
+            if ($LASTEXITCODE -ne 0) { throw 'APK signature verification failed.' }
+            $certMatch = [regex]::Match($signOutput, 'Signer #1 certificate SHA-256 digest: ([0-9a-fA-F]{64})')
+            if (-not $certMatch.Success) { throw 'Could not read APK signing certificate digest.' }
+            return [ordered]@{
+              packageName = $packageMatch.Groups[1].Value
+              versionCode = [int]$packageMatch.Groups[2].Value
+              versionName = $packageMatch.Groups[3].Value
+              signingCertificateSha256 = $certMatch.Groups[1].Value.ToLowerInvariant()
+            }
+          }
+
+          $oldIdentity = Read-AppIdentity $baselineApk $aapt $apksigner
+          $newIdentity = Read-AppIdentity $candidateApk $aapt $apksigner
+          if ($oldIdentity.packageName -ne $baseline.reviewedRelease.packageName -or
+              $oldIdentity.versionName -ne $baseline.reviewedRelease.versionName -or
+              $oldIdentity.versionCode -ne $baseline.reviewedRelease.versionCode -or
+              $oldIdentity.signingCertificateSha256 -ne $baseline.reviewedRelease.signingCertificateSha256) {
+            throw 'Saved reviewed baseline APK identity differs from the pinned compatibility record.'
+          }
+
+          $jadxVersion = 'v1.5.6'
+          $jadxDigest = 'sha256:545ea2be9c242511bc145755cf4bda2485ade42966e096f8b4d3da2a230e8974'
+          $jadxRelease = Invoke-RestMethod -Uri "https://api.github.com/repos/skylot/jadx/releases/tags/$jadxVersion" -Headers $headers
+          $jadxAsset = @($jadxRelease.assets | Where-Object name -eq 'jadx-1.5.6.zip' | Select-Object -First 1)
+          if ($jadxAsset.Count -eq 0 -or $jadxAsset[0].digest -ne $jadxDigest) { throw 'Pinned JADX CLI asset digest changed.' }
+          $jadxZip = Join-Path $root 'jadx.zip'
+          Invoke-WebRequest -Uri $jadxAsset[0].browser_download_url -OutFile $jadxZip
+          if ((Get-FileHash -LiteralPath $jadxZip -Algorithm SHA256).Hash.ToLowerInvariant() -ne ($jadxDigest -replace '^sha256:', '')) {
+            throw 'JADX archive failed SHA-256 verification.'
+          }
+          $jadxRoot = Join-Path $root 'jadx'
+          Expand-Archive -LiteralPath $jadxZip -DestinationPath $jadxRoot -Force
+          $jadx = Get-ChildItem -LiteralPath $jadxRoot -Recurse -Filter 'jadx.bat' | Select-Object -First 1 -ExpandProperty FullName
+          if (-not $jadx) { throw 'Pinned JADX CLI was not found in the verified archive.' }
+
+          $oldOutput = Join-Path $root 'old-decompiled'
+          $newOutput = Join-Path $root 'new-decompiled'
+          $oldLog = Join-Path $root 'baseline-jadx.log'
+          $newLog = Join-Path $root 'candidate-jadx.log'
+          & $jadx -d $oldOutput --no-res --no-debug-info $baselineApk *> $oldLog
+          $oldJadxExit = $LASTEXITCODE
+          & $jadx -d $newOutput --no-res --no-debug-info $candidateApk *> $newLog
+          $newJadxExit = $LASTEXITCODE
+          foreach ($required in @('sources/com/drama/mp4/data/api/ApiService.java','sources/com/drama/mp4/data/model/WatchLink.java')) {
+            if (-not (Test-Path (Join-Path $oldOutput $required)) -or -not (Test-Path (Join-Path $newOutput $required))) {
+              throw "JADX did not produce required compatibility sources: $required"
+            }
+          }
+          $oldErrors = 0
+          $newErrors = 0
+          if (Select-String -LiteralPath $oldLog -Pattern 'ERROR - finished with errors' -Quiet) { $oldErrors = 1 }
+          if (Select-String -LiteralPath $newLog -Pattern 'ERROR - finished with errors' -Quiet) { $newErrors = 1 }
+
+          $baselineAssets = [ordered]@{}
+          $baselineAssets.mobile = "sha256:$pinnedBaselineHash"
+          $baselineAssets.tdm = "sha256:$($baseline.reviewedRelease.tdmArtifactSha256)"
+          $metadata = [ordered]@{
+            baseline = [ordered]@{
+              tag = $baseline.reviewedRelease.tag; packageName = $oldIdentity.packageName
+              versionName = $oldIdentity.versionName; versionCode = $oldIdentity.versionCode
+              artifactSha256 = $pinnedBaselineHash; signingCertificateSha256 = $oldIdentity.signingCertificateSha256
+              assets = $baselineAssets
+            }
+            candidate = [ordered]@{
+              channel = $channel; tag = $candidateRelease.tag_name; releaseUrl = $candidateRelease.html_url
+              publishedAt = $candidateRelease.published_at; packageName = $newIdentity.packageName
+              versionName = $newIdentity.versionName; versionCode = $newIdentity.versionCode
+              artifactSha256 = $candidateHash; signingCertificateSha256 = $newIdentity.signingCertificateSha256
+              assets = $candidateRoleAssets; assetNames = [ordered]@{ mobile = $mobileAsset.name; tdm = if ($tdmAsset.Count -gt 0) { $tdmAsset[0].name } else { $null } }
+              changedAssets = $assetChanges; changeReasons = $changeReasons
+              tdmAssetPresent = ($tdmAsset.Count -gt 0)
+            }
+            decompilation = [ordered]@{ baselineExitCode = $oldJadxExit; candidateExitCode = $newJadxExit;
+              baselineReportedErrors = $oldErrors; candidateReportedErrors = $newErrors }
+          }
+          $metaPath = Join-Path $root 'metadata.json'
+          $metadata | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $metaPath -Encoding utf8
+          $reportPath = Join-Path $root 'oscar-compatibility-diff.json'
+          node tools/oscar-release-diff.cjs (Join-Path $oldOutput 'sources') (Join-Path $newOutput 'sources') $metaPath $reportPath
+          if ($LASTEXITCODE -ne 0) { throw 'Machine-readable source comparison failed.' }
+          Copy-Item -LiteralPath $reportPath -Destination (Join-Path $workspace 'oscar-compatibility-diff.json') -Force
+
+          [ordered]@{
+            channel = $channel; tag = $candidateRelease.tag_name; releaseUrl = $candidateRelease.html_url
+            packageName = $newIdentity.packageName; versionName = $newIdentity.versionName; versionCode = $newIdentity.versionCode
+            artifactSha256 = $candidateHash; signingCertificateSha256 = $newIdentity.signingCertificateSha256
+            assets = $assetDigests; changedAssets = $assetChanges
+            reviewStatus = 'review required; this proposal does not update the plugin or baseline automatically'
+          } | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $workspace 'oscar-proposed-baseline.json') -Encoding utf8
+
+          $state.channels[$channel] = [ordered]@{
+            tag = [string]$candidateRelease.tag_name; assets = $assetDigests
+            publishedAt = [string]$candidateRelease.published_at; releaseUrl = [string]$candidateRelease.html_url
+          }
+          $state | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $stateFile -Encoding utf8
+          "channel=$channel" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          'has_change=true' | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "Release review generated for $channel $($candidateRelease.tag_name). The pinned stable plugin baseline was not changed." |
+            Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+
+      - name: Run OscarTV plugin regression tests
+        if: steps.release.outputs.has_change == 'true'
+        shell: pwsh
+        run: node --test tests/oscartv.test.cjs tests/oscartv-v2.test.cjs
+
+      - name: Upload compatibility review
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: oscar-tv-compatibility-review
+          path: |
+            oscar-compatibility-diff.json
+            oscar-proposed-baseline.json
+          if-no-files-found: ignore
+          retention-days: 30
+
+      - name: Save release-state snapshot and reviewed APK baseline
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: oscar-release-state
+          path: |
+            oscar-release-state/release-state.json
+            oscar-release-state/reviewed-baseline.apk
+          if-no-files-found: ignore
+          retention-days: 90

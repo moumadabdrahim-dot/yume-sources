@@ -1,7 +1,7 @@
 {
   "id": "oscar",
   "name": "OscarTV",
-  "version": "2.0.8",
+  "version": "2.0.9",
   "filename": "plugins/oscartv-v2.js",
   "apiVersion": 2,
   "capabilities": ["home", "details", "streams"],
@@ -11,7 +11,16 @@
       "type": "movie",
       "title": "أحدث الأفلام",
       "capabilities": ["browse", "search", "pagination"],
-      "filters": [],
+      "filters": [
+        {"key":"sort_by","kind":"select","required":false,"options":[
+          {"value":"newest","label":"الأحدث"},
+          {"value":"views_today","label":"الأكثر مشاهدة اليوم"},
+          {"value":"most_viewed","label":"الأكثر مشاهدة"}
+        ]},
+        {"key":"category","kind":"select","required":false,"options":[
+          {"value":"18","label":"أفلام أجنبية"}
+        ]}
+      ],
       "presentation": { "posterShape": "portrait" },
       "homeFallback": false
     },
@@ -20,7 +29,17 @@
       "type": "series",
       "title": "أحدث المسلسلات",
       "capabilities": ["browse", "search", "pagination"],
-      "filters": [],
+      "filters": [
+        {"key":"sort_by","kind":"select","required":false,"options":[
+          {"value":"newest","label":"الأحدث"},
+          {"value":"most_viewed","label":"الأكثر مشاهدة"},
+          {"value":"latest_episode","label":"أحدث الحلقات"}
+        ]},
+        {"key":"category","kind":"select","required":false,"options":[
+          {"value":"4","label":"أجنبي"},
+          {"value":"5","label":"آسيوي"}
+        ]}
+      ],
       "presentation": { "posterShape": "portrait" },
       "homeFallback": false
     },
@@ -119,7 +138,12 @@
       "type": "anime",
       "title": "أحدث الأنمي",
       "capabilities": ["home", "browse", "search", "pagination"],
-      "filters": [],
+      "filters": [
+        {"key":"sort_by","kind":"select","required":false,"options":[
+          {"value":"newest","label":"الأحدث"},
+          {"value":"rating","label":"الأعلى تقييمًا"}
+        ]}
+      ],
       "presentation": { "posterShape": "portrait" },
       "homeOrder": -99991,
       "homeFallback": true

@@ -1,0 +1,30 @@
+{
+  "schemaVersion": 1,
+  "source": {
+    "website": "https://oscartv.app/downloads",
+    "githubRepository": "Oscar-TV/apk",
+    "mobileAsset": "OscarTV.apk",
+    "tdmAsset": "TDM.apk"
+  },
+  "reviewedRelease": {
+    "tag": "v1.1.5",
+    "publishedAt": "2026-06-17T15:21:12Z",
+    "packageName": "com.drama.mp4",
+    "versionName": "1.1.5",
+    "versionCode": 15,
+    "artifactSha256": "5c7c7a50ae6ac72de596dbea0d2d8f3c1d6d3acff76d62bf0387f4cd3a3f29ad",
+    "tdmArtifactSha256": "a0f8ee9a8eebc2ecbabf304f95c475a94c82fb2b33653aa93c629b25896db994",
+    "signingCertificateSha256": "6e2fcda8631eb49ebcba4ca8ef4c597abe84654c7d3e8096db32bdd21ecf763f"
+  },
+  "api": {
+    "defaultHost": "https://ostvapp.cam",
+    "liveStatus": "not verified; normal signed request returned HTTP 403 on 2026-10-15"
+  },
+  "policy": {
+    "autoDeploy": false,
+    "autoAcceptChangedSigner": false,
+    "runtimeHostConfigRequiresReview": true,
+    "betaRunsAreManualOnly": true,
+    "sameTagAssetChangesRequireReview": true
+  }
+}

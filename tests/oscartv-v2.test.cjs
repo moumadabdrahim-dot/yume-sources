@@ -4,6 +4,8 @@ const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
 const crypto = require('node:crypto');
+const { summarize: summarizeWatchLinks } = require('../tools/oscar-watchlink-evidence.cjs');
+const { selectTargetOption } = require('./live-smoke.cjs');
 
 const root = path.resolve(__dirname, '..');
 const source = fs.readFileSync(path.join(root, 'plugins/oscartv-v2.js'), 'utf8');
@@ -34,20 +36,13 @@ const CryptoJS = {
 };
 function loadPlugin(fetchImpl, options = {}) {
   const module = { exports: {} };
-  const headerProviderUrl = 'https://flech.tn/scrapefinal/dramabox/step1_prepare_oscar.php';
-  const fetchWithHeaderProvider = async (url, requestOptions = {}) => {
+  const observedFetch = async (url, requestOptions = {}) => {
     options.onFetch?.(url, requestOptions);
-    if (url === headerProviderUrl) {
-      if (options.headerProviderFetch) return options.headerProviderFetch(url, requestOptions);
-      return { ok: true, status: 200, json: async () => ({ headers: {
-        'X-Iron-Sig': 'test-signature', 'X-Iron-Ts': '123', 'X-Iron-Nonce': 'abc',
-        Accept: 'application/json', Host: 'ignored.example', Connection: 'keep-alive', 'Content-Length': '99'
-      } }) };
-    }
     return fetchImpl(url, requestOptions);
   };
-  const context = { module, exports: module.exports, CryptoJS, __YUME_OSCAR_TESTING__: true, fetch: fetchWithHeaderProvider,
-    console, Date, URL, TextEncoder, Uint8Array, ArrayBuffer, isFinite, encodeURIComponent, decodeURIComponent };
+  const context = { module, exports: module.exports, CryptoJS, __YUME_OSCAR_TESTING__: true, fetch: observedFetch,
+    console, Date, URL, TextEncoder, TextDecoder, Uint8Array, ArrayBuffer, isFinite,
+    setTimeout: options.setTimeout || (callback => { callback(); return 0; }), encodeURIComponent, decodeURIComponent };
   vm.runInNewContext(source, context, { filename: 'oscartv-v2.js' });
   return module.exports;
 }
@@ -77,7 +72,7 @@ test('v2 exports aggregate Home/catalog/details/streams and preserves the determ
   assert.equal(plugin.__test.sign(pathPart, timestamp, nonce), vector.expectedSignature);
 });
 
-test('API requests obtain headers with a form POST, then GET the same URL with filtered headers', async () => {
+test('API requests are signed locally and sent directly to the provider host', async () => {
   const events = [];
   const plugin = loadPlugin(async () => {
     return apiResponse([{ id: 4444, title_en: 'Reference movie', poster: '/poster.jpg' }], { page: 1, page_count: 1 });
@@ -85,79 +80,38 @@ test('API requests obtain headers with a form POST, then GET the same URL with f
 
   const result = await plugin.getCatalog({ catalogId: 'movies', type: 'movie', limit: 20 });
   assert.equal(result.items[0].nativeId, 'movie:4444');
-  assert.equal(events.length, 2);
-  assert.equal(events[0].url, 'https://flech.tn/scrapefinal/dramabox/step1_prepare_oscar.php');
-  assert.equal(events[0].options.method, 'POST');
-  assert.equal(events[0].options.headers['Content-Type'], 'application/x-www-form-urlencoded');
-  assert.match(events[0].options.headers['User-Agent'], /Chrome\/141\.0\.0\.0/);
+  assert.equal(events.length, 1);
   const requestedApiUrl = 'https://ostv-11-11.xyz/api/movies/?page=1&limit=20';
-  assert.equal(events[0].options.body, `url=${encodeURIComponent(requestedApiUrl)}`);
-  assert.equal(events[1].url, requestedApiUrl);
-  assert.equal(events[1].options.method, 'GET');
-  assert.equal(events[1].options.redirect, 'manual', 'API auth headers must not follow redirects to other hosts');
-  assert.equal(events[1].options.headers['X-Iron-Sig'], 'test-signature');
-  assert.equal(events[1].options.headers.Accept, 'application/json');
-  for (const name of ['Host', 'Connection', 'Content-Length']) {
-    assert.equal(events[1].options.headers[name], undefined, `${name} is controlled by the HTTP transport`);
-  }
-  assert.deepEqual(events.map(event => event.stage), ['fetch', 'fetch']);
+  assert.equal(events[0].url, requestedApiUrl);
+  assert.equal(events[0].options.method, 'GET');
+  assert.equal(events[0].options.redirect, 'manual', 'API signatures must not follow redirects to other hosts');
+  assert.match(events[0].options.headers['X-Iron-Sig'], /^[a-f0-9]{64}$/);
+  assert.match(events[0].options.headers['X-Iron-Ts'], /^\d+$/);
+  assert.match(events[0].options.headers['X-Iron-Nonce'], /^[a-f0-9]{8}$/);
+  assert.equal(events[0].options.headers.Accept, 'application/json');
+  assert.equal(events[0].options.headers['User-Agent'], 'okhttp/4.12.0');
+  assert.deepEqual(events[0].stage, 'fetch');
 });
 
-test('unexpected provider credentials are never forwarded to the Oscar API', async () => {
+test('API signing never contacts or forwards request data to the former external helper', async () => {
   const events = [];
-  const plugin = loadPlugin(async () => apiResponse([]), {
-    onFetch: (url, options) => events.push({ url, options }),
-    headerProviderFetch: async () => ({
-      ok: true,
-      status: 200,
-      json: async () => ({ headers: {
-        'X-Iron-Sig': 'expected-signature', 'X-Iron-Ts': '123', 'X-Iron-Nonce': 'abc',
-        Accept: 'application/json', 'User-Agent': 'expected-agent',
-        Authorization: 'unexpected-auth', Cookie: 'unexpected-cookie',
-        'Proxy-Authorization': 'unexpected-proxy-auth', 'X-Provider-Token': 'unexpected-token'
-      } })
-    })
-  });
+  const plugin = loadPlugin(async () => apiResponse([]), { onFetch: (url, options) => events.push({ url, options }) });
 
   await plugin.getCatalog({ catalogId: 'movies', type: 'movie', limit: 1 });
-  const forwardedHeaders = events[1].options.headers;
-  assert.deepEqual(Object.keys(forwardedHeaders).sort(), [
-    'Accept', 'User-Agent', 'X-Iron-Nonce', 'X-Iron-Sig', 'X-Iron-Ts'
-  ]);
-  assert.equal(forwardedHeaders.Authorization, undefined);
-  assert.equal(forwardedHeaders.Cookie, undefined);
-  assert.equal(forwardedHeaders['Proxy-Authorization'], undefined);
-  assert.equal(forwardedHeaders['X-Provider-Token'], undefined);
+  assert.equal(events.length, 1);
+  assert.equal(new URL(events[0].url).hostname, 'ostv-11-11.xyz');
+  assert.equal(events[0].options.headers.Authorization, undefined);
+  assert.equal(events[0].options.headers.Cookie, undefined);
+  assert.equal(events[0].options.headers['Proxy-Authorization'], undefined);
+  assert.equal(events[0].options.headers['X-Provider-Token'], undefined);
 });
 
-test('header-provider failures are explicit and never fall back to the old signer', async () => {
-  let apiRequests = 0;
-  const plugin = loadPlugin(async () => { apiRequests++; return apiResponse([]); }, {
-    headerProviderFetch: async () => ({ ok: false, status: 503, json: async () => ({}) })
-  });
-  await assert.rejects(
-    plugin.getCatalog({ catalogId: 'movies', type: 'movie' }),
-    /header provider HTTP 503/
-  );
-  assert.equal(apiRequests, 0);
-
-  const missingHeadersPlugin = loadPlugin(async () => { apiRequests++; return apiResponse([]); }, {
-    headerProviderFetch: async () => ({ ok: true, status: 200, json: async () => ({}) })
-  });
-  await assert.rejects(
-    missingHeadersPlugin.getCatalog({ catalogId: 'movies', type: 'movie' }),
-    /header provider response is missing headers/
-  );
-  assert.equal(apiRequests, 0);
-
-  const invalidJsonPlugin = loadPlugin(async () => { apiRequests++; return apiResponse([]); }, {
-    headerProviderFetch: async () => ({ ok: true, status: 200, json: async () => { throw new Error('invalid JSON'); } })
-  });
-  await assert.rejects(
-    invalidJsonPlugin.getCatalog({ catalogId: 'movies', type: 'movie' }),
-    /header provider returned invalid JSON/
-  );
-  assert.equal(apiRequests, 0);
+test('provider request signature covers the raw path and excludes query values', async () => {
+  const plugin = loadPlugin(async () => apiResponse([]));
+  const headers = plugin.__test.apiHeaders('https://ostv-11-11.xyz/api/movies/?search=private%20query');
+  const expected = plugin.__test.sign('/api/movies/', headers['X-Iron-Ts'], headers['X-Iron-Nonce']);
+  assert.equal(headers['X-Iron-Sig'], expected);
+  assert.deepEqual(Object.keys(headers).sort(), ['Accept', 'User-Agent', 'X-Iron-Nonce', 'X-Iron-Sig', 'X-Iron-Ts'].sort());
 });
 
 test('Oscar API HTTP and JSON failures remain distinguishable', async () => {
@@ -270,7 +224,7 @@ test('getHome bounds request concurrency, preserves catalog order, and isolates 
 });
 
 test('manifest exposes only the requested ordered Home catalogs with paginated browse targets', () => {
-  assert.equal(manifest.version, '2.0.8');
+  assert.equal(manifest.version, '2.0.9');
   assert.ok(manifest.capabilities.includes('home'));
   const expected = [
     ['movies_top', 'رائج اليوم'], ['foreign_movies', 'أفلام أجنبية'], ['foreign_series', 'مسلسلات أجنبية'],
@@ -310,7 +264,8 @@ test('catalog descriptors map movies, series, and anime to one native-ID-preserv
   }
   assert.equal(requests.length, 3);
   assert.deepEqual(requests.map(({ url }) => url.pathname), ['/api/movies/', '/api/series/', '/api/anime/']);
-  assert.ok(requests.every(({ options }) => options.headers['X-Iron-Sig'] === 'test-signature' && options.headers['X-Iron-Ts'] === '123' && options.headers['X-Iron-Nonce'] === 'abc'));
+  assert.ok(requests.every(({ options }) => /^[a-f0-9]{64}$/.test(options.headers['X-Iron-Sig']) &&
+    /^\d+$/.test(options.headers['X-Iron-Ts']) && /^[a-f0-9]{8}$/.test(options.headers['X-Iron-Nonce'])));
 });
 
 test('external TMDB and IMDb IDs are validated and mapped without changing native identity', () => {
@@ -395,24 +350,80 @@ test('anime details return Japanese original title while preserving visible titl
   assert.equal(result.item.year, 2021);
 });
 
-test('anime details advertise parent streams only when valid parent watch links exist', async () => {
+test('anime details advertise parent streams only when a supported parent WatchLink exists', async () => {
   const responses = [
     { id: 150, title_en: 'One Piece Fan Letter', seasons: [], watch_links: [
       { url: 'https://cdn.mediaoscar.com/fan-letter/master.m3u8', quality: '1080p' }
     ] },
     { id: 151, title_en: 'Episode-only anime', seasons: [], watch_links: [] },
-    { id: 152, title_en: 'Malformed special', seasons: [], watch_links: [{ url: 'not-a-url' }] }
+    { id: 152, title_en: 'Malformed special', seasons: [], watch_links: [{ url: 'not-a-url' }] },
+    { id: 153, title_en: 'TDM-linked special', seasons: [], watch_links: [
+      { deep_link: 'tdmvideo://play?url=https%3A%2F%2Fcdn.mediaoscar.com%2Fspecial%2Fmaster.m3u8', type: 'direct' }
+    ] }
   ];
   const plugin = loadPlugin(async () => apiResponse(responses.shift()));
 
   const playable = await plugin.getDetails({ id: 'anime:150' });
   const episodeOnly = await plugin.getDetails({ id: 'anime:151' });
   const malformed = await plugin.getDetails({ id: 'anime:152' });
+  const deepLinkOnly = await plugin.getDetails({ id: 'anime:153' });
 
   assert.equal(playable.item.hasParentStreams, true);
   assert.equal(playable.episodes.length, 0);
   assert.equal(episodeOnly.item.hasParentStreams, false);
   assert.equal(malformed.item.hasParentStreams, false);
+  assert.equal(deepLinkOnly.item.hasParentStreams, true);
+});
+
+test('series detail loading caps concurrent page fetches while preserving all episode IDs and order', async () => {
+  let active = 0;
+  let peak = 0;
+  const plugin = loadPlugin(async rawUrl => {
+    const url = new URL(rawUrl);
+    active += 1;
+    peak = Math.max(peak, active);
+    await new Promise(resolve => setTimeout(resolve, 2));
+    active -= 1;
+    if (url.pathname === '/api/series/show.php') {
+      return apiResponse({ id: 800, title_en: 'Many seasons' });
+    }
+    if (url.pathname === '/api/seasons/') {
+      return apiResponse(Array.from({ length: 4 }, (_, index) => ({ id: index + 10, season_number: index + 1 })));
+    }
+    if (url.pathname === '/api/episodes/') {
+      const seasonId = Number(url.searchParams.get('season_id'));
+      const page = Number(url.searchParams.get('page'));
+      return apiResponse([{ id: seasonId * 100 + page, episode_number: page }], { page, page_count: 3 });
+    }
+    throw new Error(`unexpected URL ${rawUrl}`);
+  });
+
+  const result = await plugin.getDetails({ id: 'series:800' });
+  assert.ok(peak <= 4, `peak concurrent detail requests was ${peak}`);
+  assert.deepEqual(Array.from(result.episodes, item => item.nativeId), [
+    'series_episode:1001', 'series_episode:1002', 'series_episode:1003',
+    'series_episode:1101', 'series_episode:1102', 'series_episode:1103',
+    'series_episode:1201', 'series_episode:1202', 'series_episode:1203',
+    'series_episode:1301', 'series_episode:1302', 'series_episode:1303'
+  ]);
+});
+
+test('episode page 403 is not retried by the details layer', async () => {
+  let episodePageRequests = 0;
+  const plugin = loadPlugin(async rawUrl => {
+    const url = new URL(rawUrl);
+    if (url.pathname === '/api/series/show.php') return apiResponse({ id: 801, title_en: 'Denied season' });
+    if (url.pathname === '/api/seasons/') return apiResponse([{ id: 81, season_number: 1 }]);
+    if (url.pathname === '/api/episodes/') {
+      episodePageRequests += 1;
+      return httpResponse({ status: 403, url: rawUrl, contentType: 'application/json' });
+    }
+    throw new Error(`unexpected URL ${rawUrl}`);
+  });
+
+  const result = await plugin.getDetails({ id: 'series:801' });
+  assert.equal(result.episodes.length, 0);
+  assert.equal(episodePageRequests, 1);
 });
 
 test('Oscar genres normalize live object, text-array, and delimited-string shapes without object leakage', () => {
@@ -813,19 +824,130 @@ test('TDM custom schemes are never emitted as Media3 stream URLs', async () => {
   assert.equal(fetches, 0);
 });
 
-test('deep_link remains metadata for User-Agent while the HTTP url is the playable target', async () => {
+test('WatchLink URL remains the media candidate while TDM deep_link supplies playback headers', async () => {
   let fetches = 0;
   const plugin = loadPlugin(async () => { fetches += 1; throw new Error('direct media must not fetch'); });
   const url = 'https://cdn.mediaoscar.com/live/master.m3u8?token=signed';
   const streams = await plugin.__test.resolveLink({
     url,
-    deep_link: 'tdmvideo://play?url=https%3A%2F%2Fother.example%2Fvideo.mp4&user_agent=Fixture%20Player',
+    deep_link: 'tdmvideo://play?url=https%3A%2F%2Fother.example%2Fvideo.mp4&user_agent=Fixture%20Player&cookies=session%3Dfixture&referer=https%3A%2F%2Fwatch.example%2Fepisode',
     type: 'direct'
   });
   assert.equal(fetches, 0);
   assert.equal(streams.length, 1);
   assert.equal(streams[0].url, url);
   assert.equal(streams[0].headers['User-Agent'], 'Fixture Player');
+  assert.equal(streams[0].headers.Cookie, 'session=fixture');
+  assert.equal(streams[0].headers.Referer, 'https://watch.example/episode');
+});
+
+test('TDM session headers are omitted when the deep-link media target differs from the WatchLink origin', async () => {
+  const plugin = loadPlugin(async () => { throw new Error('direct media must not fetch'); });
+  const streams = await plugin.__test.resolveLink({
+    id: 42,
+    url: 'https://origin.example/wrapper.mp4',
+    type: 'embed',
+    deep_link: 'tdmvideo://play?url=https%3A%2F%2Fother.example%2Fepisode.mp4&ua=FixtureUA&cookies=session%3Dsecret&ref=https%3A%2F%2Fwatch.example%2F'
+  });
+
+  assert.equal(streams.length, 1);
+  assert.equal(streams[0].url, 'https://other.example/episode.mp4');
+  assert.equal(streams[0].headers['User-Agent'], 'FixtureUA');
+  assert.equal(streams[0].headers.Cookie, undefined);
+  assert.equal(streams[0].headers.Referer, undefined);
+});
+
+test('TDM playback metadata rejects header controls and non-HTTP Referer values', async () => {
+  const plugin = loadPlugin(async () => { throw new Error('direct media must not fetch'); });
+  const streams = await plugin.__test.resolveLink({
+    url: 'https://cdn.mediaoscar.com/episode.mp4',
+    type: 'direct',
+    deep_link: 'tdmvideo://play?url=https%3A%2F%2Fcdn.mediaoscar.com%2Fepisode.mp4&ua=Bad%0d%0aX-Evil%3A%20yes&cookies=session%3Dvalue%0d%0aX-Evil%3A%20yes&referer=javascript%3Aalert(1)'
+  });
+
+  assert.equal(streams[0].headers['User-Agent'], 'TDMuaPlayer');
+  assert.equal(streams[0].headers.Cookie, undefined);
+  assert.equal(streams[0].headers.Referer, undefined);
+});
+
+test('offline WatchLink fixture retains server order and selects HTTP WatchLink URLs', async () => {
+  const mediaFetches = [];
+  const links = [
+    { url: 'https://fixture.example/first.mp4', type: 'direct', server_name: 'MP4 only' },
+    {
+      url: 'https://fixture.example/second/master.m3u8', type: 'direct', server_name: 'URL plus deep link',
+      deep_link: 'tdmvideo://play?url=https%3A%2F%2Fother.fixture%2Fepisode.mp4&ua=ExternalFixture'
+    },
+    { url: 'https://fixture.example/wrapper/third', type: 'embed', server_name: 'HTML wrapper' },
+    {
+      url: 'https://fixture.example/episode/fourth.mp4', type: 'direct', server_name: 'Fixture server 4',
+      deep_link: 'tdmvideo://play?url=https%3A%2F%2Ffixture.example%2Fdeep-target.mp4'
+    }
+  ];
+  const plugin = loadPlugin(async rawUrl => {
+    const url = new URL(rawUrl);
+    if (url.hostname !== 'ostv-11-11.xyz') mediaFetches.push(url.href);
+    assert.equal(url.pathname, '/api/episodes/show.php');
+    assert.equal(url.searchParams.get('id'), '731');
+    return apiResponse({ id: 731, watch_links: links });
+  });
+
+  const listing = await plugin.getStreams({ id: 'series_episode:731', mode: 'options' });
+  assert.deepEqual(Array.from(listing.options, option => option.title), [
+    'MP4 only', 'URL plus deep link', 'HTML wrapper', 'Fixture server 4'
+  ]);
+  assert.equal(listing.options.length, 4);
+
+  const first = await plugin.resolveStreamOption({ id: 'series_episode:731', token: listing.options[0].token });
+  assert.equal(first.streams[0].url, links[0].url, 'URL-only MP4 is retained as a playable candidate');
+
+  const second = await plugin.resolveStreamOption({ id: 'series_episode:731', token: listing.options[1].token });
+  assert.equal(second.streams[0].url, links[1].url, 'the WatchLink URL remains the media candidate');
+  assert.equal(second.streams[0].type, 'm3u8');
+
+  const fourth = await plugin.resolveStreamOption({ id: 'series_episode:731', token: listing.options[3].token });
+  assert.equal(fourth.streams.length, 1);
+  assert.equal(fourth.streams[0].url, links[3].url);
+  assert.equal(fourth.streams[0].type, 'video');
+  assert.equal(mediaFetches.length, 0, 'direct candidates are not probed or downloaded');
+});
+
+test('offline deep_link-only TDM option becomes a normal HTTP stream, never a custom Media3 URI', async () => {
+  const plugin = loadPlugin(async rawUrl => {
+    const url = new URL(rawUrl);
+    assert.equal(url.pathname, '/api/anime/episodes/show.php');
+    assert.equal(url.searchParams.get('id'), '812');
+    return apiResponse({ id: 812, watch_links: [{
+      deep_link: 'tdmvideo://play?url=https%3A%2F%2Ffixture.example%2Fepisode.mp4',
+      server_name: 'External player only',
+      type: 'direct'
+    }] });
+  });
+
+  const listing = await plugin.getStreams({ id: 'anime_episode:812', mode: 'options' });
+  assert.equal(listing.options.length, 1, 'a supported TDM deep link contains a safe HTTP candidate');
+  const resolved = await plugin.resolveStreamOption({ id: 'anime_episode:812', token: listing.options[0].token });
+  assert.equal(resolved.streams[0].url, 'https://fixture.example/episode.mp4');
+  assert.equal(resolved.streams[0].url.startsWith('tdmvideo:'), false);
+});
+
+test('embed links prefer an HTTP deep_link, while unsupported custom schemes fall back to HTTP url', () => {
+  const h = loadPlugin(async () => { throw new Error('classification must not fetch'); }).__test;
+  assert.equal(h.playbackTarget({
+    url: 'https://cdn.example.test/warning.mp4',
+    deep_link: 'https://embed.example.test/watch/episode',
+    type: 'embed'
+  }).url, 'https://embed.example.test/watch/episode');
+  assert.equal(h.playbackTarget({
+    url: 'https://cdn.example.test/episode.mp4',
+    deep_link: 'unknownplayer://play?id=12',
+    type: 'direct'
+  }).url, 'https://cdn.example.test/episode.mp4');
+  assert.equal(h.playbackTarget({
+    url: 'https://cdn.example.test/fallback.mp4',
+    deep_link: 'tdmvideo://play?url=javascript%3Aalert(1)',
+    type: 'direct'
+  }).url, 'https://cdn.example.test/fallback.mp4');
 });
 
 test('Yandex aliases are boundary-matched and HTTP failures remain failures', async () => {
@@ -958,7 +1080,8 @@ test('STREAMS resolves at most two slow links concurrently and preserves adverti
   const elapsedMs = performance.now() - started;
 
   assert.equal(peak, 2);
-  assert.ok(elapsedMs < 250, `bounded concurrency should beat the 300 ms sequential fixture, got ${elapsedMs} ms`);
+  // Peak concurrency is the deterministic performance contract. Wall-clock
+  // assertions made this test flaky under desktop/CI scheduling contention.
   assert.equal(bodyReads, 0, 'media response bodies must not be downloaded');
   assert.deepEqual(Array.from(result.streams, stream => stream.title), ['Mirror 1', 'Mirror 2', 'Mirror 3', 'Mirror 4']);
   assert.deepEqual(Array.from(result.streams, stream => stream.quality), ['1080p', '900p', '720p', '540p']);
@@ -1033,6 +1156,114 @@ test('lazy stream options expose every advertised quality without resolving wrap
   assert.equal(result.options.length, 2);
   assert.deepEqual(Array.from(result.options, option => option.quality), ['1080p', '720p']);
   assert.ok(result.options.every(option => option.token && !option.url));
+});
+
+test('identified lazy options omit signed URLs and refresh the selected WatchLink by native ID', async () => {
+  let listingRequests = 0;
+  const oldUrl = 'https://cdn.mediaoscar.com/episode/old.m3u8?token=old-secret';
+  const freshUrl = 'https://cdn.mediaoscar.com/episode/fresh.m3u8?token=new-secret';
+  const plugin = loadPlugin(async rawUrl => {
+    const url = new URL(rawUrl);
+    assert.equal(url.pathname, '/api/anime/episodes/show.php');
+    listingRequests += 1;
+    const selected = listingRequests === 1 ? oldUrl : freshUrl;
+    return apiResponse({ id: 3383, watch_links: [
+      { id: 771, server_name: 'Via - Server 4', url: selected, type: 'direct', quality: '1080p' },
+      { id: 772, server_name: 'Other', url: 'https://cdn.mediaoscar.com/episode/unselected.m3u8?token=untouched', type: 'direct' }
+    ] });
+  });
+
+  const listed = await plugin.getStreams({ id: 'anime_episode:3383', mode: 'options' });
+  const token = JSON.parse(listed.options[0].token);
+  assert.equal(token.version, 3);
+  assert.equal(token.nativeId, 'anime_episode:3383');
+  assert.equal(token.link.watch_link_id, 771);
+  assert.equal(token.link.url, undefined);
+  assert.equal(token.link.deep_link, undefined);
+  assert.equal(JSON.stringify(token).includes('old-secret'), false);
+  await assert.rejects(
+    plugin.resolveStreamOption({ id: 'anime_episode:3384', token: listed.options[0].token }),
+    /invalid stream option identity/
+  );
+  assert.equal(listingRequests, 1, 'a mismatched native ID must fail before a refresh request');
+
+  const resolved = await plugin.resolveStreamOption({ id: 'anime_episode:3383', token: listed.options[0].token });
+  assert.equal(listingRequests, 2, 'only the selected option should request a fresh WatchLink list');
+  assert.equal(resolved.streams[0].url, freshUrl);
+  assert.equal(resolved.streams[0].url.includes('old-secret'), false);
+});
+
+test('selected lazy WatchLink refreshes URL, Cookie, User-Agent and Referer metadata without storing secrets in its token', async () => {
+  let requestCount = 0;
+  const oldDeepLink = 'tdmvideo://play?url=https%3A%2F%2Fcdn.mediaoscar.com%2Fold.m3u8&ua=OldUA&cookies=session%3Dold-cookie&referer=https%3A%2F%2Fwatch.mediaoscar.com%2Fold';
+  const freshDeepLink = 'tdmvideo://play?url=https%3A%2F%2Fcdn.mediaoscar.com%2Ffresh.m3u8&ua=FreshUA&cookies=session%3Dfresh-cookie&referer=https%3A%2F%2Fwatch.mediaoscar.com%2Ffresh';
+  const plugin = loadPlugin(async rawUrl => {
+    const url = new URL(rawUrl);
+    assert.equal(url.pathname, '/api/episodes/show.php');
+    requestCount += 1;
+    return apiResponse({ id: 93051, watch_links: [{
+      id: 771,
+      server_name: 'Via - Server 4',
+      type: 'direct',
+      url: requestCount === 1
+        ? 'https://cdn.mediaoscar.com/old.m3u8?token=old-signed'
+        : 'https://cdn.mediaoscar.com/fresh.m3u8?token=fresh-signed',
+      deep_link: requestCount === 1 ? oldDeepLink : freshDeepLink
+    }] });
+  });
+
+  const listing = await plugin.getStreams({ id: 'series_episode:93051', mode: 'options' });
+  const tokenText = listing.options[0].token;
+  assert.equal(tokenText.includes('old-cookie'), false);
+  assert.equal(tokenText.includes('old-signed'), false);
+  assert.equal(tokenText.includes('OldUA'), false);
+  assert.equal(tokenText.includes('watch.mediaoscar.com/old'), false);
+
+  const resolved = await plugin.resolveStreamOption({ id: 'series_episode:93051', token: tokenText });
+  assert.equal(requestCount, 2, 'selection re-fetches the provider WatchLinks');
+  assert.equal(resolved.streams[0].url, 'https://cdn.mediaoscar.com/fresh.m3u8?token=fresh-signed');
+  assert.equal(resolved.streams[0].headers.Cookie, 'session=fresh-cookie');
+  assert.equal(resolved.streams[0].headers['User-Agent'], 'FreshUA');
+  assert.equal(resolved.streams[0].headers.Referer, 'https://watch.mediaoscar.com/fresh');
+  assert.equal(JSON.stringify(resolved).includes('old-cookie'), false);
+});
+
+test('identified-by-descriptor options without a WatchLink ID refresh dynamic metadata without persisting URLs or cookies', async () => {
+  let requestCount = 0;
+  const plugin = loadPlugin(async rawUrl => {
+    const url = new URL(rawUrl);
+    assert.equal(url.pathname, '/api/movies/show.php');
+    requestCount += 1;
+    return apiResponse({ id: 6001, watch_links: [{
+      server_name: 'Oscar CDN',
+      type: 'direct',
+      quality: '1080p',
+      url: requestCount === 1
+        ? 'https://cdn.mediaoscar.com/old.m3u8?token=old-signed'
+        : 'https://cdn.mediaoscar.com/fresh.m3u8?token=fresh-signed',
+      deep_link: requestCount === 1
+        ? 'tdmvideo://play?url=https%3A%2F%2Fcdn.mediaoscar.com%2Fold.m3u8&cookies=session%3Dold-cookie'
+        : 'tdmvideo://play?url=https%3A%2F%2Fcdn.mediaoscar.com%2Ffresh.m3u8&cookies=session%3Dfresh-cookie&ua=FreshUA'
+    }] });
+  });
+
+  const listing = await plugin.getStreams({ id: 'movie:6001', mode: 'options' });
+  const tokenText = listing.options[0].token;
+  const token = JSON.parse(tokenText);
+  assert.equal(token.version, 4);
+  assert.equal(token.link.server_name, 'Oscar CDN');
+  assert.equal(token.link.source_ordinal, 0);
+  assert.equal(tokenText.includes('old-cookie'), false);
+  assert.equal(tokenText.includes('old-signed'), false);
+  assert.equal(token.link.url, undefined);
+  assert.equal(token.link.deep_link, undefined);
+
+  const resolved = await plugin.resolveStreamOption({ id: 'movie:6001', token: tokenText });
+  assert.equal(requestCount, 2);
+  assert.equal(resolved.streams[0].url, 'https://cdn.mediaoscar.com/fresh.m3u8?token=fresh-signed');
+  assert.equal(resolved.streams[0].headers.Cookie, 'session=fresh-cookie');
+  assert.equal(resolved.streams[0].headers['User-Agent'], 'FreshUA');
+  assert.equal(JSON.stringify(resolved).includes('old-cookie'), false);
 });
 
 test('lazy options preserve anime parent and movie server counts without probes', async () => {
@@ -1132,4 +1363,181 @@ test('lazy listing separates time to server list from selected server resolution
   assert.ok(listMs < 70, `fixture option listing should be API-bound, got ${listMs}ms`);
   assert.ok(resolveMs >= 60, `selected fixture should include its resolver delay, got ${resolveMs}ms`);
   t.diagnostic(`fixture legacy=${legacyMs.toFixed(1)}ms list=${listMs.toFixed(1)}ms selectedResolve=${resolveMs.toFixed(1)}ms`);
+});
+
+test('live reference selector matches the requested server label rather than assuming its source ordinal', () => {
+  const options = [
+    { title: 'Server 8', token: JSON.stringify({ link: { server_name: 'Server 8' } }) },
+    { title: 'Via — Server 4', token: JSON.stringify({ link: { server_name: 'Server 4' } }) },
+    { title: 'Server 2', token: JSON.stringify({ link: { server_name: 'Server 2' } }) }
+  ];
+  const selected = selectTargetOption(options, 'Via — Server 4');
+  assert.equal(selected.index, 1);
+  assert.equal(selected.option.title, 'Via — Server 4');
+  assert.equal(selectTargetOption([
+    options[0], options[1], { title: 'Mirror Server 4', token: JSON.stringify({ link: { server_name: 'Mirror Server 4' } }) }
+  ], 'Via — Server 4'), null, 'ambiguous server labels must not trigger a guessed selection');
+});
+
+test('existing evidence analyzer maps v2 option tokens by WatchLink ID and redacts signed queries', () => {
+  const capture = {
+    nativeEpisodeId: 'series_episode:93051',
+    runtimeTrace: {
+      events: [{
+        requestUrl: 'https://ostv-11-11.xyz/api/episodes/show.php?id=93051',
+        responseBody: { data: { watch_links: [{
+          id: 771,
+          server_name: 'Via - Server 4',
+          type: 'direct',
+          quality: '1080p',
+          duration_seconds: 61,
+          url: 'https://warning.example/warning.mp4?token=PRIVATE_QUERY_SENTINEL',
+          deep_link: 'tdmvideo://play?url=https%3A%2F%2Fepisode.example%2Fwatch.mp4%3Fsig%3DPRIVATE_QUERY_SENTINEL'
+        }] } }
+      }],
+      yumeListing: [{
+        title: 'Via - Server 4',
+        token: JSON.stringify({ version: 2, ordinal: 3, link: {
+          watch_link_id: 771,
+          url: 'https://warning.example/warning.mp4?token=PRIVATE_QUERY_SENTINEL',
+          deep_link: 'tdmvideo://play?url=https%3A%2F%2Fepisode.example%2Fwatch.mp4%3Fsig%3DPRIVATE_QUERY_SENTINEL',
+          selected_url: 'https://episode.example/watch.mp4?sig=PRIVATE_QUERY_SENTINEL',
+          selected_field: 'deep_link.url',
+          server_name: 'Via - Server 4', type: 'direct', quality: '1080p'
+        } })
+      }],
+      selectedYumeOrdinal: 1
+    }
+  };
+  const report = summarizeWatchLinks(capture);
+  assert.equal(report.watchLinks[0].id, 771);
+  assert.equal(report.yumeSelection.matchedWatchLink.id, 771);
+  assert.equal(report.yumeSelection.selectedField, 'deep_link.url');
+  assert.equal(report.yumeSelection.selectedCandidate.hostname, 'episode.example');
+  assert.deepEqual(JSON.parse(JSON.stringify(report.watchLinks[0].durationMetadata)), {
+    sourceField: 'duration_seconds', value: 61, unit: 'seconds'
+  });
+  assert.equal(JSON.stringify(report).includes('PRIVATE_QUERY_SENTINEL'), false);
+});
+
+test('existing evidence analyzer maps refreshed v3 option tokens without a stored signed URL', () => {
+  const report = summarizeWatchLinks({
+    nativeEpisodeId: 'series_episode:93051',
+    runtimeTrace: {
+      events: [{ requestUrl: 'https://ostv-11-11.xyz/api/episodes/show.php?id=93051', responseBody: { data: { watch_links: [
+        { id: 771, server_name: 'Via - Server 4', type: 'direct', quality: '1080p', url: 'https://cdn.example/new.m3u8?token=PRIVATE_REFRESHED' }
+      ] } } }],
+      yumeListing: [{ title: 'Via - Server 4', token: JSON.stringify({ version: 3, nativeId: 'series_episode:93051', link: {
+        watch_link_id: 771, selected_field: 'url', server_name: 'Via - Server 4', type: 'direct', quality: '1080p'
+      } }) }],
+      selectedYumeOrdinal: 1,
+      playerStream: { url: 'https://cdn.example/new.m3u8?token=PRIVATE_REFRESHED', type: 'm3u8' }
+    }
+  });
+  assert.equal(report.yumeSelection.matchedWatchLink.id, 771);
+  assert.equal(report.yumeSelection.selectedField, 'url');
+  assert.equal(JSON.stringify(report).includes('PRIVATE_REFRESHED'), false);
+});
+
+test('WatchLink evidence analyzer redacts short CDN path tokens after /t/', () => {
+  const report = summarizeWatchLinks({
+    watchLinks: [{
+      id: 772,
+      server_name: 'CDN',
+      type: 'direct',
+      quality: '1080p',
+      url: 'https://cdn.example/t/shorttoken/files/episode/index.m3u8?cookie=PRIVATE_COOKIE_SENTINEL'
+    }],
+    playerCandidate: {
+      url: 'https://cdn.example/t/shorttoken/files/episode/index.m3u8?cookie=PRIVATE_COOKIE_SENTINEL',
+      type: 'm3u8'
+    },
+    hops: [{
+      url: 'https://cdn.example/t/shorttoken/files/episode/index.m3u8?cookie=PRIVATE_COOKIE_SENTINEL',
+      status: 200
+    }]
+  });
+  const serialized = JSON.stringify(report);
+  assert.equal(serialized.includes('shorttoken'), false);
+  assert.equal(serialized.includes('PRIVATE_COOKIE_SENTINEL'), false);
+  assert.equal(report.watchLinks[0].url.pathname, '/t/[REDACTED]/files/episode/index.m3u8');
+  assert.equal(report.playerCandidate.url.pathname, '/t/[REDACTED]/files/episode/index.m3u8');
+  assert.equal(report.hops[0].from.pathname, '/t/[REDACTED]/files/episode/index.m3u8');
+});
+
+test('catalog filters forward only provider-supported scalar keys', async () => {
+  let requestUrl;
+  const plugin = loadPlugin(async url => {
+    requestUrl = new URL(url);
+    return apiResponse([{ id: 55, title_en: 'Filtered series' }], { page: 1, page_count: 1 });
+  });
+  await plugin.getCatalog({ catalogId: 'series', type: 'series', filters: {
+    year: 2024, country: 'US', genre_id: 8, sort_by: 'newest', '__proto__': 'bad', unknown: 'discard'
+  } });
+  assert.equal(requestUrl.searchParams.get('year'), '2024');
+  assert.equal(requestUrl.searchParams.get('country'), 'US');
+  assert.equal(requestUrl.searchParams.get('genre_id'), '8');
+  assert.equal(requestUrl.searchParams.get('sort_by'), 'newest');
+  assert.equal(requestUrl.searchParams.has('unknown'), false);
+});
+
+test('catalog and details normalize compatible envelope and pagination aliases', async () => {
+  let call = 0;
+  const plugin = loadPlugin(async url => {
+    call += 1;
+    if (call === 1) return {
+      ok: true, status: 200,
+      json: async () => ({ status: 'success', data: { items: [{ id: 42, title_en: 'Wrapped list' }] },
+        meta: { currentPage: 2, totalPages: 4, totalItems: 31, pageSize: 10 } })
+    };
+    return {
+      ok: true, status: 200,
+      json: async () => ({ status: 'success', data: { data: { id: 42, title_en: 'Nested detail' } } })
+    };
+  });
+  const page = await plugin.getCatalog({ catalogId: 'movies', type: 'movie', limit: 10 });
+  assert.equal(page.items[0].nativeId, 'movie:42');
+  assert.equal(page.page.nextCursor, '3');
+  assert.equal(page.page.total, 31);
+  const detail = await plugin.getDetails({ id: 'movie:42' });
+  assert.equal(detail.item.nativeId, 'movie:42');
+  assert.equal(detail.item.title, 'Nested detail');
+});
+
+test('API client retries transient 502/503/504 responses but never retries 403', async () => {
+  let transientCalls = 0;
+  const transient = loadPlugin(async () => {
+    transientCalls += 1;
+    if (transientCalls < 3) return { ok: false, status: transientCalls === 1 ? 503 : 502, json: async () => ({}) };
+    return apiResponse([{ id: 9, title_en: 'Recovered' }], { page: 1, page_count: 1 });
+  });
+  const recovered = await transient.getCatalog({ catalogId: 'movies', type: 'movie' });
+  assert.equal(recovered.items[0].nativeId, 'movie:9');
+  assert.equal(transientCalls, 3);
+
+  let deniedCalls = 0;
+  const denied = loadPlugin(async () => { deniedCalls += 1; return { ok: false, status: 403, json: async () => ({}) }; });
+  await assert.rejects(denied.getCatalog({ catalogId: 'movies', type: 'movie' }), /HTTP 403/);
+  assert.equal(deniedCalls, 1);
+});
+
+test('API client applies a bounded server Date offset to subsequent signatures', async () => {
+  let calls = 0;
+  let secondTimestamp;
+  const targetTime = Math.floor(Date.now() / 1000) + 120;
+  const date = new Date(targetTime * 1000).toUTCString();
+  const plugin = loadPlugin(async (url, options) => {
+    calls += 1;
+    if (calls === 1) return {
+      ok: false, status: 503,
+      headers: { get: key => String(key).toLowerCase() === 'date' ? date : null },
+      json: async () => ({})
+    };
+    secondTimestamp = Number(options.headers['X-Iron-Ts']);
+    return apiResponse([{ id: 10, title_en: 'Clock corrected' }], { page: 1, page_count: 1 });
+  });
+  await plugin.getCatalog({ catalogId: 'movies', type: 'movie' });
+  assert.equal(calls, 2);
+  assert.ok(Math.abs(secondTimestamp - targetTime) <= 1);
+  assert.ok(Math.abs(plugin.__test.clockOffset() - (targetTime - Math.floor(Date.now() / 1000))) <= 1);
 });

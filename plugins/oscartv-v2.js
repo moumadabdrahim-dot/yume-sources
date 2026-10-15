@@ -2,18 +2,20 @@
 (function (root) {
   "use strict";
 
+  // Use the published plugin origin verified to serve the API from this runtime.
+  // Keep locally signed API requests scoped to this host.
   var API = "https://ostv-11-11.xyz";
-  var HEADER_PROVIDER_URL = "https://flech.tn/scrapefinal/dramabox/step1_prepare_oscar.php";
-  var HEADER_PROVIDER_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36";
   var PLUGIN_ID = "oscar";
   var CERT_SHA256 = "6e2fcda8631eb49ebcba4ca8ef4c597abe84654c7d3e8096db32bdd21ecf763f";
   var PACKAGE_NAME = "com.drama.mp4";
-  var IRON_DIAG = "f=6e2fcda8 p=6e2fcda8 h=0";
   var API_UA = "okhttp/4.12.0";
+  var serverClockOffsetSeconds = 0;
   var MEDIA_UA = "TDMuaPlayer";
   var MAX_PAGES = 1000;
   var MAX_CONCURRENT_STREAM_RESOLUTIONS = 2;
   var MAX_CONCURRENT_HOME_CATALOGS = 3;
+  var MAX_CONCURRENT_DETAIL_SEASONS = 2;
+  var MAX_CONCURRENT_EPISODE_PAGES = 2;
 
   function fail(message) { throw new Error("Source: " + message); }
   function text(value) {
@@ -88,17 +90,25 @@
     return CryptoJS.lib.WordArray.random(4).toString(CryptoJS.enc.Hex).toLowerCase();
   }
   function apiHeaders(url) {
-    var timestamp = Math.floor(Date.now() / 1000);
+    var timestamp = Math.floor(Date.now() / 1000) + serverClockOffsetSeconds;
     var nonce = randomNonce();
     var headers = {
       "Accept": "application/json",
       "User-Agent": API_UA,
       "X-Iron-Sig": sign(url, timestamp, nonce),
       "X-Iron-Ts": String(timestamp),
-      "X-Iron-Nonce": nonce,
-      "X-Iron-Diag": IRON_DIAG
+      "X-Iron-Nonce": nonce
     };
     return headers;
+  }
+  function syncServerClock(response) {
+    var rawDate = response && response.headers && response.headers.get ? response.headers.get("date") : null;
+    if (!rawDate) return;
+    var serverMillis = Date.parse(rawDate);
+    if (!isFinite(serverMillis) || serverMillis <= 0) return;
+    var offset = Math.floor(serverMillis / 1000) - Math.floor(Date.now() / 1000);
+    // Bound an untrusted response header to one day before it can affect a signature.
+    if (Math.abs(offset) <= 86400) serverClockOffsetSeconds = offset;
   }
   function queryString(values) {
     var pairs = [];
@@ -111,53 +121,32 @@
     var suffix = queryString(query);
     return API + path + (suffix ? "?" + suffix : "");
   }
+  async function waitForRetry(milliseconds) {
+    if (typeof setTimeout !== "function") return;
+    await new Promise(function (resolve) { setTimeout(resolve, milliseconds); });
+  }
   async function request(path, query) {
     var url = buildUrl(path, query);
     if (url.indexOf(API + "/") !== 0) fail("refusing to send API headers to an unrelated host");
-    var headerResponse;
-    try {
-      headerResponse = await fetch(HEADER_PROVIDER_URL, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/x-www-form-urlencoded",
-          "User-Agent": HEADER_PROVIDER_UA
-        },
-        body: "url=" + encodeURIComponent(url),
-        redirect: "follow"
-      });
-    } catch (_) { fail("header provider network error"); }
-    if (!headerResponse || !headerResponse.ok) {
-      fail("header provider HTTP " + (headerResponse ? headerResponse.status : "no response"));
+    var response = null;
+    var networkFailure = false;
+    for (var attempt = 0; attempt < 3; attempt++) {
+      try {
+        // Signing is performed locally using the compatibility implementation
+        // covered by the deterministic reference vector; no external signer sees URLs.
+        // Keep redirects manual so request signatures are never forwarded to another host.
+        response = await fetch(url, { method: "GET", headers: apiHeaders(url), redirect: "manual" });
+        syncServerClock(response);
+        networkFailure = false;
+      } catch (_) {
+        response = null;
+        networkFailure = true;
+      }
+      var retryableStatus = response && [502, 503, 504].indexOf(Number(response.status)) >= 0;
+      if (attempt >= 2 || (!networkFailure && !retryableStatus)) break;
+      await waitForRetry(attempt === 0 ? 500 : 1000);
     }
-    var headerPayload;
-    try { headerPayload = await headerResponse.json(); }
-    catch (_) { fail("header provider returned invalid JSON"); }
-    if (!headerPayload || typeof headerPayload !== "object") fail("header provider returned invalid JSON");
-    if (!headerPayload.headers || typeof headerPayload.headers !== "object" || Array.isArray(headerPayload.headers)) {
-      fail("header provider response is missing headers");
-    }
-    var blockedHeaders = {
-      host: true, connection: true, "content-length": true, "transfer-encoding": true,
-      "keep-alive": true, "proxy-connection": true, upgrade: true, te: true, trailer: true
-    };
-    var allowedApiHeaders = {
-      accept: true, "user-agent": true, "x-iron-sig": true, "x-iron-ts": true,
-      "x-iron-nonce": true, "x-iron-diag": true
-    };
-    var apiRequestHeaders = {};
-    Object.keys(headerPayload.headers).forEach(function (name) {
-      var value = headerPayload.headers[name];
-      var lowerName = name.toLowerCase();
-      if (!/^[!#$%&'*+.^_`|~0-9a-z-]+$/i.test(name) || blockedHeaders[lowerName] || !allowedApiHeaders[lowerName]) return;
-      if (typeof value !== "string" && typeof value !== "number") return;
-      apiRequestHeaders[name] = String(value);
-    });
-    if (!Object.keys(apiRequestHeaders).length) fail("header provider returned no usable API headers");
-    var response;
-    try {
-      // Never allow the transport to forward provider credentials through a cross-host redirect.
-      response = await fetch(url, { method: "GET", headers: apiRequestHeaders, redirect: "manual" });
-    } catch (_) { fail("Oscar API network error for " + path); }
+    if (networkFailure) fail("Oscar API network error for " + path);
     if (!response || !response.ok) fail("HTTP " + (response ? response.status : "no response") + " for " + path);
     var envelope;
     try { envelope = await response.json(); } catch (error2) { fail("invalid JSON for " + path); }
@@ -169,13 +158,38 @@
   }
   async function list(path, query) {
     var envelope = await request(path, query);
-    if (!Array.isArray(envelope.data)) fail("expected list data at " + path);
-    return { items: envelope.data, pagination: envelope.pagination || {} };
+    var data = envelope.data;
+    var items = Array.isArray(data) ? data : data && (data.items || data.results) || envelope.items || envelope.results;
+    if (!Array.isArray(items)) fail("expected list data at " + path);
+    return { items: items, pagination: normalizePagination(envelope.pagination || envelope.meta || data && data.pagination || {}) };
   }
   async function objectData(path, query) {
     var envelope = await request(path, query);
-    if (!envelope.data || typeof envelope.data !== "object" || Array.isArray(envelope.data)) fail("expected object data at " + path);
-    return envelope.data;
+    var data = envelope.data;
+    if (data && typeof data === "object" && !Array.isArray(data) && data.data && typeof data.data === "object" && !Array.isArray(data.data)) data = data.data;
+    if ((!data || typeof data !== "object" || Array.isArray(data)) && envelope.result && typeof envelope.result === "object") data = envelope.result;
+    if (!data || typeof data !== "object" || Array.isArray(data)) fail("expected object data at " + path);
+    return data;
+  }
+  function firstPositive(source, keys) {
+    for (var i = 0; i < keys.length; i++) {
+      var value = positiveInt(source && source[keys[i]]);
+      if (value) return value;
+    }
+    return null;
+  }
+  function normalizePagination(value) {
+    var p = value && typeof value === "object" ? value : {};
+    var normalized = {};
+    var page = firstPositive(p, ["page", "current_page", "currentPage"]);
+    var count = firstPositive(p, ["page_count", "total_pages", "totalPages", "last_page", "lastPage", "pages"]);
+    var total = firstPositive(p, ["total", "total_items", "totalItems"]);
+    var limit = firstPositive(p, ["per_page", "perPage", "limit", "page_size", "pageSize"]);
+    if (page) normalized.page = page;
+    if (count) normalized.page_count = count;
+    if (total) normalized.total = total;
+    if (limit) normalized.per_page = limit;
+    return normalized;
   }
   function imageUrl(value) {
     var v = optional(value);
@@ -235,8 +249,8 @@
     };
   }
   function pageCount(page) {
-    var p = page && page.pagination || {};
-    return positiveInt(p.page_count) || positiveInt(p.total_pages) || positiveInt(p.last_page) || null;
+    var p = normalizePagination(page && page.pagination || {});
+    return positiveInt(p.page_count) || null;
   }
   var CATALOG_CONFIG = [
     { id: "movies", path: "/api/movies/", type: "movie" },
@@ -253,6 +267,14 @@
     { id: "anime", path: "/api/anime/", type: "anime", query: { sort_by: "newest" } },
     { id: "anime_movies", path: "/api/anime/", type: "anime", query: { anime_type: "movie", sort_by: "newest" } }
   ];
+  var CATALOG_FILTER_KEYS = {
+    movie: ["status", "year", "country", "genre_id", "language", "category", "content_type", "age_rating",
+      "collection_id", "quality_source", "has_links", "featured", "awards", "sort_by"],
+    series: ["status", "year", "country", "genre_id", "language", "is_colored", "sort_by", "age_rating",
+      "type", "category", "content_type"],
+    anime: ["anime_type", "studio_id", "genre_id", "status", "season_period", "season_year", "year",
+      "content_type", "age_rating", "featured", "sort_by"]
+  };
   function catalogPageCount(page) {
     var count = pageCount(page);
     if (count) return count;
@@ -279,6 +301,17 @@
     if (!isFinite(limit) || Math.floor(limit) !== limit || limit < 1 || limit > 100) fail("invalid page limit");
     var query = {};
     Object.keys(catalog.query || {}).forEach(function (key) { query[key] = catalog.query[key]; });
+    var allowedFilters = CATALOG_FILTER_KEYS[catalog.type] || [];
+    var filters = args.filters && typeof args.filters === "object" ? args.filters : {};
+    Object.keys(filters).forEach(function (key) {
+      if (allowedFilters.indexOf(key) < 0) return;
+      var value = filters[key];
+      if (value === undefined || value === null) return;
+      if (typeof value !== "string" && typeof value !== "number" && typeof value !== "boolean") return;
+      var normalizedValue = String(value).trim();
+      if (!normalizedValue || normalizedValue.length > 128 || /[\u0000-\u001f\u007f]/.test(normalizedValue)) return;
+      query[key] = normalizedValue;
+    });
     query.page = pageNo;
     query.limit = limit;
     var search = args.query == null ? "" : String(args.query);
@@ -356,23 +389,17 @@
       title: title, thumbnail: imageUrl(raw.thumbnail || raw.anime_poster || raw.series_poster || raw.poster || posterFallback) || undefined,
       description: optional(raw.description) || undefined, released: optional(raw.air_date) || undefined };
   }
-  async function listWithRetry(path, query) {
-    var lastError;
-    for (var attempt = 0; attempt < 2; attempt++) {
-      try { return await list(path, query); } catch (error) { lastError = error; }
-    }
-    throw lastError || new Error("request failed");
-  }
   async function fetchAllEpisodes(path, seasonId, type, seasonNumber, poster) {
-    var first = await listWithRetry(path, { season_id: seasonId, per_page: 100, page: 1 });
+    var first = await list(path, { season_id: seasonId, per_page: 100, page: 1 });
     var pages = positiveInt(first.pagination.page_count) || positiveInt(first.pagination.total_pages) || positiveInt(first.pagination.last_page) || 1;
     pages = Math.max(1, Math.min(pages, MAX_PAGES));
     var all = first.items.slice();
-    // Match the reference implementation's page concurrency bound of four.
-    for (var start = 2; start <= pages; start += 4) {
+    // Keep each season's episode-page fanout small; getDetails processes only
+    // two seasons at a time, limiting the combined page burst to four requests.
+    for (var start = 2; start <= pages; start += MAX_CONCURRENT_EPISODE_PAGES) {
       var jobs = [];
-      for (var page = start; page < start + 4 && page <= pages; page++) {
-        (function (pageNo) { jobs.push(listWithRetry(path, { season_id: seasonId, per_page: 100, page: pageNo }).catch(function () { return null; })); })(page);
+      for (var page = start; page < start + MAX_CONCURRENT_EPISODE_PAGES && page <= pages; page++) {
+        (function (pageNo) { jobs.push(list(path, { season_id: seasonId, per_page: 100, page: pageNo }).catch(function () { return null; })); })(page);
       }
       var loaded = await Promise.all(jobs);
       loaded.forEach(function (result) { if (result && result.items) all = all.concat(result.items); });
@@ -399,8 +426,8 @@
     seasons = seasons.filter(function (season) { return positiveInt(season.id) && positiveInt(season.season_number); })
       .sort(function (a, b) { return Number(a.season_number) - Number(b.season_number); });
     var episodes = [];
-    for (var i = 0; i < seasons.length; i += 4) {
-      var seasonGroup = seasons.slice(i, i + 4);
+    for (var i = 0; i < seasons.length; i += MAX_CONCURRENT_DETAIL_SEASONS) {
+      var seasonGroup = seasons.slice(i, i + MAX_CONCURRENT_DETAIL_SEASONS);
       var fetched = await Promise.all(seasonGroup.map(function (season) {
         var endpoint = parsed.type === "series" ? "/api/episodes/" : "/api/anime/episodes/";
         return fetchAllEpisodes(endpoint, Number(season.id), parsed.type, Number(season.season_number), item.poster).catch(function () { return []; });
@@ -419,7 +446,7 @@
       description: item.description, year: item.year, rating: item.rating,
       genres: item.genres || [], externalIds: item.externalIds,
       hasParentStreams: Array.isArray(raw.watch_links) && raw.watch_links.some(function (link) {
-        return isHttpUrl(link && link.url);
+        return !!playbackTarget(link);
       }),
       runtime: positiveInt(raw.runtime) || positiveInt(raw.episode_duration) || undefined };
   }
@@ -452,11 +479,96 @@
     return host === "seriesmp4.com" || /\.seriesmp4\.com$/i.test(host);
   }
   function isYandex(url) { var host = hostOf(url); return /(^|\.)yandex\.(ru|net)$/i.test(host); }
-  function mediaUa(link) {
+  function queryParameter(uri, name) {
+    var question = String(uri || "").indexOf("?");
+    if (question < 0) return null;
+    var query = String(uri).slice(question + 1).split("#")[0].split("&");
+    for (var i = 0; i < query.length; i++) {
+      var equals = query[i].indexOf("=");
+      if (equals < 0) continue;
+      var key = query[i].slice(0, equals);
+      var value = query[i].slice(equals + 1);
+      try { key = decodeURIComponent(key.replace(/\+/g, "%20")); } catch (_) {}
+      if (key !== name) continue;
+      try { value = decodeURIComponent(value.replace(/\+/g, "%20")); } catch (_) { return null; }
+      return value;
+    }
+    return null;
+  }
+  function safeHeaderValue(value, maxLength) {
+    var result = text(value).trim();
+    if (!result || result.length > maxLength || /[\x00-\x1f\x7f]/.test(result)) return null;
+    return result;
+  }
+  function safeHttpUrl(value) {
+    var url = text(value).trim();
+    if (!isHttpUrl(url)) return null;
+    try {
+      var parsed = new URL(url);
+      if ((parsed.protocol !== "http:" && parsed.protocol !== "https:") || parsed.username || parsed.password) return null;
+      parsed.hash = "";
+      return parsed.toString();
+    } catch (_) { return url; }
+  }
+  function originOf(value) {
+    try {
+      var parsed = new URL(String(value || ""));
+      if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return null;
+      return parsed.origin.toLowerCase();
+    } catch (_) {
+      var match = /^(https?):\/\/([^/?#]+)/i.exec(String(value || "").trim());
+      if (!match) return null;
+      return match[1].toLowerCase() + "://" + match[2].toLowerCase();
+    }
+  }
+  function sameOrigin(left, right) {
+    var leftOrigin = originOf(left);
+    var rightOrigin = originOf(right);
+    return !!leftOrigin && leftOrigin === rightOrigin;
+  }
+  function playbackMetadata(link, targetUrl) {
     var deep = text(link && link.deep_link);
-    var match = /(?:\?|&)(?:ua|user_agent)=([^&]+)/i.exec(deep);
-    if (!match) return MEDIA_UA;
-    try { return decodeURIComponent(match[1].replace(/\+/g, "%20")) || MEDIA_UA; } catch (_) { return match[1] || MEDIA_UA; }
+    var rawUa = queryParameter(deep, "ua") || queryParameter(deep, "user_agent");
+    var userAgent = safeHeaderValue(rawUa, 1024) || MEDIA_UA;
+    var metadata = { "User-Agent": userAgent };
+    var mediaUrl = text(link && link.url);
+    // Oscar's playback metadata is carried beside the URL in deep_link. Keep
+    // session headers bound to the WatchLink URL's origin; a TDM URL on a
+    // different origin must not inherit that Cookie.
+    if (sameOrigin(targetUrl, mediaUrl)) {
+      var cookie = safeHeaderValue(queryParameter(deep, "cookies"), 8192);
+      var referer = safeHttpUrl(queryParameter(deep, "referer") || queryParameter(deep, "ref"));
+      if (cookie) metadata.Cookie = cookie;
+      if (referer) metadata.Referer = referer;
+    }
+    return metadata;
+  }
+  function tdmVideoUrl(uri) {
+    if (!/^tdmvideo:\/\//i.test(String(uri || ""))) return null;
+    var embedded = queryParameter(uri, "url");
+    return isHttpUrl(embedded) ? embedded : null;
+  }
+  function playbackTarget(link) {
+    var url = text(link && link.url);
+    var deep = text(link && link.deep_link);
+    var type = text(link && link.type).toLowerCase();
+    var tdmUrl = tdmVideoUrl(deep);
+    // Oscar's WatchLink.url is the player candidate; deep_link may carry the
+    // TDM URL and request metadata. This follows the upstream CDN-cookie fix.
+    if (type === "direct" && isHttpUrl(url)) return { url: url, source: "url" };
+    if (tdmUrl) return { url: tdmUrl, source: "deep_link.url" };
+    // Oscar hands embed-like sources to ACTION_VIEW. A plain HTTP(S) deep link
+    // can be resolved by Yume's bounded wrapper resolver, while direct links keep
+    // their media URL unless the deep link itself is recognized as media.
+    if (/^(embed|iframe|wrapper|external|web)$/.test(type) && isHttpUrl(deep)) {
+      return { url: deep, source: "deep_link-http" };
+    }
+    if (type === "direct" && isHttpUrl(deep) && directMedia(deep, "")) {
+      return { url: deep, source: "deep_link-media" };
+    }
+    if (isHttpUrl(url)) return { url: url, source: "url" };
+    if (isHttpUrl(deep)) return { url: deep, source: "deep_link-http-fallback" };
+    return null;
   }
   function normalizeUrl(base, value) {
     var href = text(value);
@@ -520,6 +632,38 @@
     return /\.m3u8(?:$|[?#])/i.test(String(url || "")) || /(?:mpegurl|vnd\.apple\.mpegurl)/i.test(String(contentType || ""))
       ? "m3u8" : "video";
   }
+  async function boundedResponseText(response, maxBytes) {
+    var limit = positiveInt(maxBytes) || 1048576;
+    var body = response && response.body;
+    if (body && typeof body.getReader === "function" && typeof TextDecoder !== "undefined") {
+      var reader = body.getReader();
+      var chunks = [];
+      var total = 0;
+      try {
+        while (total < limit) {
+          var part = await reader.read();
+          if (part.done) break;
+          var bytes = part.value || new Uint8Array(0);
+          var remaining = limit - total;
+          var accepted = bytes.length > remaining ? bytes.subarray(0, remaining) : bytes;
+          chunks.push(accepted);
+          total += accepted.length;
+          if (accepted.length < bytes.length) break;
+        }
+      } finally {
+        if (total >= limit && reader.cancel) {
+          try { await reader.cancel(); } catch (_) {}
+        }
+      }
+      var merged = new Uint8Array(total);
+      var offset = 0;
+      chunks.forEach(function (chunk) { merged.set(chunk, offset); offset += chunk.length; });
+      return new TextDecoder("utf-8").decode(merged);
+    }
+    // Yume's fetch bridge caps text response bodies. This fallback keeps the
+    // same character bound for runtimes that do not expose a Web ReadableStream.
+    try { return String(await response.text()).slice(0, limit); } catch (_) { return ""; }
+  }
   async function resolveWrapper(url, headers, depth, visited) {
     if (!isHttpUrl(url)) return [];
     if (depth > 4) return [];
@@ -544,8 +688,7 @@
       Object.keys(headers || {}).forEach(function (name) { mediaHeaders[name] = headers[name]; });
       return [{ url: finalUrl, headers: mediaHeaders, contentType: contentType }];
     }
-    var html = "";
-    try { html = typeof response.text === "function" ? await response.text() : ""; } catch (_) { return []; }
+    var html = await boundedResponseText(response, 1048576);
     if (directMedia(finalUrl, contentType) && !htmlResponse(contentType, html)) {
       var extensionMediaHeaders = {};
       Object.keys(headers || {}).forEach(function (name) { extensionMediaHeaders[name] = headers[name]; });
@@ -596,13 +739,28 @@
     return uniqueResolved(found);
   }
   async function resolveLink(link) {
-    var url = text(link.url);
-    if (!isHttpUrl(url)) return [];
-    var headers = { "User-Agent": mediaUa(link) };
+    var selected = playbackTarget(link);
+    if (!selected) return [];
+    var url = selected.url;
+    var headers = playbackMetadata(link, url);
+    var resolverHeaders = { "User-Agent": headers["User-Agent"] };
     if (isSeriesMp4(url) || isYandex(url) || !directMedia(url, "")) {
-      var resolved = await resolveWrapper(url, headers, 0);
+      // Do not put session cookies or provider Referer values on wrapper
+      // requests: fetch may follow redirects before the final media origin is known.
+      var resolved = await resolveWrapper(url, resolverHeaders, 0);
       return resolved.map(function (entry) {
-        return { url: entry.url, headers: entry.headers || headers, title: serverTitle(link),
+        var mediaHeaders = {};
+        Object.keys(entry.headers || resolverHeaders).forEach(function (name) {
+          mediaHeaders[name] = (entry.headers || resolverHeaders)[name];
+        });
+        mediaHeaders["User-Agent"] = headers["User-Agent"];
+        if (sameOrigin(url, entry.url)) {
+          if (headers.Cookie) mediaHeaders.Cookie = headers.Cookie;
+          if (headers.Referer) mediaHeaders.Referer = headers.Referer;
+        } else {
+          delete mediaHeaders.Cookie;
+        }
+        return { url: entry.url, headers: mediaHeaders, title: serverTitle(link),
           provider: "Source", quality: qualityOf(link.quality), type: streamType(entry.url, entry.contentType) };
       });
     }
@@ -650,26 +808,95 @@
     } else fail("streams require movie, anime, series_episode, or anime_episode id");
     return Array.isArray(links) ? links : [];
   }
-  function streamOption(link, index) {
+  function streamOption(link, index, sourceNativeId) {
+    var selected = playbackTarget(link);
+    if (!selected) return null;
+    var watchLinkId = positiveInt(link && link.id);
+    if (watchLinkId) {
+      // Keep signed URLs out of new option tokens. The selected action will
+      // fetch a fresh WatchLink and match its stable provider ID.
+      var identifiedLink = {
+        watch_link_id: watchLinkId,
+        source_ordinal: Number(index) || 0,
+        selected_field: selected.source,
+        type: text(link && link.type) || undefined,
+        quality: text(link && link.quality) || undefined,
+        server_name: text(link && link.server_name) || undefined
+      };
+      return { token: JSON.stringify({ version: 3, nativeId: sourceNativeId, link: identifiedLink }), title: serverTitle(link),
+        provider: "Source", quality: qualityOf(link && link.quality), type: text(link && link.type) || undefined };
+    }
+    if (sourceNativeId) {
+      var fallbackIdentity = {
+        source_ordinal: Number(index) || 0,
+        selected_field: selected.source,
+        server_name: text(link && link.server_name) || undefined,
+        type: text(link && link.type) || undefined,
+        quality: text(link && link.quality) || undefined
+      };
+      if (!fallbackIdentity.server_name && !fallbackIdentity.type && !fallbackIdentity.quality) return null;
+      return { token: JSON.stringify({ version: 4, nativeId: sourceNativeId, link: fallbackIdentity }), title: serverTitle(link),
+        provider: "Source", quality: qualityOf(link && link.quality), type: text(link && link.type) || undefined };
+    }
+    // Retain the internal legacy helper path for old v1/v2 tokens. Production
+    // option lists always provide sourceNativeId and use the refreshable v3/v4 forms.
     var safeLink = {
       url: text(link && link.url),
       deep_link: text(link && link.deep_link) || undefined,
+      selected_url: selected.url,
+      selected_field: selected.source,
       type: text(link && link.type) || undefined,
       quality: text(link && link.quality) || undefined,
       server_name: text(link && link.server_name) || undefined
     };
-    if (!isHttpUrl(safeLink.url)) return null;
-    return { token: JSON.stringify({ version: 1, ordinal: Number(index) || 0, link: safeLink }), title: serverTitle(link),
+    return { token: JSON.stringify({ version: 2, ordinal: Number(index) || 0, link: safeLink }), title: serverTitle(link),
       provider: "Source", quality: qualityOf(link && link.quality), type: text(link && link.type) || undefined };
   }
   function linkFromOptionToken(token) {
     var parsed;
     try { parsed = JSON.parse(String(token || "")); } catch (_) { return null; }
-    if (!parsed || parsed.version !== 1 || !parsed.link || !isHttpUrl(parsed.link.url)) return null;
-    return parsed.link;
+    if (!parsed || (parsed.version !== 1 && parsed.version !== 2) || !parsed.link) return null;
+    // Recompute from the original fields so older v1 options remain usable and
+    // a serialized selected_url cannot turn a custom scheme into a media URL.
+    var selected = playbackTarget(parsed.link);
+    if (!selected) return null;
+    var link = {};
+    Object.keys(parsed.link).forEach(function (key) { link[key] = parsed.link[key]; });
+    link.url = selected.url;
+    return link;
   }
   async function resolveStreamOption(args) {
-    parseId(args && args.id);
+    var parsedId = parseId(args && args.id);
+    var parsedToken;
+    try { parsedToken = JSON.parse(String(args && args.token || "")); } catch (_) { parsedToken = null; }
+    if (parsedToken && parsedToken.version === 3) {
+      var expectedNativeId = nativeId(parsedId.type, parsedId.id);
+      var selectedLinkId = positiveInt(parsedToken.link && parsedToken.link.watch_link_id);
+      if (parsedToken.nativeId !== expectedNativeId || !selectedLinkId) fail("invalid stream option identity");
+      var freshLinks = await watchLinksFor(parsedId);
+      var freshLink = freshLinks.find(function (entry) { return positiveInt(entry && entry.id) === selectedLinkId; });
+      if (!freshLink) fail("selected WatchLink changed; refresh the stream list");
+      return { streams: await resolveLink(freshLink) };
+    }
+    if (parsedToken && parsedToken.version === 4) {
+      var expectedNativeIdWithoutLink = nativeId(parsedId.type, parsedId.id);
+      if (parsedToken.nativeId !== expectedNativeIdWithoutLink) fail("invalid stream option identity");
+      var identity = parsedToken.link || {};
+      var sourceOrdinal = Number(identity.source_ordinal);
+      if (!isFinite(sourceOrdinal) || sourceOrdinal < 0 || Math.floor(sourceOrdinal) !== sourceOrdinal) {
+        fail("invalid stream option identity");
+      }
+      var refreshedLinks = await watchLinksFor(parsedId);
+      var freshMatches = refreshedLinks.filter(function (entry) {
+        return text(entry && entry.server_name) === text(identity.server_name) &&
+          text(entry && entry.type) === text(identity.type) &&
+          text(entry && entry.quality) === text(identity.quality);
+      });
+      if (freshMatches.length !== 1) {
+        fail("selected WatchLink changed or is ambiguous at source ordinal " + sourceOrdinal + "; refresh the stream list");
+      }
+      return { streams: await resolveLink(freshMatches[0]) };
+    }
     var link = linkFromOptionToken(args && args.token);
     if (!link) fail("invalid stream option token");
     return { streams: await resolveLink(link) };
@@ -681,7 +908,8 @@
     var apiMs = Date.now() - apiStartedAt;
     if (args && args.mode === "options") {
       var parsingStartedAt = Date.now();
-      var options = links.map(streamOption).filter(Boolean);
+      var sourceNativeId = nativeId(parsed.type, parsed.id);
+      var options = links.map(function (link, index) { return streamOption(link, index, sourceNativeId); }).filter(Boolean);
       return { options: options, timing: { apiMs: apiMs, parsingMs: Date.now() - parsingStartedAt } };
     }
     return { streams: await resolveLinks(links) };
@@ -693,13 +921,16 @@
   // The local node:test harness opts in; this property is absent in the Yume runtime.
   if (root && root.__YUME_OSCAR_TESTING__ && root.module) {
     root.module.exports.__test = { parseId: parseId, nativeId: nativeId, deriveIronKey: deriveIronKey,
-      sign: sign, signedPath: signedPath, directMedia: directMedia, qualityOf: qualityOf,
+      sign: sign, signedPath: signedPath, apiHeaders: apiHeaders, clockOffset: function () { return serverClockOffsetSeconds; },
+      directMedia: directMedia, qualityOf: qualityOf,
       mapMedia: mapMedia, detailsItem: detailsItem, imageUrl: imageUrl, isSeriesMp4: isSeriesMp4,
       externalIdsOf: externalIdsOf,
       getHome: getHome, homeCatalogs: HOME_CATALOGS, getCatalog: getCatalog, catalogConfig: CATALOG_CONFIG, serverTitle: serverTitle,
       normalizeUrl: normalizeUrl, extractHtmlSources: extractHtmlSources,
       extractAbsoluteHttpUrls: extractAbsoluteHttpUrls, isHttpUrl: isHttpUrl, isYandex: isYandex,
-      streamType: streamType, resolveWrapper: resolveWrapper, resolveLink: resolveLink,
+      streamType: streamType, queryParameter: queryParameter, tdmVideoUrl: tdmVideoUrl, playbackTarget: playbackTarget,
+      normalizePagination: normalizePagination, boundedResponseText: boundedResponseText,
+      resolveWrapper: resolveWrapper, resolveLink: resolveLink,
       resolveLinks: resolveLinks, streamOption: streamOption, linkFromOptionToken: linkFromOptionToken,
       resolveStreamOption: resolveStreamOption };
   }

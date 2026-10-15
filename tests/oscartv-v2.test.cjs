@@ -10,6 +10,7 @@ const { selectTargetOption } = require('./live-smoke.cjs');
 const root = path.resolve(__dirname, '..');
 const source = fs.readFileSync(path.join(root, 'plugins/oscartv-v2.js'), 'utf8');
 const manifest = JSON.parse(fs.readFileSync(path.join(root, 'manifest.json'), 'utf8'));
+const ORIGINAL_ENCRYPTED_DOMAIN_CONFIG = "cG1q2ai4gZGtgQFNbZLJcqfw8R4FL5l9aUXHJLcwAZQ3alLqX30LSOIVQeIRPhpM3BMD858RdXOFjZxomEKaZ6AISXSldwd6xWOZM24qtYBMyijxQbCuo3lXQyksDmQZGp/iVqGYEPA50mXS9qOvrsP8+d1fBMGekx6y04meLq0w0ZMDioTv6joUdBy2UWh1nywgA+v1zDLS0ItVLK//Z9tZ5n4VIJ7kDpGHroFBfpB318ILqJbqIiKyVktI2k1obMJLKNcGO8aYLKuk3NIan9Wml0ex4F0SDkKCejOLQY73qAUp/6qcpjnRWFEREnFLYuHEzy6Fk24pf8awbGRCJbmc3MZzgBeYsSKjk3+vL2ZTkkutBqyv97DLA2fbqS6XZPbVUephi4p6XDmnmsE3vX1mAU9f5VLDR037JuGywWJ1WGqIoqCC3DhPrenXKBuSfhH3WcnxJY8sFgJ+jIo/9e2S/LIDg74sCCJmMc8GR37DfhuecKYsWCkdizu14+04JLoCBhIUrf1s6dMq8tMB5TBuyJmkvLJbWLYofAag4G5ZF2X2Vnhnb0BN/B8jdvFegIsZbPp5bONgGl98irSKR82YBFhi766CHRwlCcl3Mhz3PwEx2bjzS8M+D8SN3xAKQaQOo4h3NBNKtRvR8k5cDrhkqC7U/r0PhyEhD16osWG1Hwo80C5c";
 function wordArray(bytes) {
   const value = Buffer.from(bytes);
   const words = [];
@@ -24,19 +25,47 @@ function bytesOf(value) {
 }
 const CryptoJS = {
   enc: {
-    Utf8: { parse: value => wordArray(Buffer.from(String(value), 'utf8')) },
-    Hex: { stringify: value => bytesOf(value).toString('hex') }
+    Utf8: { parse: value => wordArray(Buffer.from(String(value), 'utf8')),
+      stringify: value => bytesOf(value).toString('utf8') },
+    Hex: { stringify: value => bytesOf(value).toString('hex'), parse: value => wordArray(Buffer.from(String(value), 'hex')) },
+    Base64: { parse: value => wordArray(Buffer.from(String(value), 'base64')) }
   },
   lib: { WordArray: {
     create: (words, size) => wordArray(Buffer.isBuffer(words) ? words.subarray(0, size) : Array.from({ length: size }, (_, i) => (words[i >>> 2] >>> (24 - (i % 4) * 8)) & 255)),
     random: size => wordArray(Buffer.from(Array.from({ length: size }, (_, i) => i + 1)))
   } },
   SHA256: value => wordArray(crypto.createHash('sha256').update(bytesOf(value)).digest()),
-  HmacSHA256: (message, key) => wordArray(crypto.createHmac('sha256', bytesOf(key)).update(Buffer.from(String(message))).digest())
+  HmacSHA256: (message, key) => wordArray(crypto.createHmac('sha256', bytesOf(key)).update(Buffer.from(String(message))).digest()),
+  mode: { GCM: 'AES-GCM' },
+  pad: { NoPadding: 'NoPadding' },
+  AES: { decrypt: (cipher, key, options = {}) => {
+    const bytes = bytesOf(cipher.ciphertext || cipher);
+    const keyBytes = bytesOf(key);
+    const nonce = bytesOf(options.iv);
+    if (options.mode !== 'AES-GCM' || bytes.length < 16) throw new Error('Invalid AES-GCM test input');
+    const decipher = crypto.createDecipheriv(`aes-${keyBytes.length * 8}-gcm`, keyBytes, nonce);
+    decipher.setAuthTag(bytes.subarray(bytes.length - 16));
+    return wordArray(Buffer.concat([decipher.update(bytes.subarray(0, bytes.length - 16)), decipher.final()]));
+  } }
 };
+const DOMAIN_CONFIG_URLS = new Set([
+  'https://raw.githubusercontent.com/MBoshkash/ostv-config/main/domains.json',
+  'https://cdn.jsdelivr.net/gh/MBoshkash/ostv-config@main/domains.json'
+]);
+const DEFAULT_TEST_DOMAIN_CONFIG = JSON.stringify({ default_domain: 'https://ostv-11-11.xyz/', backup_domains: [] });
 function loadPlugin(fetchImpl, options = {}) {
   const module = { exports: {} };
   const observedFetch = async (url, requestOptions = {}) => {
+    const parsed = new URL(url);
+    const isBootstrap = DOMAIN_CONFIG_URLS.has(url);
+    const isProbe = parsed.pathname === '/api/movies/' && parsed.searchParams.get('page') === '1' &&
+      parsed.searchParams.get('limit') === '1' && parsed.searchParams.get('sort_by') === 'views_today';
+    if (options.mockBootstrapAndProbe !== false && isBootstrap) {
+      return httpResponse({ status: 200, url, contentType: 'text/plain', body: options.remoteConfigBody ?? DEFAULT_TEST_DOMAIN_CONFIG });
+    }
+    if (options.mockBootstrapAndProbe !== false && isProbe) {
+      return apiResponse([{ id: 1, title_en: 'Probe' }], { page: 1, page_count: 1, total: 1, per_page: 1 });
+    }
     options.onFetch?.(url, requestOptions);
     return fetchImpl(url, requestOptions);
   };
@@ -70,6 +99,162 @@ test('v2 exports aggregate Home/catalog/details/streams and preserves the determ
   assert.equal(plugin.search, undefined);
   assert.equal(typeof plugin.getCatalog, 'function');
   assert.equal(plugin.__test.sign(pathPart, timestamp, nonce), vector.expectedSignature);
+});
+
+test('the current original OscarTV AES-GCM domain feed decrypts and preserves ordered candidates', () => {
+  const plugin = loadPlugin(async () => { throw new Error('unexpected network'); });
+  const candidates = plugin.__test.domainCandidatesFromConfig(ORIGINAL_ENCRYPTED_DOMAIN_CONFIG);
+  assert.equal(candidates[0], 'https://ostvapp.cam');
+  assert.equal(candidates[1], 'https://api.myychann.site');
+  assert.equal(candidates[2], 'https://api.ossccaarr111.online');
+  assert.equal(candidates[3], 'https://ostv-11-11.xyz');
+  assert.equal(candidates.at(-1), 'https://weathered-forest-d8db.manon-lol2000.workers.dev');
+  assert.equal(candidates.includes('https://poster.ostv-11-33.xyz'), false);
+  assert.equal(plugin.__test.domainCandidatesFromConfig('{malformed'), null);
+});
+
+test('domain config accepts only HTTPS host roots and always reserves the known .xyz fallback', () => {
+  const plugin = loadPlugin(async () => { throw new Error('unexpected network'); });
+  const candidates = plugin.__test.domainCandidatesFromConfig(JSON.stringify({
+    default_domain: 'http://insecure.example.net/',
+    backup_domains: [
+      'https://user:pass@credential.example.net/',
+      'https://path.example.net/api/',
+      'https://invalid_label.example.net/',
+      'https://valid.example.net/'
+    ]
+  }));
+  assert.deepEqual(Array.from(candidates), ['https://valid.example.net', 'https://ostv-11-11.xyz']);
+  const manyDomains = Array.from({ length: 32 }, (_, index) => `https://domain-${index}.example.net/`);
+  const bounded = plugin.__test.domainCandidatesFromConfig(JSON.stringify({ backup_domains: manyDomains }));
+  assert.equal(bounded.length, 16);
+  assert.equal(bounded.at(-1), 'https://ostv-11-11.xyz');
+  assert.deepEqual(Array.from(plugin.__test.domainCandidatesFromConfig(JSON.stringify(['https://legacy.example.net/']))), [
+    'https://legacy.example.net', 'https://ostv-11-11.xyz'
+  ]);
+});
+
+test('configuration bootstrap uses the fixed source without API signatures and selects a valid configured primary', async () => {
+  const events = [];
+  const config = JSON.stringify({ default_domain: 'https://primary.example.net/', backup_domains: ['https://backup.example.net/'] });
+  const plugin = loadPlugin(async (url, options) => {
+    const parsed = new URL(url);
+    if (DOMAIN_CONFIG_URLS.has(url)) return httpResponse({ status: 200, url, contentType: 'text/plain', body: config });
+    if (parsed.pathname === '/api/movies/' && parsed.searchParams.get('sort_by') === 'views_today') {
+      return apiResponse([{ id: 1 }], { page: 1, page_count: 1, total: 1, per_page: 1 });
+    }
+    return apiResponse([{ id: 42, title_en: 'Configured movie', poster: '/poster.jpg' }], { page: 1, page_count: 1 });
+  }, { mockBootstrapAndProbe: false, onFetch: (url, options) => events.push({ url, options }) });
+
+  const result = await plugin.getCatalog({ catalogId: 'movies', type: 'movie', limit: 1 });
+  assert.equal(result.items[0].nativeId, 'movie:42');
+  assert.deepEqual(events.map(event => new URL(event.url).hostname), [
+    'raw.githubusercontent.com', 'primary.example.net', 'primary.example.net'
+  ]);
+  assert.equal(events[0].options.redirect, 'manual');
+  assert.deepEqual(Object.keys(events[0].options.headers), ['Accept']);
+  assert.equal(events[0].options.headers['X-Iron-Sig'], undefined);
+  assert.equal(events[1].options.redirect, 'manual');
+  assert.match(events[1].options.headers['X-Iron-Sig'], /^[a-f0-9]{64}$/);
+  assert.equal(plugin.__test.selectedApiDomain(), 'https://primary.example.net');
+});
+
+test('unhealthy primary and invalid probe schema fail over to the first valid backup', async () => {
+  const events = [];
+  const config = JSON.stringify({ default_domain: 'https://primary.example.net/', backup_domains: ['https://backup.example.net/'] });
+  const plugin = loadPlugin(async (url, options) => {
+    const parsed = new URL(url);
+    if (DOMAIN_CONFIG_URLS.has(url)) return httpResponse({ status: 200, url, contentType: 'application/json', body: config });
+    if (parsed.pathname === '/api/movies/' && parsed.searchParams.get('sort_by') === 'views_today') {
+      if (parsed.hostname === 'primary.example.net') return apiResponse({ wrong: 'shape' });
+      return apiResponse([{ id: 2 }], { page: 1, page_count: 1 });
+    }
+    return apiResponse([{ id: 43, title_en: 'Backup movie', poster: '/poster.jpg' }], { page: 1, page_count: 1 });
+  }, { mockBootstrapAndProbe: false, onFetch: (url, options) => events.push({ url, options }) });
+
+  const result = await plugin.getCatalog({ catalogId: 'movies', type: 'movie', limit: 1 });
+  assert.equal(result.items[0].nativeId, 'movie:43');
+  assert.deepEqual(events.map(event => new URL(event.url).hostname), [
+    'raw.githubusercontent.com', 'primary.example.net', 'backup.example.net', 'backup.example.net'
+  ]);
+  assert.equal(plugin.__test.selectedApiDomain(), 'https://backup.example.net');
+});
+
+test('unavailable primary config source uses jsDelivr mirror and caches the selected domain for the runtime', async () => {
+  const events = [];
+  const config = JSON.stringify({ default_domain: 'https://mirror-selected.example.net/', backup_domains: [] });
+  let apiCalls = 0;
+  const plugin = loadPlugin(async (url, options) => {
+    const parsed = new URL(url);
+    if (url === 'https://raw.githubusercontent.com/MBoshkash/ostv-config/main/domains.json') {
+      return httpResponse({ status: 503, url, contentType: 'text/plain', body: 'unavailable' });
+    }
+    if (url === 'https://cdn.jsdelivr.net/gh/MBoshkash/ostv-config@main/domains.json') {
+      return httpResponse({ status: 200, url, contentType: 'text/plain', body: config });
+    }
+    if (parsed.pathname === '/api/movies/' && parsed.searchParams.get('sort_by') === 'views_today') {
+      return apiResponse([{ id: 3 }], { page: 1, page_count: 1 });
+    }
+    apiCalls++;
+    return apiResponse([{ id: 44 + apiCalls, title_en: 'Cached config movie', poster: '/poster.jpg' }], { page: 1, page_count: 1 });
+  }, { mockBootstrapAndProbe: false, onFetch: (url, options) => events.push({ url, options }) });
+
+  await plugin.getCatalog({ catalogId: 'movies', type: 'movie', limit: 1 });
+  await plugin.getCatalog({ catalogId: 'movies', type: 'movie', limit: 1 });
+  assert.deepEqual(events.map(event => new URL(event.url).hostname), [
+    'raw.githubusercontent.com', 'cdn.jsdelivr.net', 'mirror-selected.example.net',
+    'mirror-selected.example.net', 'mirror-selected.example.net'
+  ]);
+  assert.equal(events.filter(event => new URL(event.url).hostname === 'cdn.jsdelivr.net').length, 1);
+  assert.equal(events.filter(event => new URL(event.url).searchParams.get('sort_by') === 'views_today').length, 1);
+  assert.equal(apiCalls, 2);
+});
+
+test('both remote config sources unavailable falls back to the known working .xyz API', async () => {
+  const events = [];
+  const plugin = loadPlugin(async (url, options) => {
+    const parsed = new URL(url);
+    if (DOMAIN_CONFIG_URLS.has(url)) return httpResponse({ status: 503, url, contentType: 'text/plain', body: 'unavailable' });
+    if (parsed.pathname === '/api/movies/' && parsed.searchParams.get('sort_by') === 'views_today') {
+      return apiResponse([{ id: 4 }], { page: 1, page_count: 1 });
+    }
+    return apiResponse([{ id: 45, title_en: 'Fallback movie', poster: '/poster.jpg' }], { page: 1, page_count: 1 });
+  }, { mockBootstrapAndProbe: false, onFetch: (url, options) => events.push({ url, options }) });
+
+  const result = await plugin.getCatalog({ catalogId: 'movies', type: 'movie', limit: 1 });
+  assert.equal(result.items[0].nativeId, 'movie:45');
+  assert.deepEqual(events.map(event => new URL(event.url).hostname), [
+    'raw.githubusercontent.com', 'cdn.jsdelivr.net', 'ostv-11-11.xyz', 'ostv-11-11.xyz'
+  ]);
+  assert.equal(plugin.__test.selectedApiDomain(), 'https://ostv-11-11.xyz');
+});
+
+test('malformed remote config and redirected API probes cannot redirect signed headers off-host', async () => {
+  const events = [];
+  const plugin = loadPlugin(async (url, options) => {
+    const parsed = new URL(url);
+    if (DOMAIN_CONFIG_URLS.has(url)) {
+      return httpResponse({ status: 200, url, contentType: 'application/json', body: '{malformed' });
+    }
+    if (parsed.hostname === 'ostv-11-11.xyz' && parsed.pathname === '/api/movies/' && parsed.searchParams.get('sort_by') === 'views_today') {
+      return httpResponse({ status: 302, url, contentType: 'text/plain', body: '', headers: { location: 'https://untrusted.example/api/movies/' } });
+    }
+    if (parsed.pathname === '/api/movies/' && parsed.searchParams.get('sort_by') === 'views_today') {
+      return apiResponse([{ id: 5 }], { page: 1, page_count: 1 });
+    }
+    return apiResponse([{ id: 46, title_en: 'Safe fallback', poster: '/poster.jpg' }], { page: 1, page_count: 1 });
+  }, { mockBootstrapAndProbe: false, onFetch: (url, options) => events.push({ url, options }) });
+
+  const result = await plugin.getCatalog({ catalogId: 'movies', type: 'movie', limit: 1 });
+  assert.equal(result.items[0].nativeId, 'movie:46');
+  assert.equal(events.filter(event => new URL(event.url).hostname === 'raw.githubusercontent.com').length, 1);
+  assert.equal(events.filter(event => new URL(event.url).hostname === 'cdn.jsdelivr.net').length, 1);
+  assert.equal(events.some(event => new URL(event.url).hostname === 'untrusted.example'), false);
+  const signed = events.filter(event => event.options.headers['X-Iron-Sig']);
+  assert.equal(signed.length, 2);
+  assert.ok(signed.every(event => event.options.redirect === 'manual'));
+  assert.ok(signed.every(event => !new URL(event.url).hostname.includes('untrusted')));
+  assert.equal(plugin.__test.selectedApiDomain(), 'https://ostv-11-11.xyz');
 });
 
 test('API requests are signed locally and sent directly to the provider host', async () => {
@@ -224,7 +409,7 @@ test('getHome bounds request concurrency, preserves catalog order, and isolates 
 });
 
 test('manifest exposes only the requested ordered Home catalogs with paginated browse targets', () => {
-  assert.equal(manifest.version, '2.0.9');
+  assert.equal(manifest.version, '2.0.10');
   assert.ok(manifest.capabilities.includes('home'));
   const expected = [
     ['movies_top', 'رائج اليوم'], ['foreign_movies', 'أفلام أجنبية'], ['foreign_series', 'مسلسلات أجنبية'],

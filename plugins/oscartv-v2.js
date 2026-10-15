@@ -2,9 +2,22 @@
 (function (root) {
   "use strict";
 
-  // Use the published plugin origin verified to serve the API from this runtime.
-  // Keep locally signed API requests scoped to this host.
-  var API = "https://ostv-11-11.xyz";
+  // Bootstrap from the original OscarTV public domain configuration, then keep
+  // the known-working Yume API origin as the final fallback.
+  var API_FALLBACK = "https://ostv-11-11.xyz";
+  var API = API_FALLBACK;
+  var DOMAIN_CONFIG_URLS = [
+    "https://raw.githubusercontent.com/MBoshkash/ostv-config/main/domains.json",
+    "https://cdn.jsdelivr.net/gh/MBoshkash/ostv-config@main/domains.json"
+  ];
+  // Key fragments and nonce/tag layout match the original public feed decoder.
+  var DOMAIN_CONFIG_KEY_PARTS = ["9f2c4a7e", "1b6d3f8c", "0a5e9b2d", "7f4c1a6e", "8b3d0f5c", "9a2e7b4d", "1f6c8a3e", "0b5d9f2c"];
+  var DOMAIN_CONFIG_KEY_SEPARATOR = "";
+  var DOMAIN_CONFIG_MAX_CHARS = 16384;
+  var MAX_DOMAIN_CANDIDATES = 16;
+  var domainCandidatesPromise = null;
+  var apiDomainPromise = null;
+  var selectedApiDomain = null;
   var PLUGIN_ID = "oscar";
   var CERT_SHA256 = "6e2fcda8631eb49ebcba4ca8ef4c597abe84654c7d3e8096db32bdd21ecf763f";
   var PACKAGE_NAME = "com.drama.mp4";
@@ -53,6 +66,11 @@
     var words = [];
     for (var i = 0; i < bytes.length; i++) words[i >>> 2] = (words[i >>> 2] || 0) | (bytes[i] << (24 - (i % 4) * 8));
     return CryptoJS.lib.WordArray.create(words, bytes.length);
+  }
+  function bytesFromWordArray(value) {
+    var out = [];
+    for (var i = 0; i < value.sigBytes; i++) out.push((value.words[i >>> 2] >>> (24 - (i % 4) * 8)) & 255);
+    return out;
   }
   function hexBytes(hex) {
     var out = [];
@@ -121,11 +139,132 @@
     var suffix = queryString(query);
     return API + path + (suffix ? "?" + suffix : "");
   }
+  function decodeDomainConfigPayload(payload) {
+    var body = text(payload).replace(/^\uFEFF/, "").trim();
+    if (!body) fail("empty OscarTV domain configuration");
+    if (body.charAt(0) === "{" || body.charAt(0) === "[") return body;
+    if (body.length > DOMAIN_CONFIG_MAX_CHARS || body.length % 4 !== 0 || !/^[A-Za-z0-9+/]+={0,2}$/.test(body)) {
+      fail("invalid OscarTV domain configuration encoding");
+    }
+    var encrypted = bytesFromWordArray(CryptoJS.enc.Base64.parse(body));
+    if (encrypted.length < 29) fail("encrypted OscarTV domain configuration is too short");
+    var nonce = encrypted.slice(0, 12);
+    var cipherAndTag = encrypted.slice(12);
+    var key = CryptoJS.enc.Hex.parse(DOMAIN_CONFIG_KEY_PARTS.join(DOMAIN_CONFIG_KEY_SEPARATOR));
+    var decoded = CryptoJS.AES.decrypt({ ciphertext: wordArray(cipherAndTag) }, key, {
+      iv: wordArray(nonce), mode: CryptoJS.mode.GCM, padding: CryptoJS.pad.NoPadding
+    });
+    return CryptoJS.enc.Utf8.stringify(decoded).trim();
+  }
+  function normalizeApiDomain(value) {
+    if (typeof value !== "string") return null;
+    var match = /^https:\/\/([^\/:?#]+)\/?$/i.exec(value.trim());
+    if (!match) return null;
+    var host = match[1].toLowerCase();
+    if (host.length > 253 || host.indexOf(".") < 0) return null;
+    var labels = host.split(".");
+    for (var i = 0; i < labels.length; i++) {
+      if (labels[i].length > 63 || !/^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/.test(labels[i])) return null;
+    }
+    return "https://" + host;
+  }
+  function domainCandidatesFromConfig(value) {
+    var config;
+    try { config = JSON.parse(decodeDomainConfigPayload(value)); }
+    catch (_) { return null; }
+    var rawDomains = [];
+    if (Array.isArray(config)) {
+      rawDomains = config;
+    } else if (config && typeof config === "object") {
+      if (config.default_domain !== undefined && config.default_domain !== null && text(config.default_domain)) {
+        rawDomains.push(config.default_domain);
+      }
+      if (config.backup_domains !== undefined && config.backup_domains !== null) {
+        if (!Array.isArray(config.backup_domains) || config.backup_domains.length > 32) return null;
+        rawDomains = rawDomains.concat(config.backup_domains);
+      }
+    } else {
+      return null;
+    }
+    if (rawDomains.length > 32) return null;
+    var domains = [];
+    for (var i = 0; i < rawDomains.length; i++) {
+      var domain = normalizeApiDomain(rawDomains[i]);
+      if (domain && domains.indexOf(domain) < 0) domains.push(domain);
+      if (domains.length >= MAX_DOMAIN_CANDIDATES) break;
+    }
+    if (!domains.length) return null;
+    if (domains.indexOf(API_FALLBACK) < 0) {
+      if (domains.length >= MAX_DOMAIN_CANDIDATES) domains = domains.slice(0, MAX_DOMAIN_CANDIDATES - 1);
+      domains.push(API_FALLBACK);
+    }
+    return domains;
+  }
+  async function loadDomainCandidates() {
+    if (!domainCandidatesPromise) {
+      domainCandidatesPromise = (async function () {
+        for (var i = 0; i < DOMAIN_CONFIG_URLS.length; i++) {
+          var sourceUrl = DOMAIN_CONFIG_URLS[i];
+          try {
+            var response = await fetch(sourceUrl, {
+              method: "GET", headers: { "Accept": "text/plain, application/json" }, redirect: "manual"
+            });
+            if (!response || !response.ok || response.status !== 200) continue;
+            if (response.url && new URL(response.url).origin !== new URL(sourceUrl).origin) continue;
+            var body = await response.text();
+            if (typeof body !== "string" || body.length > DOMAIN_CONFIG_MAX_CHARS) continue;
+            var domains = domainCandidatesFromConfig(body);
+            if (domains && domains.length) return domains;
+          } catch (_) {
+            // Try the fixed jsDelivr mirror if GitHub Raw is unavailable or invalid.
+          }
+        }
+        return [API_FALLBACK];
+      })();
+    }
+    return domainCandidatesPromise;
+  }
+  function isValidDomainProbe(envelope) {
+    if (!envelope || typeof envelope !== "object" || Array.isArray(envelope) ||
+        String(envelope.status || "").toLowerCase() !== "success") return false;
+    if (!Array.isArray(envelope.data)) return false;
+    return !envelope.pagination || (typeof envelope.pagination === "object" && !Array.isArray(envelope.pagination));
+  }
+  async function probeApiDomain(domain) {
+    var url = domain + "/api/movies/?page=1&limit=1&sort_by=views_today";
+    try {
+      var response = await fetch(url, { method: "GET", headers: apiHeaders(url), redirect: "manual" });
+      syncServerClock(response);
+      if (!response || !response.ok) return false;
+      return isValidDomainProbe(await response.json());
+    } catch (_) {
+      return false;
+    }
+  }
+  async function resolveApiDomain() {
+    if (!apiDomainPromise) {
+      apiDomainPromise = (async function () {
+        var candidates = await loadDomainCandidates();
+        for (var i = 0; i < candidates.length; i++) {
+          if (await probeApiDomain(candidates[i])) {
+            selectedApiDomain = candidates[i];
+            API = selectedApiDomain;
+            return selectedApiDomain;
+          }
+        }
+        selectedApiDomain = API_FALLBACK;
+        API = selectedApiDomain;
+        return selectedApiDomain;
+      })();
+    }
+    return apiDomainPromise;
+  }
   async function waitForRetry(milliseconds) {
     if (typeof setTimeout !== "function") return;
     await new Promise(function (resolve) { setTimeout(resolve, milliseconds); });
   }
   async function request(path, query) {
+    await resolveApiDomain();
     var url = buildUrl(path, query);
     if (url.indexOf(API + "/") !== 0) fail("refusing to send API headers to an unrelated host");
     var response = null;
@@ -922,6 +1061,9 @@
   if (root && root.__YUME_OSCAR_TESTING__ && root.module) {
     root.module.exports.__test = { parseId: parseId, nativeId: nativeId, deriveIronKey: deriveIronKey,
       sign: sign, signedPath: signedPath, apiHeaders: apiHeaders, clockOffset: function () { return serverClockOffsetSeconds; },
+      decodeDomainConfigPayload: decodeDomainConfigPayload, domainCandidatesFromConfig: domainCandidatesFromConfig,
+      loadDomainCandidates: loadDomainCandidates, resolveApiDomain: resolveApiDomain,
+      apiDomain: function () { return API; }, selectedApiDomain: function () { return selectedApiDomain; },
       directMedia: directMedia, qualityOf: qualityOf,
       mapMedia: mapMedia, detailsItem: detailsItem, imageUrl: imageUrl, isSeriesMp4: isSeriesMp4,
       externalIdsOf: externalIdsOf,

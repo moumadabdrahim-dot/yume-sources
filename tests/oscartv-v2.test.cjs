@@ -69,8 +69,9 @@ function loadPlugin(fetchImpl, options = {}) {
     options.onFetch?.(url, requestOptions);
     return fetchImpl(url, requestOptions);
   };
+  observedFetch.supportsNativeTimeout = options.nativeTimeoutSupport !== false;
   const context = { module, exports: module.exports, CryptoJS, __YUME_OSCAR_TESTING__: true, fetch: observedFetch,
-    console, Date, URL, TextEncoder, TextDecoder, Uint8Array, ArrayBuffer, isFinite,
+    console, Date: options.Date || Date, URL, TextEncoder, TextDecoder, Uint8Array, ArrayBuffer, isFinite,
     setTimeout: options.setTimeout || (callback => { callback(); return 0; }), encodeURIComponent, decodeURIComponent };
   vm.runInNewContext(source, context, { filename: 'oscartv-v2.js' });
   return module.exports;
@@ -152,11 +153,106 @@ test('configuration bootstrap uses the fixed source without API signatures and s
     'raw.githubusercontent.com', 'primary.example.net', 'primary.example.net'
   ]);
   assert.equal(events[0].options.redirect, 'manual');
+  assert.equal(events[0].options.timeoutMs, 3000);
   assert.deepEqual(Object.keys(events[0].options.headers), ['Accept']);
   assert.equal(events[0].options.headers['X-Iron-Sig'], undefined);
   assert.equal(events[1].options.redirect, 'manual');
+  assert.equal(events[1].options.timeoutMs, 4000);
   assert.match(events[1].options.headers['X-Iron-Sig'], /^[a-f0-9]{64}$/);
   assert.equal(plugin.__test.selectedApiDomain(), 'https://primary.example.net');
+});
+
+test('domain discovery bounds native requests and reserves the third probe for the known fallback', async () => {
+  let now = 1_000;
+  const FakeDate = { now: () => now, parse: Date.parse };
+  const config = JSON.stringify({
+    default_domain: 'https://primary.example.net/',
+    backup_domains: ['https://backup.example.net/', 'https://not-probed.example.net/']
+  });
+  const events = [];
+  const plugin = loadPlugin(async (url, options) => {
+    const parsed = new URL(url);
+    events.push({ url, options });
+    if (DOMAIN_CONFIG_URLS.has(url)) {
+      return httpResponse({ status: 200, url, contentType: 'application/json', body: config });
+    }
+    if (parsed.pathname === '/api/movies/' && parsed.searchParams.get('sort_by') === 'views_today') {
+      if (parsed.hostname !== 'ostv-11-11.xyz') {
+        now += options.timeoutMs;
+        throw new Error('native timeout');
+      }
+      return apiResponse([{ id: 9 }], { page: 1, page_count: 1 });
+    }
+    return apiResponse([{ id: 90, title_en: 'Fallback movie', poster: '/poster.jpg' }], { page: 1, page_count: 1 });
+  }, { mockBootstrapAndProbe: false, Date: FakeDate });
+
+  const result = await plugin.getCatalog({ catalogId: 'movies', type: 'movie', limit: 1 });
+  const probes = events.filter(event => new URL(event.url).searchParams.get('sort_by') === 'views_today');
+  assert.equal(result.items[0].nativeId, 'movie:90');
+  assert.deepEqual(probes.map(event => new URL(event.url).hostname), [
+    'primary.example.net', 'backup.example.net', 'ostv-11-11.xyz'
+  ]);
+  assert.deepEqual(probes.map(event => event.options.timeoutMs), [4000, 4000, 4000]);
+  assert.equal(events.some(event => new URL(event.url).hostname === 'not-probed.example.net'), false);
+  assert.ok(now - 1_000 <= plugin.__test.discoveryPolicy.budgetMs);
+});
+
+test('slow configuration sources consume only their native timeout and still leave time for fallback', async () => {
+  let now = 10_000;
+  const FakeDate = { now: () => now, parse: Date.parse };
+  const events = [];
+  const plugin = loadPlugin(async (url, options) => {
+    events.push({ url, options });
+    const parsed = new URL(url);
+    if (DOMAIN_CONFIG_URLS.has(url)) {
+      now += options.timeoutMs;
+      throw new Error('native timeout');
+    }
+    if (parsed.pathname === '/api/movies/' && parsed.searchParams.get('sort_by') === 'views_today') {
+      return apiResponse([{ id: 10 }], { page: 1, page_count: 1 });
+    }
+    return apiResponse([{ id: 91, title_en: 'Fallback after config timeout', poster: '/poster.jpg' }], { page: 1, page_count: 1 });
+  }, { mockBootstrapAndProbe: false, Date: FakeDate });
+
+  const result = await plugin.getCatalog({ catalogId: 'movies', type: 'movie', limit: 1 });
+  assert.equal(result.items[0].nativeId, 'movie:91');
+  assert.deepEqual(events.filter(event => DOMAIN_CONFIG_URLS.has(event.url)).map(event => event.options.timeoutMs), [3000, 3000]);
+  assert.equal(plugin.__test.selectedApiDomain(), 'https://ostv-11-11.xyz');
+  assert.equal(now - 10_000, 6000);
+});
+
+test('an exhausted discovery budget starts no additional probe', async () => {
+  let now = 50_000;
+  const FakeDate = { now: () => now, parse: Date.parse };
+  const events = [];
+  const config = JSON.stringify({ default_domain: 'https://primary.example.net/', backup_domains: [] });
+  const plugin = loadPlugin(async (url, options) => {
+    events.push({ url, options });
+    if (DOMAIN_CONFIG_URLS.has(url)) {
+      now += 20_000;
+      return httpResponse({ status: 200, url, contentType: 'application/json', body: config });
+    }
+    return apiResponse([{ id: 92, title_en: 'Budget fallback', poster: '/poster.jpg' }], { page: 1, page_count: 1 });
+  }, { mockBootstrapAndProbe: false, Date: FakeDate });
+
+  const result = await plugin.getCatalog({ catalogId: 'movies', type: 'movie', limit: 1 });
+  assert.equal(result.items[0].nativeId, 'movie:92');
+  assert.equal(events.filter(event => new URL(event.url).searchParams.get('sort_by') === 'views_today').length, 0);
+  assert.equal(plugin.__test.selectedApiDomain(), 'https://ostv-11-11.xyz');
+});
+
+test('older hosts without native timeout support skip speculative discovery and keep the fallback API', async () => {
+  const events = [];
+  const plugin = loadPlugin(async (url, options) => {
+    events.push({ url, options });
+    return apiResponse([{ id: 93, title_en: 'Compatible fallback', poster: '/poster.jpg' }], { page: 1, page_count: 1 });
+  }, { mockBootstrapAndProbe: false, nativeTimeoutSupport: false });
+
+  const result = await plugin.getCatalog({ catalogId: 'movies', type: 'movie', limit: 1 });
+  assert.equal(result.items[0].nativeId, 'movie:93');
+  assert.equal(events.length, 1);
+  assert.equal(new URL(events[0].url).hostname, 'ostv-11-11.xyz');
+  assert.equal(events[0].options.timeoutMs, undefined);
 });
 
 test('unhealthy primary and invalid probe schema fail over to the first valid backup', async () => {

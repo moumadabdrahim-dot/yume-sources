@@ -15,6 +15,10 @@
   var DOMAIN_CONFIG_KEY_SEPARATOR = "";
   var DOMAIN_CONFIG_MAX_CHARS = 16384;
   var MAX_DOMAIN_CANDIDATES = 16;
+  var DOMAIN_CONFIG_TIMEOUT_MS = 3000;
+  var DOMAIN_PROBE_TIMEOUT_MS = 4000;
+  var DOMAIN_DISCOVERY_BUDGET_MS = 20000;
+  var MAX_DOMAIN_PROBES = 3;
   var domainCandidatesPromise = null;
   var apiDomainPromise = null;
   var selectedApiDomain = null;
@@ -200,14 +204,30 @@
     }
     return domains;
   }
-  async function loadDomainCandidates() {
+  function remainingDiscoveryTimeout(deadline, perRequestLimit) {
+    var remaining = Math.floor(deadline - Date.now());
+    if (remaining <= 0) return 0;
+    return Math.min(perRequestLimit, remaining);
+  }
+  function discoveryProbeCandidates(candidates) {
+    var selected = [];
+    for (var i = 0; i < candidates.length && selected.length < MAX_DOMAIN_PROBES - 1; i++) {
+      if (candidates[i] !== API_FALLBACK && selected.indexOf(candidates[i]) < 0) selected.push(candidates[i]);
+    }
+    selected.push(API_FALLBACK);
+    return selected;
+  }
+  async function loadDomainCandidates(deadline) {
     if (!domainCandidatesPromise) {
       domainCandidatesPromise = (async function () {
         for (var i = 0; i < DOMAIN_CONFIG_URLS.length; i++) {
           var sourceUrl = DOMAIN_CONFIG_URLS[i];
           try {
+            var timeoutMs = remainingDiscoveryTimeout(deadline, DOMAIN_CONFIG_TIMEOUT_MS);
+            if (!timeoutMs) break;
             var response = await fetch(sourceUrl, {
-              method: "GET", headers: { "Accept": "text/plain, application/json" }, redirect: "manual"
+              method: "GET", headers: { "Accept": "text/plain, application/json" }, redirect: "manual",
+              timeoutMs: timeoutMs
             });
             if (!response || !response.ok || response.status !== 200) continue;
             if (response.url && new URL(response.url).origin !== new URL(sourceUrl).origin) continue;
@@ -230,10 +250,14 @@
     if (!Array.isArray(envelope.data)) return false;
     return !envelope.pagination || (typeof envelope.pagination === "object" && !Array.isArray(envelope.pagination));
   }
-  async function probeApiDomain(domain) {
+  async function probeApiDomain(domain, deadline) {
     var url = domain + "/api/movies/?page=1&limit=1&sort_by=views_today";
     try {
-      var response = await fetch(url, { method: "GET", headers: apiHeaders(url), redirect: "manual" });
+      var timeoutMs = remainingDiscoveryTimeout(deadline, DOMAIN_PROBE_TIMEOUT_MS);
+      if (!timeoutMs) return false;
+      var response = await fetch(url, {
+        method: "GET", headers: apiHeaders(url), redirect: "manual", timeoutMs: timeoutMs
+      });
       syncServerClock(response);
       if (!response || !response.ok) return false;
       return isValidDomainProbe(await response.json());
@@ -242,11 +266,20 @@
     }
   }
   async function resolveApiDomain() {
+    if (selectedApiDomain) return selectedApiDomain;
     if (!apiDomainPromise) {
       apiDomainPromise = (async function () {
-        var candidates = await loadDomainCandidates();
+        // Older hosts ignore timeoutMs and cannot safely run speculative discovery.
+        if (typeof fetch !== "function" || fetch.supportsNativeTimeout !== true) {
+          selectedApiDomain = API_FALLBACK;
+          API = selectedApiDomain;
+          return selectedApiDomain;
+        }
+        var deadline = Date.now() + DOMAIN_DISCOVERY_BUDGET_MS;
+        var candidates = discoveryProbeCandidates(await loadDomainCandidates(deadline));
         for (var i = 0; i < candidates.length; i++) {
-          if (await probeApiDomain(candidates[i])) {
+          if (remainingDiscoveryTimeout(deadline, DOMAIN_PROBE_TIMEOUT_MS) <= 0) break;
+          if (await probeApiDomain(candidates[i], deadline)) {
             selectedApiDomain = candidates[i];
             API = selectedApiDomain;
             return selectedApiDomain;
@@ -1062,7 +1095,10 @@
     root.module.exports.__test = { parseId: parseId, nativeId: nativeId, deriveIronKey: deriveIronKey,
       sign: sign, signedPath: signedPath, apiHeaders: apiHeaders, clockOffset: function () { return serverClockOffsetSeconds; },
       decodeDomainConfigPayload: decodeDomainConfigPayload, domainCandidatesFromConfig: domainCandidatesFromConfig,
-      loadDomainCandidates: loadDomainCandidates, resolveApiDomain: resolveApiDomain,
+      loadDomainCandidates: loadDomainCandidates, discoveryProbeCandidates: discoveryProbeCandidates,
+      remainingDiscoveryTimeout: remainingDiscoveryTimeout, resolveApiDomain: resolveApiDomain,
+      discoveryPolicy: { configTimeoutMs: DOMAIN_CONFIG_TIMEOUT_MS, probeTimeoutMs: DOMAIN_PROBE_TIMEOUT_MS,
+        budgetMs: DOMAIN_DISCOVERY_BUDGET_MS, maxProbes: MAX_DOMAIN_PROBES },
       apiDomain: function () { return API; }, selectedApiDomain: function () { return selectedApiDomain; },
       directMedia: directMedia, qualityOf: qualityOf,
       mapMedia: mapMedia, detailsItem: detailsItem, imageUrl: imageUrl, isSeriesMp4: isSeriesMp4,

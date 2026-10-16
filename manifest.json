@@ -1,10 +1,15 @@
 {
   "id": "oscar",
   "name": "OscarTV",
-  "version": "2.0.10",
+  "version": "2.0.11",
   "filename": "plugins/oscartv-v2.js",
   "apiVersion": 2,
-  "capabilities": ["home", "details", "streams"],
+  "capabilities": ["home", "search", "details", "streams"],
+  "searchGroups": [
+    {"id":"movies","title":"الأفلام","types":["movie"],"pagination":true,"presentation":{"posterShape":"portrait"}},
+    {"id":"series","title":"المسلسلات","types":["series"],"pagination":true,"presentation":{"posterShape":"portrait"}},
+    {"id":"anime","title":"الأنمي","types":["anime"],"pagination":true,"presentation":{"posterShape":"portrait"}}
+  ],
   "catalogs": [
     {
       "id": "movies",

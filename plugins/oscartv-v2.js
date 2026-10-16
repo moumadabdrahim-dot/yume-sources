@@ -499,6 +499,39 @@
       page: { nextCursor: hasMore ? String(current + 1) : null, hasMore: hasMore, total: total || undefined }
     };
   }
+  var SEARCH_CONFIG = [
+    { id: "movies", path: "/api/movies/", type: "movie" },
+    { id: "series", path: "/api/series/", type: "series" },
+    { id: "anime", path: "/api/anime/", type: "anime" }
+  ];
+  async function search(args) {
+    args = args || {};
+    var queryText = String(args.query == null ? "" : args.query).trim();
+    if (!queryText) fail("search query is required");
+    var group = null;
+    for (var i = 0; i < SEARCH_CONFIG.length; i++) {
+      if (SEARCH_CONFIG[i].id === args.groupId) { group = SEARCH_CONFIG[i]; break; }
+    }
+    if (!group) fail("unknown search group");
+    var pageNo = 1;
+    if (args.cursor !== undefined && args.cursor !== null) {
+      var cursor = String(args.cursor);
+      if (!/^[1-9][0-9]{0,3}$/.test(cursor) || Number(cursor) > MAX_PAGES) fail("invalid page cursor");
+      pageNo = Number(cursor);
+    }
+    var limit = args.limit === undefined || args.limit === null ? 20 : Number(args.limit);
+    if (!isFinite(limit) || Math.floor(limit) !== limit || limit < 1 || limit > 100) fail("invalid page limit");
+    var result = await list(group.path, { search: queryText, page: pageNo, limit: limit });
+    var current = positiveInt(result.pagination.page) || pageNo;
+    var pages = catalogPageCount(result);
+    var hasMore = !!pages && current < pages && current < MAX_PAGES;
+    var total = positiveInt(result.pagination.total);
+    return {
+      groupId: group.id,
+      items: result.items.map(function (item) { return mapMedia(item, group.type); }).filter(Boolean),
+      page: { nextCursor: hasMore ? String(current + 1) : null, hasMore: hasMore, total: total || undefined }
+    };
+  }
   var HOME_CATALOGS = [
     { id: "movies_top", title: "رائج اليوم", type: "movie" },
     { id: "foreign_movies", title: "أفلام أجنبية", type: "movie" },
@@ -1087,7 +1120,7 @@
     return { streams: await resolveLinks(links) };
   }
 
-  var plugin = { getHome: getHome, getCatalog: getCatalog, getDetails: getDetails, getStreams: getStreams,
+  var plugin = { getHome: getHome, getCatalog: getCatalog, search: search, getDetails: getDetails, getStreams: getStreams,
     resolveStreamOption: resolveStreamOption };
   if (root && root.module) root.module.exports = plugin;
   // The local node:test harness opts in; this property is absent in the Yume runtime.
@@ -1103,7 +1136,8 @@
       directMedia: directMedia, qualityOf: qualityOf,
       mapMedia: mapMedia, detailsItem: detailsItem, imageUrl: imageUrl, isSeriesMp4: isSeriesMp4,
       externalIdsOf: externalIdsOf,
-      getHome: getHome, homeCatalogs: HOME_CATALOGS, getCatalog: getCatalog, catalogConfig: CATALOG_CONFIG, serverTitle: serverTitle,
+      getHome: getHome, homeCatalogs: HOME_CATALOGS, getCatalog: getCatalog, catalogConfig: CATALOG_CONFIG,
+      search: search, searchConfig: SEARCH_CONFIG, serverTitle: serverTitle,
       normalizeUrl: normalizeUrl, extractHtmlSources: extractHtmlSources,
       extractAbsoluteHttpUrls: extractAbsoluteHttpUrls, isHttpUrl: isHttpUrl, isYandex: isYandex,
       streamType: streamType, queryParameter: queryParameter, tdmVideoUrl: tdmVideoUrl, playbackTarget: playbackTarget,

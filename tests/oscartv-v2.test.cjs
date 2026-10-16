@@ -97,7 +97,7 @@ test('v2 exports aggregate Home/catalog/details/streams and preserves the determ
   const vector = JSON.parse(fs.readFileSync(path.join(root, 'tests/fixtures/iron-signer.json'), 'utf8'));
   const [pathPart, timestamp, nonce] = vector.source.split('|');
   assert.equal(typeof plugin.getHome, 'function');
-  assert.equal(plugin.search, undefined);
+  assert.equal(typeof plugin.search, 'function');
   assert.equal(typeof plugin.getCatalog, 'function');
   assert.equal(plugin.__test.sign(pathPart, timestamp, nonce), vector.expectedSignature);
 });
@@ -505,8 +505,10 @@ test('getHome bounds request concurrency, preserves catalog order, and isolates 
 });
 
 test('manifest exposes only the requested ordered Home catalogs with paginated browse targets', () => {
-  assert.equal(manifest.version, '2.0.10');
+  assert.equal(manifest.version, '2.0.11');
   assert.ok(manifest.capabilities.includes('home'));
+  assert.ok(manifest.capabilities.includes('search'));
+  assert.deepEqual(manifest.searchGroups.map(group => group.id), ['movies', 'series', 'anime']);
   const expected = [
     ['movies_top', 'رائج اليوم'], ['foreign_movies', 'أفلام أجنبية'], ['foreign_series', 'مسلسلات أجنبية'],
     ['foreign_latest', 'أحدث الأجنبي'], ['foreign_airing', 'يعرض الآن'], ['asian_series', 'مسلسلات آسيوية'],
@@ -761,6 +763,28 @@ test('opaque pagination cursor and query are forwarded to one catalog request', 
   assert.equal(page.items[0].nativeId, 'movie:99');
   assert.equal(page.page.hasMore, false);
   assert.equal(page.page.nextCursor, null);
+});
+
+test('native search sends one request for the selected group and preserves pagination', async () => {
+  let observed;
+  const plugin = loadPlugin(async (url) => {
+    observed = new URL(url);
+    return apiResponse([{ id: 42, title_ar: 'نتيجة' }], { page: 2, page_count: 3, total: 41, per_page: 20 });
+  });
+  const page = await plugin.search({ query: ' تنانين ', groupId: 'series', cursor: '2', limit: 20 });
+  assert.equal(observed.pathname, '/api/series/');
+  assert.equal(observed.searchParams.get('search'), 'تنانين');
+  assert.equal(observed.searchParams.get('page'), '2');
+  assert.equal(page.groupId, 'series');
+  assert.equal(page.items[0].nativeId, 'series:42');
+  assert.deepEqual(JSON.parse(JSON.stringify(page.page)), { nextCursor: '3', hasMore: true, total: 41 });
+});
+
+test('native search rejects unknown groups before network access', async () => {
+  let requests = 0;
+  const plugin = loadPlugin(async () => { requests++; return apiResponse([]); });
+  await assert.rejects(plugin.search({ query: 'x', groupId: 'unknown' }), /unknown search group/);
+  assert.equal(requests, 0);
 });
 
 test('invalid catalog type, cursor, and limit fail without making a request', async () => {

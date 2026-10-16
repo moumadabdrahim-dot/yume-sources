@@ -447,6 +447,87 @@
     anime: ["anime_type", "studio_id", "genre_id", "status", "season_period", "season_year", "year",
       "content_type", "age_rating", "featured", "sort_by"]
   };
+  var CATALOG_FILTER_CONFIG = {
+    movies: {
+      path: "/api/movies/filters.php",
+      fields: [
+        ["category", "التصنيف", "categories"], ["genre_id", "النوع الفني", "genres"],
+        ["year", "السنة", "years"], ["country", "الدولة", "countries"],
+        ["language", "اللغة", "languages"], ["quality_source", "المصدر", "sources"],
+        ["content_type", "نوع المحتوى", "content_types"], ["age_rating", "التصنيف العمري", "age_ratings"],
+        ["status", "الحالة", "statuses"], ["awards", "الجوائز", "awards"],
+        ["sort_by", "الترتيب", "sort_options"]
+      ]
+    },
+    series: {
+      path: "/api/series/filters.php",
+      fields: [
+        ["category", "التصنيف", "categories"], ["genre_id", "النوع الفني", "genres", ["category"]],
+        ["year", "السنة", "years", ["category"]], ["country", "الدولة", "countries", ["category"]],
+        ["language", "اللغة", "languages", ["category"]], ["status", "الحالة", "statuses", ["category"]],
+        ["content_type", "نوع المحتوى", "content_types", ["category"]],
+        ["age_rating", "التصنيف العمري", "age_ratings", ["category"]]
+      ]
+    },
+    anime_movies: {
+      path: "/api/anime/filters.php",
+      fields: [
+        ["genre_id", "النوع الفني", "genres"], ["studio_id", "الاستوديو", "studios"],
+        ["status", "الحالة", "statuses"], ["season_period", "الموسم", "season_periods"],
+        ["season_year", "سنة الموسم", "season_years"], ["year", "السنة", "years"],
+        ["content_type", "نوع المحتوى", "content_types"], ["age_rating", "التصنيف العمري", "age_ratings"]
+      ]
+    }
+  };
+  function filterOption(raw) {
+    if (raw === null || raw === undefined) return null;
+    if (typeof raw !== "object" || Array.isArray(raw)) {
+      var primitive = optional(raw);
+      return primitive ? { value: primitive, label: primitive } : null;
+    }
+    var valueKeys = ["value", "key", "code", "id", "slug", "name"];
+    var labelKeys = ["label", "name", "title", "title_ar", "value", "key", "code", "slug", "id"];
+    var value = null;
+    var label = null;
+    for (var i = 0; i < valueKeys.length && !value; i++) value = optional(raw[valueKeys[i]]);
+    for (var j = 0; j < labelKeys.length && !label; j++) label = optional(raw[labelKeys[j]]);
+    if (!value || !label || value.length > 128 || label.length > 160) return null;
+    return { value: value, label: label };
+  }
+  function filterOptions(raw) {
+    if (!Array.isArray(raw)) return [];
+    var seen = {};
+    return raw.map(filterOption).filter(function (entry) {
+      if (!entry || seen[entry.value]) return false;
+      seen[entry.value] = true;
+      return true;
+    }).slice(0, 500);
+  }
+  async function getCatalogFilters(args) {
+    args = args || {};
+    var config = CATALOG_FILTER_CONFIG[args.catalogId];
+    var catalog = null;
+    for (var i = 0; i < CATALOG_CONFIG.length; i++) {
+      if (CATALOG_CONFIG[i].id === args.catalogId) { catalog = CATALOG_CONFIG[i]; break; }
+    }
+    if (!catalog || !config) fail("catalog does not provide dynamic filters");
+    if (args.contentType !== catalog.type) fail("catalog filter type mismatch");
+    var selected = args.selectedFilters && typeof args.selectedFilters === "object" ? args.selectedFilters : {};
+    var query = {};
+    if (args.catalogId === "series" && /^(4|5)$/.test(String(selected.category || ""))) {
+      query.category = String(selected.category);
+    }
+    var data = await objectData(config.path, query);
+    return {
+      catalogId: catalog.id,
+      filters: config.fields.map(function (definition) {
+        return {
+          key: definition[0], kind: "select", label: definition[1], required: false, dynamic: true,
+          dependsOn: definition[3] || [], options: filterOptions(data[definition[2]])
+        };
+      })
+    };
+  }
   function catalogPageCount(page) {
     var count = pageCount(page);
     if (count) return count;
@@ -1120,8 +1201,8 @@
     return { streams: await resolveLinks(links) };
   }
 
-  var plugin = { getHome: getHome, getCatalog: getCatalog, search: search, getDetails: getDetails, getStreams: getStreams,
-    resolveStreamOption: resolveStreamOption };
+  var plugin = { getHome: getHome, getCatalog: getCatalog, getCatalogFilters: getCatalogFilters, search: search,
+    getDetails: getDetails, getStreams: getStreams, resolveStreamOption: resolveStreamOption };
   if (root && root.module) root.module.exports = plugin;
   // The local node:test harness opts in; this property is absent in the Yume runtime.
   if (root && root.__YUME_OSCAR_TESTING__ && root.module) {
@@ -1136,7 +1217,8 @@
       directMedia: directMedia, qualityOf: qualityOf,
       mapMedia: mapMedia, detailsItem: detailsItem, imageUrl: imageUrl, isSeriesMp4: isSeriesMp4,
       externalIdsOf: externalIdsOf,
-      getHome: getHome, homeCatalogs: HOME_CATALOGS, getCatalog: getCatalog, catalogConfig: CATALOG_CONFIG,
+      getHome: getHome, homeCatalogs: HOME_CATALOGS, getCatalog: getCatalog,
+      getCatalogFilters: getCatalogFilters, catalogConfig: CATALOG_CONFIG, catalogFilterConfig: CATALOG_FILTER_CONFIG,
       search: search, searchConfig: SEARCH_CONFIG, serverTitle: serverTitle,
       normalizeUrl: normalizeUrl, extractHtmlSources: extractHtmlSources,
       extractAbsoluteHttpUrls: extractAbsoluteHttpUrls, isHttpUrl: isHttpUrl, isYandex: isYandex,

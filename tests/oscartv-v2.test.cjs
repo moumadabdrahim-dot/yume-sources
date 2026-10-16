@@ -505,7 +505,7 @@ test('getHome bounds request concurrency, preserves catalog order, and isolates 
 });
 
 test('manifest exposes only the requested ordered Home catalogs with paginated browse targets', () => {
-  assert.equal(manifest.version, '2.0.11');
+  assert.equal(manifest.version, '2.0.12');
   assert.ok(manifest.capabilities.includes('home'));
   assert.ok(manifest.capabilities.includes('search'));
   assert.deepEqual(manifest.searchGroups.map(group => group.id), ['movies', 'series', 'anime']);
@@ -527,6 +527,65 @@ test('manifest exposes only the requested ordered Home catalogs with paginated b
   assert.equal(rows.series.capabilities.includes('home'), false);
   assert.equal(rows.movies.capabilities.includes('browse'), true);
   assert.equal(rows.series.capabilities.includes('browse'), true);
+});
+
+test('manifest declares ordered dynamic Discover filters while preserving anime movie identity', () => {
+  const rows = Object.fromEntries(manifest.catalogs.map(row => [row.id, row]));
+  assert.equal(rows.movies.discoverType, 'movie');
+  assert.equal(rows.series.discoverType, 'series');
+  assert.equal(rows.anime_movies.type, 'anime');
+  assert.equal(rows.anime_movies.discoverType, 'movie');
+  assert.deepEqual(rows.movies.filters.map(filter => filter.key), [
+    'category', 'genre_id', 'year', 'country', 'language', 'quality_source', 'content_type',
+    'age_rating', 'status', 'awards', 'sort_by'
+  ]);
+  assert.equal(rows.movies.filters.every(filter => filter.dynamic && filter.options.length === 0), true);
+  assert.deepEqual(rows.series.filters.slice(1).map(filter => filter.dependsOn),
+    rows.series.filters.slice(1).map(() => ['category']));
+  assert.equal(rows.anime_movies.filters.some(filter => filter.key === 'anime_type'), false);
+});
+
+test('dynamic filter lookup preserves API values and scopes series dependencies to category', async () => {
+  const requests = [];
+  const plugin = loadPlugin(async url => {
+    const parsed = new URL(url);
+    requests.push(parsed);
+    if (parsed.pathname === '/api/series/filters.php') {
+      return apiResponse({
+        categories: [{ id: 4, name: 'أجنبي' }, { id: 5, name: 'آسيوي' }],
+        genres: [{ id: 17, name: 'دراما' }], years: [2026], countries: [{ code: 'kr', name: 'كوريا' }],
+        languages: ['ko'], statuses: [{ code: 'ongoing', name: 'مستمر' }],
+        content_types: [{ code: 'series', name: 'مسلسل' }], age_ratings: [{ code: 'pg13', name: '+13' }]
+      });
+    }
+    throw new Error(`unexpected request ${parsed.pathname}`);
+  });
+  const result = await plugin.getCatalogFilters({
+    catalogId: 'series', contentType: 'series', selectedFilters: { category: '5', genre_id: 'old' }
+  });
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0].searchParams.get('category'), '5');
+  assert.deepEqual(JSON.parse(JSON.stringify(result.filters[0].options)), [
+    { value: '4', label: 'أجنبي' }, { value: '5', label: 'آسيوي' }
+  ]);
+  assert.deepEqual(JSON.parse(JSON.stringify(result.filters[1].options)), [{ value: '17', label: 'دراما' }]);
+  assert.deepEqual(JSON.parse(JSON.stringify(result.filters[1].dependsOn)), ['category']);
+});
+
+test('anime movie filters use the verified movie catalog without inventing an anime series type', async () => {
+  const plugin = loadPlugin(async url => {
+    const parsed = new URL(url);
+    if (parsed.pathname !== '/api/anime/filters.php') throw new Error(`unexpected request ${parsed.pathname}`);
+    return apiResponse({
+      genres: [{ id: 2, name: 'مغامرات' }], studios: [{ id: 8, name: 'Studio' }], statuses: ['finished'],
+      season_periods: ['winter'], season_years: [2025], years: [2024],
+      content_types: [{ code: 'anime', name: 'أنمي' }], age_ratings: ['pg']
+    });
+  });
+  const result = await plugin.getCatalogFilters({ catalogId: 'anime_movies', contentType: 'anime', selectedFilters: {} });
+  assert.equal(result.filters.some(filter => filter.key === 'anime_type'), false);
+  assert.deepEqual(JSON.parse(JSON.stringify(result.filters[0].options)), [{ value: '2', label: 'مغامرات' }]);
+  await assert.rejects(plugin.getCatalogFilters({ catalogId: 'anime_movies', contentType: 'series' }), /type mismatch/);
 });
 
 test('catalog descriptors map movies, series, and anime to one native-ID-preserving page each', async () => {

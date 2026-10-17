@@ -628,7 +628,8 @@
   var SEARCH_CONFIG = [
     { id: "movies", path: "/api/movies/", type: "movie" },
     { id: "series", path: "/api/series/", type: "series" },
-    { id: "anime", path: "/api/anime/", type: "anime" }
+    { id: "anime_movies", path: "/api/anime/", type: "anime", query: { anime_type: "movie" } },
+    { id: "anime_series", path: "/api/anime/", type: "anime", query: { anime_type: "tv,ova,ona,special" } }
   ];
   async function search(args) {
     args = args || {};
@@ -647,7 +648,9 @@
     }
     var limit = args.limit === undefined || args.limit === null ? 20 : Number(args.limit);
     if (!isFinite(limit) || Math.floor(limit) !== limit || limit < 1 || limit > 100) fail("invalid page limit");
-    var result = await list(group.path, { search: queryText, page: pageNo, limit: limit });
+    var searchQuery = { search: queryText, page: pageNo, limit: limit };
+    Object.keys(group.query || {}).forEach(function (key) { searchQuery[key] = group.query[key]; });
+    var result = await list(group.path, searchQuery);
     var current = positiveInt(result.pagination.page) || pageNo;
     var pages = catalogPageCount(result);
     var hasMore = !!pages && current < pages && current < MAX_PAGES;

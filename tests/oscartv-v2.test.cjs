@@ -505,7 +505,7 @@ test('getHome bounds request concurrency, preserves catalog order, and isolates 
 });
 
 test('manifest exposes only the requested ordered Home catalogs with paginated browse targets', () => {
-  assert.equal(manifest.version, '2.0.14');
+  assert.equal(manifest.version, '2.0.15');
   assert.ok(manifest.capabilities.includes('home'));
   assert.ok(manifest.capabilities.includes('search'));
   assert.deepEqual(manifest.searchGroups.map(group => group.id), ['movies', 'series', 'anime']);
@@ -549,6 +549,32 @@ test('manifest declares ordered dynamic Discover filters while preserving anime 
   assert.deepEqual(rows.series.filters.slice(1).map(filter => filter.dependsOn),
     rows.series.filters.slice(1).map(() => ['category']));
   assert.equal(rows.anime_movies.filters.some(filter => filter.key === 'anime_type'), false);
+
+  const priorities = filters => Object.fromEntries(filters.map(filter => [filter.key, filter.discoverPresentation]));
+  assert.deepEqual(
+    Object.fromEntries(Object.entries(priorities(rows.movies.filters))
+      .filter(([, presentation]) => presentation?.priority != null)
+      .map(([key, presentation]) => [key, presentation.priority])),
+    { genre_id: 10, year: 20, sort_by: 30 }
+  );
+  assert.equal(priorities(rows.anime_movies.filters).genre_id.priority, 10);
+  assert.equal(priorities(rows.anime_movies.filters).year.priority, 20);
+  assert.equal(priorities(rows.anime_movies.filters).age_rating.priority, 30);
+  assert.equal(priorities(rows.anime_movies.filters).studio_id.hidden, true);
+  assert.equal(priorities(rows.anime_series.filters).studio_id.hidden, true);
+  assert.equal(priorities(rows.anime_series.filters).genre_id.priority, 10);
+  assert.equal(priorities(rows.anime_series.filters).season_period.priority, 20);
+  assert.equal(priorities(rows.anime_series.filters).status.priority, 30);
+
+  const seriesPriorities = priorities(rows.series.filters);
+  assert.equal(seriesPriorities.genre_id.priority, 10);
+  assert.equal(seriesPriorities.year.priority, 20);
+  assert.equal(seriesPriorities.year.priorityOverrides[0].filters.category, '5');
+  assert.equal(seriesPriorities.year.priorityOverrides[0].priority, 40);
+  assert.equal(seriesPriorities.country.priority, 40);
+  assert.equal(seriesPriorities.country.priorityOverrides[0].filters.category, '5');
+  assert.equal(seriesPriorities.country.priorityOverrides[0].priority, 20);
+  assert.equal(seriesPriorities.status.priority, 30);
 });
 
 test('dynamic filter lookup preserves API values and scopes series dependencies to category', async () => {
@@ -627,6 +653,9 @@ test('anime movie and series filters share native anime metadata without exposin
   const result = await plugin.getCatalogFilters({ catalogId: 'anime_movies', contentType: 'anime', selectedFilters: {} });
   assert.equal(result.filters.some(filter => filter.key === 'anime_type'), false);
   assert.deepEqual(JSON.parse(JSON.stringify(result.filters[0].options)), [{ value: '2', label: 'مغامرات' }]);
+  assert.deepEqual(JSON.parse(JSON.stringify(result.filters.find(filter => filter.key === 'studio_id').options)), [
+    { value: '8', label: 'Studio' }
+  ]);
   await assert.rejects(plugin.getCatalogFilters({ catalogId: 'anime_movies', contentType: 'series' }), /type mismatch/);
 
   const seriesFilters = await plugin.getCatalogFilters({ catalogId: 'anime_series', contentType: 'anime', selectedFilters: {} });

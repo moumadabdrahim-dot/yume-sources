@@ -1,7 +1,7 @@
 {
   "id": "oscar",
   "name": "OscarTV",
-  "version": "2.0.14",
+  "version": "2.0.15",
   "filename": "plugins/oscartv-v2.js",
   "apiVersion": 2,
   "capabilities": ["home", "search", "details", "streams"],
@@ -18,8 +18,8 @@
       "capabilities": ["browse", "search", "pagination"],
       "filters": [
         {"key":"category","kind":"select","required":false,"options":[],"label":"فئة الفيلم","dynamic":true},
-        {"key":"genre_id","kind":"select","required":false,"options":[],"label":"النوع الفني","dynamic":true},
-        {"key":"year","kind":"select","required":false,"options":[],"label":"السنة","dynamic":true},
+        {"key":"genre_id","kind":"select","required":false,"options":[],"label":"النوع الفني","dynamic":true,"discoverPresentation":{"priority":10}},
+        {"key":"year","kind":"select","required":false,"options":[],"label":"السنة","dynamic":true,"discoverPresentation":{"priority":20}},
         {"key":"country","kind":"select","required":false,"options":[],"label":"الدولة","dynamic":true},
         {"key":"language","kind":"select","required":false,"options":[],"label":"اللغة","dynamic":true},
         {"key":"quality_source","kind":"select","required":false,"options":[],"label":"المصدر","dynamic":true},
@@ -27,7 +27,7 @@
         {"key":"age_rating","kind":"select","required":false,"options":[],"label":"التصنيف العمري","dynamic":true},
         {"key":"status","kind":"select","required":false,"options":[],"label":"الحالة","dynamic":true},
         {"key":"awards","kind":"select","required":false,"options":[],"label":"الجوائز","dynamic":true},
-        {"key":"sort_by","kind":"select","required":false,"options":[],"label":"الترتيب","dynamic":true}
+        {"key":"sort_by","kind":"select","required":false,"options":[],"label":"الترتيب","dynamic":true,"discoverPresentation":{"priority":30}}
       ],
       "discoverType": "movie",
       "presentation": { "posterShape": "portrait" },
@@ -40,11 +40,11 @@
       "capabilities": ["browse", "search", "pagination"],
       "filters": [
         {"key":"category","kind":"select","required":false,"options":[],"label":"فئة المسلسل","dynamic":true},
-        {"key":"genre_id","kind":"select","required":false,"options":[],"label":"النوع الفني","dynamic":true,"dependsOn":["category"]},
-        {"key":"year","kind":"select","required":false,"options":[],"label":"السنة","dynamic":true,"dependsOn":["category"]},
-        {"key":"country","kind":"select","required":false,"options":[],"label":"الدولة","dynamic":true,"dependsOn":["category"]},
+        {"key":"genre_id","kind":"select","required":false,"options":[],"label":"النوع الفني","dynamic":true,"dependsOn":["category"],"discoverPresentation":{"priority":10}},
+        {"key":"year","kind":"select","required":false,"options":[],"label":"السنة","dynamic":true,"dependsOn":["category"],"discoverPresentation":{"priority":20,"priorityOverrides":[{"filters":{"category":"5"},"priority":40}]}},
+        {"key":"country","kind":"select","required":false,"options":[],"label":"الدولة","dynamic":true,"dependsOn":["category"],"discoverPresentation":{"priority":40,"priorityOverrides":[{"filters":{"category":"5"},"priority":20}]}},
         {"key":"language","kind":"select","required":false,"options":[],"label":"اللغة","dynamic":true,"dependsOn":["category"]},
-        {"key":"status","kind":"select","required":false,"options":[],"label":"الحالة","dynamic":true,"dependsOn":["category"]},
+        {"key":"status","kind":"select","required":false,"options":[],"label":"الحالة","dynamic":true,"dependsOn":["category"],"discoverPresentation":{"priority":30}},
         {"key":"content_type","kind":"select","required":false,"options":[],"label":"نوع المحتوى","dynamic":true,"dependsOn":["category"]},
         {"key":"age_rating","kind":"select","required":false,"options":[],"label":"التصنيف العمري","dynamic":true,"dependsOn":["category"]}
       ],
@@ -163,14 +163,14 @@
       "title": "أفلام أنمي",
       "capabilities": ["home", "browse", "search", "pagination"],
       "filters": [
-        {"key":"genre_id","kind":"select","required":false,"options":[],"label":"النوع الفني","dynamic":true},
-        {"key":"studio_id","kind":"select","required":false,"options":[],"label":"الاستوديو","dynamic":true},
+        {"key":"genre_id","kind":"select","required":false,"options":[],"label":"النوع الفني","dynamic":true,"discoverPresentation":{"priority":10}},
+        {"key":"studio_id","kind":"select","required":false,"options":[],"label":"الاستوديو","dynamic":true,"discoverPresentation":{"hidden":true}},
         {"key":"status","kind":"select","required":false,"options":[],"label":"الحالة","dynamic":true},
         {"key":"season_period","kind":"select","required":false,"options":[],"label":"الموسم","dynamic":true},
         {"key":"season_year","kind":"select","required":false,"options":[],"label":"سنة الموسم","dynamic":true},
-        {"key":"year","kind":"select","required":false,"options":[],"label":"السنة","dynamic":true},
+        {"key":"year","kind":"select","required":false,"options":[],"label":"السنة","dynamic":true,"discoverPresentation":{"priority":20}},
         {"key":"content_type","kind":"select","required":false,"options":[],"label":"نوع المحتوى","dynamic":true},
-        {"key":"age_rating","kind":"select","required":false,"options":[],"label":"التصنيف العمري","dynamic":true}
+        {"key":"age_rating","kind":"select","required":false,"options":[],"label":"التصنيف العمري","dynamic":true,"discoverPresentation":{"priority":30}}
       ],
       "discoverType": "movie",
       "discoverCategory": { "id": "anime", "label": "الأنمي" },
@@ -184,10 +184,10 @@
       "title": "مسلسلات أنمي",
       "capabilities": ["browse", "search", "pagination"],
       "filters": [
-        {"key":"genre_id","kind":"select","required":false,"options":[],"label":"النوع الفني","dynamic":true},
-        {"key":"studio_id","kind":"select","required":false,"options":[],"label":"الاستوديو","dynamic":true},
-        {"key":"status","kind":"select","required":false,"options":[],"label":"الحالة","dynamic":true},
-        {"key":"season_period","kind":"select","required":false,"options":[],"label":"الموسم","dynamic":true},
+        {"key":"genre_id","kind":"select","required":false,"options":[],"label":"النوع الفني","dynamic":true,"discoverPresentation":{"priority":10}},
+        {"key":"studio_id","kind":"select","required":false,"options":[],"label":"الاستوديو","dynamic":true,"discoverPresentation":{"hidden":true}},
+        {"key":"status","kind":"select","required":false,"options":[],"label":"الحالة","dynamic":true,"discoverPresentation":{"priority":30}},
+        {"key":"season_period","kind":"select","required":false,"options":[],"label":"الموسم","dynamic":true,"discoverPresentation":{"priority":20}},
         {"key":"season_year","kind":"select","required":false,"options":[],"label":"سنة الموسم","dynamic":true},
         {"key":"year","kind":"select","required":false,"options":[],"label":"السنة","dynamic":true},
         {"key":"content_type","kind":"select","required":false,"options":[],"label":"نوع المحتوى","dynamic":true},

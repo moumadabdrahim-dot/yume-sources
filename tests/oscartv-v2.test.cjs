@@ -505,7 +505,7 @@ test('getHome bounds request concurrency, preserves catalog order, and isolates 
 });
 
 test('manifest exposes only the requested ordered Home catalogs with paginated browse targets', () => {
-  assert.equal(manifest.version, '2.0.15');
+  assert.equal(manifest.version, '2.0.16');
   assert.ok(manifest.capabilities.includes('home'));
   assert.ok(manifest.capabilities.includes('search'));
   assert.deepEqual(manifest.searchGroups.map(group => group.id), ['movies', 'series', 'anime']);
@@ -529,7 +529,7 @@ test('manifest exposes only the requested ordered Home catalogs with paginated b
   assert.equal(rows.series.capabilities.includes('browse'), true);
 });
 
-test('manifest declares ordered dynamic Discover filters while preserving anime movie identity', () => {
+test('manifest declares category and genre Discover roles while preserving anime movie identity', () => {
   const rows = Object.fromEntries(manifest.catalogs.map(row => [row.id, row]));
   assert.equal(rows.movies.discoverType, 'movie');
   assert.equal(rows.series.discoverType, 'series');
@@ -550,31 +550,21 @@ test('manifest declares ordered dynamic Discover filters while preserving anime 
     rows.series.filters.slice(1).map(() => ['category']));
   assert.equal(rows.anime_movies.filters.some(filter => filter.key === 'anime_type'), false);
 
-  const priorities = filters => Object.fromEntries(filters.map(filter => [filter.key, filter.discoverPresentation]));
-  assert.deepEqual(
-    Object.fromEntries(Object.entries(priorities(rows.movies.filters))
-      .filter(([, presentation]) => presentation?.priority != null)
-      .map(([key, presentation]) => [key, presentation.priority])),
-    { genre_id: 10, year: 20, sort_by: 30 }
-  );
-  assert.equal(priorities(rows.anime_movies.filters).genre_id.priority, 10);
-  assert.equal(priorities(rows.anime_movies.filters).year.priority, 20);
-  assert.equal(priorities(rows.anime_movies.filters).age_rating.priority, 30);
-  assert.equal(priorities(rows.anime_movies.filters).studio_id.hidden, true);
-  assert.equal(priorities(rows.anime_series.filters).studio_id.hidden, true);
-  assert.equal(priorities(rows.anime_series.filters).genre_id.priority, 10);
-  assert.equal(priorities(rows.anime_series.filters).season_period.priority, 20);
-  assert.equal(priorities(rows.anime_series.filters).status.priority, 30);
-
-  const seriesPriorities = priorities(rows.series.filters);
-  assert.equal(seriesPriorities.genre_id.priority, 10);
-  assert.equal(seriesPriorities.year.priority, 20);
-  assert.equal(seriesPriorities.year.priorityOverrides[0].filters.category, '5');
-  assert.equal(seriesPriorities.year.priorityOverrides[0].priority, 40);
-  assert.equal(seriesPriorities.country.priority, 40);
-  assert.equal(seriesPriorities.country.priorityOverrides[0].filters.category, '5');
-  assert.equal(seriesPriorities.country.priorityOverrides[0].priority, 20);
-  assert.equal(seriesPriorities.status.priority, 30);
+  for (const catalogId of ['movies', 'series']) {
+    assert.equal(rows[catalogId].filters.find(filter => filter.key === 'category').discoverPresentation.role, 'category');
+    assert.equal(rows[catalogId].filters.find(filter => filter.key === 'category').discoverPresentation.hidden, true);
+    assert.equal(rows[catalogId].filters.find(filter => filter.key === 'genre_id').discoverPresentation.role, 'genre');
+  }
+  for (const catalogId of ['anime_movies', 'anime_series']) {
+    assert.equal(rows[catalogId].filters.find(filter => filter.key === 'genre_id').discoverPresentation.role, 'genre');
+    assert.equal(rows[catalogId].filters.find(filter => filter.key === 'studio_id').discoverPresentation.hidden, true);
+  }
+  for (const catalogId of ['movies', 'series', 'anime_movies', 'anime_series']) {
+    const filters = rows[catalogId].filters;
+    const extras = filters.filter(filter =>
+      !['category', 'genre_id'].includes(filter.key) && !filter.discoverPresentation?.hidden);
+    assert.deepEqual(extras, [], `${catalogId} exposes only category/genre in Discover`);
+  }
 });
 
 test('dynamic filter lookup preserves API values and scopes series dependencies to category', async () => {

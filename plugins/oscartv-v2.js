@@ -452,7 +452,7 @@
     movies: {
       path: "/api/movies/filters.php",
       fields: [
-        ["category", "التصنيف", "categories"], ["genre_id", "النوع الفني", "genres"],
+        ["category", "فئة الفيلم", "categories"], ["genre_id", "النوع الفني", "genres"],
         ["year", "السنة", "years"], ["country", "الدولة", "countries"],
         ["language", "اللغة", "languages"], ["quality_source", "المصدر", "sources"],
         ["content_type", "نوع المحتوى", "content_types"], ["age_rating", "التصنيف العمري", "age_ratings"],
@@ -463,7 +463,7 @@
     series: {
       path: "/api/series/filters.php",
       fields: [
-        ["category", "التصنيف", "categories"], ["genre_id", "النوع الفني", "genres", ["category"]],
+        ["category", "فئة المسلسل", "categories"], ["genre_id", "النوع الفني", "genres", ["category"]],
         ["year", "السنة", "years", ["category"]], ["country", "الدولة", "countries", ["category"]],
         ["language", "اللغة", "languages", ["category"]], ["status", "الحالة", "statuses", ["category"]],
         ["content_type", "نوع المحتوى", "content_types", ["category"]],
@@ -489,25 +489,60 @@
       ]
     }
   };
-  function filterOption(raw) {
+  var KNOWN_FILTER_LABELS = {
+    arabic: "مسلسلات عربية",
+    turkish_series: "المسلسلات التركية",
+    foreign_series: "المسلسلات الأجنبية",
+    asian_series: "المسلسلات الآسيوية",
+    talk_show: "البرامج الحوارية"
+  };
+  function humanizeFilterLabel(value, localizeKnownCategory) {
+    var normalized = optional(value);
+    if (!normalized) return null;
+    var mapped = localizeKnownCategory ? KNOWN_FILTER_LABELS[normalized.toLowerCase()] : null;
+    if (mapped) return mapped;
+    return normalized.replace(/[_-]+/g, " ").replace(/\s+/g, " ").replace(/\b[a-z]/g, function (letter) {
+      return letter.toUpperCase();
+    });
+  }
+  function filterDisplayLabel(raw, value, filterKey) {
+    var localizeKnownCategory = filterKey === "category";
+    var arabicLabelKeys = ["title_ar", "name_ar", "label", "title", "name"];
+    for (var i = 0; i < arabicLabelKeys.length; i++) {
+      var candidate = optional(raw[arabicLabelKeys[i]]);
+      if (candidate && /[\u0600-\u06ff]/.test(candidate)) return candidate;
+    }
+    var knownKeys = ["slug", "code", "value", "key", "name", "title", "label", "id"];
+    for (var j = 0; j < knownKeys.length; j++) {
+      var knownValue = optional(raw[knownKeys[j]]);
+      if (localizeKnownCategory && knownValue && KNOWN_FILTER_LABELS[knownValue.toLowerCase()]) {
+        return KNOWN_FILTER_LABELS[knownValue.toLowerCase()];
+      }
+    }
+    var labelKeys = ["title_ar", "name_ar", "label", "title", "name", "value", "key", "code", "slug", "id"];
+    for (var k = 0; k < labelKeys.length; k++) {
+      var labelValue = optional(raw[labelKeys[k]]);
+      if (labelValue) return humanizeFilterLabel(labelValue, localizeKnownCategory);
+    }
+    return humanizeFilterLabel(value, localizeKnownCategory);
+  }
+  function filterOption(raw, filterKey) {
     if (raw === null || raw === undefined) return null;
     if (typeof raw !== "object" || Array.isArray(raw)) {
       var primitive = optional(raw);
-      return primitive ? { value: primitive, label: primitive } : null;
+      return primitive ? { value: primitive, label: humanizeFilterLabel(primitive, filterKey === "category") || primitive } : null;
     }
     var valueKeys = ["value", "key", "code", "id", "slug", "name"];
-    var labelKeys = ["label", "name", "title", "title_ar", "value", "key", "code", "slug", "id"];
     var value = null;
-    var label = null;
     for (var i = 0; i < valueKeys.length && !value; i++) value = optional(raw[valueKeys[i]]);
-    for (var j = 0; j < labelKeys.length && !label; j++) label = optional(raw[labelKeys[j]]);
+    var label = filterDisplayLabel(raw, value, filterKey);
     if (!value || !label || value.length > 128 || label.length > 160) return null;
     return { value: value, label: label };
   }
-  function filterOptions(raw) {
+  function filterOptions(raw, filterKey) {
     if (!Array.isArray(raw)) return [];
     var seen = {};
-    return raw.map(filterOption).filter(function (entry) {
+    return raw.map(function (entry) { return filterOption(entry, filterKey); }).filter(function (entry) {
       if (!entry || seen[entry.value]) return false;
       seen[entry.value] = true;
       return true;
@@ -533,7 +568,7 @@
       filters: config.fields.map(function (definition) {
         return {
           key: definition[0], kind: "select", label: definition[1], required: false, dynamic: true,
-          dependsOn: definition[3] || [], options: filterOptions(data[definition[2]])
+          dependsOn: definition[3] || [], options: filterOptions(data[definition[2]], definition[0])
         };
       })
     };

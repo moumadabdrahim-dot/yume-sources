@@ -1,7 +1,7 @@
 {
   "id": "oscar",
   "name": "OscarTV",
-  "version": "2.0.13",
+  "version": "2.0.14",
   "filename": "plugins/oscartv-v2.js",
   "apiVersion": 2,
   "capabilities": ["home", "search", "details", "streams"],
@@ -17,7 +17,7 @@
       "title": "أحدث الأفلام",
       "capabilities": ["browse", "search", "pagination"],
       "filters": [
-        {"key":"category","kind":"select","required":false,"options":[],"label":"التصنيف","dynamic":true},
+        {"key":"category","kind":"select","required":false,"options":[],"label":"فئة الفيلم","dynamic":true},
         {"key":"genre_id","kind":"select","required":false,"options":[],"label":"النوع الفني","dynamic":true},
         {"key":"year","kind":"select","required":false,"options":[],"label":"السنة","dynamic":true},
         {"key":"country","kind":"select","required":false,"options":[],"label":"الدولة","dynamic":true},
@@ -39,7 +39,7 @@
       "title": "أحدث المسلسلات",
       "capabilities": ["browse", "search", "pagination"],
       "filters": [
-        {"key":"category","kind":"select","required":false,"options":[],"label":"التصنيف","dynamic":true},
+        {"key":"category","kind":"select","required":false,"options":[],"label":"فئة المسلسل","dynamic":true},
         {"key":"genre_id","kind":"select","required":false,"options":[],"label":"النوع الفني","dynamic":true,"dependsOn":["category"]},
         {"key":"year","kind":"select","required":false,"options":[],"label":"السنة","dynamic":true,"dependsOn":["category"]},
         {"key":"country","kind":"select","required":false,"options":[],"label":"الدولة","dynamic":true,"dependsOn":["category"]},

@@ -505,7 +505,7 @@ test('getHome bounds request concurrency, preserves catalog order, and isolates 
 });
 
 test('manifest exposes only the requested ordered Home catalogs with paginated browse targets', () => {
-  assert.equal(manifest.version, '2.0.13');
+  assert.equal(manifest.version, '2.0.14');
   assert.ok(manifest.capabilities.includes('home'));
   assert.ok(manifest.capabilities.includes('search'));
   assert.deepEqual(manifest.searchGroups.map(group => group.id), ['movies', 'series', 'anime']);
@@ -533,6 +533,8 @@ test('manifest declares ordered dynamic Discover filters while preserving anime 
   const rows = Object.fromEntries(manifest.catalogs.map(row => [row.id, row]));
   assert.equal(rows.movies.discoverType, 'movie');
   assert.equal(rows.series.discoverType, 'series');
+  assert.equal(rows.movies.filters.find(filter => filter.key === 'category').label, 'فئة الفيلم');
+  assert.equal(rows.series.filters.find(filter => filter.key === 'category').label, 'فئة المسلسل');
   assert.equal(rows.anime_movies.type, 'anime');
   assert.equal(rows.anime_movies.discoverType, 'movie');
   assert.deepEqual(rows.anime_movies.discoverCategory, { id: 'anime', label: 'الأنمي' });
@@ -569,11 +571,47 @@ test('dynamic filter lookup preserves API values and scopes series dependencies 
   });
   assert.equal(requests.length, 1);
   assert.equal(requests[0].searchParams.get('category'), '5');
+  assert.equal(result.filters[0].label, 'فئة المسلسل');
   assert.deepEqual(JSON.parse(JSON.stringify(result.filters[0].options)), [
     { value: '4', label: 'أجنبي' }, { value: '5', label: 'آسيوي' }
   ]);
   assert.deepEqual(JSON.parse(JSON.stringify(result.filters[1].options)), [{ value: '17', label: 'دراما' }]);
   assert.deepEqual(JSON.parse(JSON.stringify(result.filters[1].dependsOn)), ['category']);
+});
+
+test('known series category slugs receive Arabic display labels while API values stay unchanged', async () => {
+  const plugin = loadPlugin(async url => {
+    const parsed = new URL(url);
+    if (!['/api/series/filters.php', '/api/movies/filters.php'].includes(parsed.pathname)) {
+      throw new Error(`unexpected request ${parsed.pathname}`);
+    }
+    return apiResponse({
+      categories: [
+        { id: 4, name: 'foreign_series' },
+        { id: 5, name: 'turkish_series' },
+        { id: 6, slug: 'asian_series', title_ar: 'المسلسلات الآسيوية' },
+        { id: 7, name: 'talk_show' },
+        { value: 'arabic', label: 'arabic' },
+        { slug: 'reality_tv', id: 9 }
+      ],
+      languages: ['arabic']
+    });
+  });
+
+  const result = await plugin.getCatalogFilters({ catalogId: 'series', contentType: 'series', selectedFilters: {} });
+  assert.deepEqual(JSON.parse(JSON.stringify(result.filters[0].options)), [
+    { value: '4', label: 'المسلسلات الأجنبية' },
+    { value: '5', label: 'المسلسلات التركية' },
+    { value: '6', label: 'المسلسلات الآسيوية' },
+    { value: '7', label: 'البرامج الحوارية' },
+    { value: 'arabic', label: 'مسلسلات عربية' },
+    { value: '9', label: 'Reality Tv' }
+  ]);
+  assert.deepEqual(JSON.parse(JSON.stringify(result.filters.find(filter => filter.key === 'language').options)), [
+    { value: 'arabic', label: 'Arabic' }
+  ]);
+  const movieFilters = await plugin.getCatalogFilters({ catalogId: 'movies', contentType: 'movie', selectedFilters: {} });
+  assert.equal(movieFilters.filters[0].label, 'فئة الفيلم');
 });
 
 test('anime movie and series filters share native anime metadata without exposing anime_type as a user filter', async () => {

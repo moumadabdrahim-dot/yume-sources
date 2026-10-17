@@ -505,10 +505,13 @@ test('getHome bounds request concurrency, preserves catalog order, and isolates 
 });
 
 test('manifest exposes only the requested ordered Home catalogs with paginated browse targets', () => {
-  assert.equal(manifest.version, '2.0.18');
+  assert.equal(manifest.version, '2.0.19');
   assert.ok(manifest.capabilities.includes('home'));
   assert.ok(manifest.capabilities.includes('search'));
-  assert.deepEqual(manifest.searchGroups.map(group => group.id), ['movies', 'series', 'anime']);
+  assert.deepEqual(manifest.searchGroups.map(group => group.id), ['movies', 'series', 'anime_movies', 'anime_series']);
+  assert.deepEqual(manifest.searchGroups.slice(2).map(group => [group.types, group.displayType]), [
+    [['anime'], 'movie'], [['anime'], 'series']
+  ]);
   const expected = [
     ['movies_top', 'رائج اليوم'], ['foreign_movies', 'أفلام أجنبية'], ['foreign_series', 'مسلسلات أجنبية'],
     ['foreign_latest', 'أحدث الأجنبي'], ['foreign_airing', 'يعرض الآن'], ['asian_series', 'مسلسلات آسيوية'],
@@ -918,6 +921,27 @@ test('native search sends one request for the selected group and preserves pagin
   assert.equal(page.groupId, 'series');
   assert.equal(page.items[0].nativeId, 'series:42');
   assert.deepEqual(JSON.parse(JSON.stringify(page.page)), { nextCursor: '3', hasMore: true, total: 41 });
+});
+
+test('anime search routes use confirmed native type filters without adding sort parameters', async () => {
+  const observed = [];
+  const plugin = loadPlugin(async (url) => {
+    const parsed = new URL(url);
+    observed.push(parsed);
+    return apiResponse([{ id: parsed.searchParams.get('anime_type') === 'movie' ? 61 : 62, title_ar: 'نتيجة' }],
+      { page: Number(parsed.searchParams.get('page') || 1), page_count: 3, total: 41, per_page: 20 });
+  });
+  const movies = await plugin.search({ query: ' أنمي ', groupId: 'anime_movies', cursor: '2', limit: 20 });
+  const series = await plugin.search({ query: ' أنمي ', groupId: 'anime_series', cursor: '2', limit: 20 });
+
+  assert.deepEqual(observed.map(url => url.pathname), ['/api/anime/', '/api/anime/']);
+  assert.deepEqual(observed.map(url => url.searchParams.get('anime_type')), ['movie', 'tv,ova,ona,special']);
+  assert.ok(observed.every(url => url.searchParams.get('search') === 'أنمي' && url.searchParams.get('page') === '2'));
+  assert.ok(observed.every(url => !url.searchParams.has('sort_by')));
+  assert.deepEqual([movies.groupId, series.groupId], ['anime_movies', 'anime_series']);
+  assert.deepEqual([movies.items[0].type, series.items[0].type], ['anime', 'anime']);
+  assert.deepEqual([movies.items[0].nativeId, series.items[0].nativeId], ['anime:61', 'anime:62']);
+  assert.deepEqual([movies.page.nextCursor, series.page.nextCursor], ['3', '3']);
 });
 
 test('native search rejects unknown groups before network access', async () => {

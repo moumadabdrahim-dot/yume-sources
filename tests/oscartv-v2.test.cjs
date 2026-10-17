@@ -505,7 +505,7 @@ test('getHome bounds request concurrency, preserves catalog order, and isolates 
 });
 
 test('manifest exposes only the requested ordered Home catalogs with paginated browse targets', () => {
-  assert.equal(manifest.version, '2.0.16');
+  assert.equal(manifest.version, '2.0.18');
   assert.ok(manifest.capabilities.includes('home'));
   assert.ok(manifest.capabilities.includes('search'));
   assert.deepEqual(manifest.searchGroups.map(group => group.id), ['movies', 'series', 'anime']);

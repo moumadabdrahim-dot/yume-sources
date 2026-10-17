@@ -505,7 +505,7 @@ test('getHome bounds request concurrency, preserves catalog order, and isolates 
 });
 
 test('manifest exposes only the requested ordered Home catalogs with paginated browse targets', () => {
-  assert.equal(manifest.version, '2.0.12');
+  assert.equal(manifest.version, '2.0.13');
   assert.ok(manifest.capabilities.includes('home'));
   assert.ok(manifest.capabilities.includes('search'));
   assert.deepEqual(manifest.searchGroups.map(group => group.id), ['movies', 'series', 'anime']);
@@ -535,6 +535,10 @@ test('manifest declares ordered dynamic Discover filters while preserving anime 
   assert.equal(rows.series.discoverType, 'series');
   assert.equal(rows.anime_movies.type, 'anime');
   assert.equal(rows.anime_movies.discoverType, 'movie');
+  assert.deepEqual(rows.anime_movies.discoverCategory, { id: 'anime', label: 'الأنمي' });
+  assert.equal(rows.anime_series.type, 'anime');
+  assert.equal(rows.anime_series.discoverType, 'series');
+  assert.deepEqual(rows.anime_series.discoverCategory, { id: 'anime', label: 'الأنمي' });
   assert.deepEqual(rows.movies.filters.map(filter => filter.key), [
     'category', 'genre_id', 'year', 'country', 'language', 'quality_source', 'content_type',
     'age_rating', 'status', 'awards', 'sort_by'
@@ -572,7 +576,7 @@ test('dynamic filter lookup preserves API values and scopes series dependencies 
   assert.deepEqual(JSON.parse(JSON.stringify(result.filters[1].dependsOn)), ['category']);
 });
 
-test('anime movie filters use the verified movie catalog without inventing an anime series type', async () => {
+test('anime movie and series filters share native anime metadata without exposing anime_type as a user filter', async () => {
   const plugin = loadPlugin(async url => {
     const parsed = new URL(url);
     if (parsed.pathname !== '/api/anime/filters.php') throw new Error(`unexpected request ${parsed.pathname}`);
@@ -586,6 +590,26 @@ test('anime movie filters use the verified movie catalog without inventing an an
   assert.equal(result.filters.some(filter => filter.key === 'anime_type'), false);
   assert.deepEqual(JSON.parse(JSON.stringify(result.filters[0].options)), [{ value: '2', label: 'مغامرات' }]);
   await assert.rejects(plugin.getCatalogFilters({ catalogId: 'anime_movies', contentType: 'series' }), /type mismatch/);
+
+  const seriesFilters = await plugin.getCatalogFilters({ catalogId: 'anime_series', contentType: 'anime', selectedFilters: {} });
+  assert.equal(seriesFilters.filters.some(filter => filter.key === 'anime_type'), false);
+  await assert.rejects(plugin.getCatalogFilters({ catalogId: 'anime_series', contentType: 'series' }), /type mismatch/);
+});
+
+test('anime series catalog uses the original OscarTV episode-list type values and preserves anime identity', async () => {
+  const requests = [];
+  const plugin = loadPlugin(async url => {
+    requests.push(new URL(url));
+    return apiResponse([{ id: 88, title_en: 'Series Anime', poster: '/series-anime.jpg' }],
+      { page: 1, page_count: 2, total: 19, per_page: 18 });
+  });
+  const page = await plugin.getCatalog({ catalogId: 'anime_series', type: 'anime', limit: 18, filters: {} });
+  assert.equal(requests.length, 1);
+  assert.deepEqual(Object.fromEntries(requests[0].searchParams.entries()), {
+    anime_type: 'tv,ova,ona,special', sort_by: 'newest', page: '1', limit: '18'
+  });
+  assert.equal(page.items[0].nativeId, 'anime:88');
+  assert.equal(page.items[0].type, 'anime');
 });
 
 test('catalog descriptors map movies, series, and anime to one native-ID-preserving page each', async () => {

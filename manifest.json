@@ -1,7 +1,7 @@
 {
   "id": "oscar",
   "name": "OscarTV",
-  "version": "2.0.12",
+  "version": "2.0.13",
   "filename": "plugins/oscartv-v2.js",
   "apiVersion": 2,
   "capabilities": ["home", "search", "details", "streams"],
@@ -173,9 +173,29 @@
         {"key":"age_rating","kind":"select","required":false,"options":[],"label":"التصنيف العمري","dynamic":true}
       ],
       "discoverType": "movie",
+      "discoverCategory": { "id": "anime", "label": "الأنمي" },
       "presentation": { "posterShape": "portrait" },
       "homeOrder": -99990,
       "homeFallback": true
+    },
+    {
+      "id": "anime_series",
+      "type": "anime",
+      "title": "مسلسلات أنمي",
+      "capabilities": ["browse", "search", "pagination"],
+      "filters": [
+        {"key":"genre_id","kind":"select","required":false,"options":[],"label":"النوع الفني","dynamic":true},
+        {"key":"studio_id","kind":"select","required":false,"options":[],"label":"الاستوديو","dynamic":true},
+        {"key":"status","kind":"select","required":false,"options":[],"label":"الحالة","dynamic":true},
+        {"key":"season_period","kind":"select","required":false,"options":[],"label":"الموسم","dynamic":true},
+        {"key":"season_year","kind":"select","required":false,"options":[],"label":"سنة الموسم","dynamic":true},
+        {"key":"year","kind":"select","required":false,"options":[],"label":"السنة","dynamic":true},
+        {"key":"content_type","kind":"select","required":false,"options":[],"label":"نوع المحتوى","dynamic":true},
+        {"key":"age_rating","kind":"select","required":false,"options":[],"label":"التصنيف العمري","dynamic":true}
+      ],
+      "discoverType": "series",
+      "discoverCategory": { "id": "anime", "label": "الأنمي" },
+      "presentation": { "posterShape": "portrait" }
     }
   ]
 }

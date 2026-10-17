@@ -437,7 +437,8 @@
     { id: "asian_airing", path: "/api/series/", type: "series", query: { category: 5, status: "ongoing", sort_by: "latest_episode" } },
     { id: "anime_picks", path: "/api/anime/", type: "anime", query: { sort_by: "rating" } },
     { id: "anime", path: "/api/anime/", type: "anime", query: { sort_by: "newest" } },
-    { id: "anime_movies", path: "/api/anime/", type: "anime", query: { anime_type: "movie", sort_by: "newest" } }
+    { id: "anime_movies", path: "/api/anime/", type: "anime", query: { anime_type: "movie", sort_by: "newest" } },
+    { id: "anime_series", path: "/api/anime/", type: "anime", query: { anime_type: "tv,ova,ona,special", sort_by: "newest" } }
   ];
   var CATALOG_FILTER_KEYS = {
     movie: ["status", "year", "country", "genre_id", "language", "category", "content_type", "age_rating",
@@ -470,6 +471,15 @@
       ]
     },
     anime_movies: {
+      path: "/api/anime/filters.php",
+      fields: [
+        ["genre_id", "النوع الفني", "genres"], ["studio_id", "الاستوديو", "studios"],
+        ["status", "الحالة", "statuses"], ["season_period", "الموسم", "season_periods"],
+        ["season_year", "سنة الموسم", "season_years"], ["year", "السنة", "years"],
+        ["content_type", "نوع المحتوى", "content_types"], ["age_rating", "التصنيف العمري", "age_ratings"]
+      ]
+    },
+    anime_series: {
       path: "/api/anime/filters.php",
       fields: [
         ["genre_id", "النوع الفني", "genres"], ["studio_id", "الاستوديو", "studios"],

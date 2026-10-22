@@ -505,7 +505,7 @@ test('getHome bounds request concurrency, preserves catalog order, and isolates 
 });
 
 test('manifest exposes only the requested ordered Home catalogs with paginated browse targets', () => {
-  assert.equal(manifest.version, '2.0.19');
+  assert.equal(manifest.version, '2.0.20');
   assert.ok(manifest.capabilities.includes('home'));
   assert.ok(manifest.capabilities.includes('search'));
   assert.deepEqual(manifest.searchGroups.map(group => group.id), ['movies', 'series', 'anime_movies', 'anime_series']);
@@ -1083,6 +1083,77 @@ test('HTTP 206 with a real media content type remains playable', async () => {
   assert.equal(streams.length, 1);
   assert.equal(streams[0].url, 'https://newcdn.seriesmp4.com/media/valid.mp4');
   assert.equal(streams[0].type, 'video');
+});
+
+test('B2 CSS-labeled WatchLink resolves only when the bounded body proves it is HLS', async () => {
+  const fixture = JSON.parse(fs.readFileSync(path.join(root, 'tests/fixtures/watchlink-b2-css-hls.json'), 'utf8'));
+  const requests = [];
+  let watchLinkFetches = 0;
+  const plugin = loadPlugin(async (rawUrl, options) => {
+    const url = new URL(rawUrl);
+    if (url.pathname === '/api/episodes/show.php') {
+      watchLinkFetches++;
+      assert.equal(url.searchParams.get('id'), '28718');
+      return apiResponse({ id: 28718, watch_links: [fixture.watchLink] });
+    }
+    requests.push({ url: rawUrl, options });
+    assert.equal(rawUrl, fixture.watchLink.url);
+    return httpResponse({
+      status: fixture.response.status,
+      url: fixture.response.finalUrl,
+      contentType: fixture.response.contentType,
+      body: fixture.response.body
+    });
+  });
+
+  const listing = await plugin.getStreams({ id: fixture.episode.nativeId, mode: 'options' });
+  assert.equal(listing.options.length, 1);
+  assert.equal(listing.options[0].title, 'B2');
+  assert.equal(listing.options[0].quality, '1080p');
+  const optionIdentity = JSON.parse(listing.options[0].token);
+  assert.equal(optionIdentity.version, 3);
+  assert.equal(optionIdentity.link.watch_link_id, fixture.watchLink.id);
+  assert.equal(optionIdentity.link.selected_field, 'url');
+
+  const result = await plugin.resolveStreamOption({ id: fixture.episode.nativeId, token: listing.options[0].token });
+
+  assert.equal(watchLinkFetches, 2, 'resolution refreshes and matches the selected WatchLink');
+  assert.equal(requests.length, 1, 'one bounded request is enough to identify the playlist');
+  assert.equal(requests[0].options.method, 'GET');
+  assert.equal(requests[0].options.redirect, 'follow');
+  assert.equal(requests[0].options.headers.Range, 'bytes=0-65535');
+  assert.equal(requests[0].options.headers['User-Agent'], 'FixtureUA');
+  assert.equal(requests[0].options.headers.Cookie, undefined, 'session Cookie is not sent to the cross-origin CDN');
+  assert.equal(requests[0].options.headers.Referer, undefined, 'session Referer is not sent to the cross-origin CDN');
+  assert.equal(result.streams.length, 1);
+  assert.equal(result.streams[0].url, fixture.response.finalUrl);
+  assert.equal(result.streams[0].type, 'm3u8');
+  assert.equal(result.streams[0].title, 'B2');
+  assert.equal(result.streams[0].quality, '1080p');
+  assert.equal(result.streams[0].headers['User-Agent'], 'FixtureUA');
+  assert.equal(result.streams[0].headers.Cookie, undefined);
+  assert.equal(result.streams[0].headers.Referer, undefined);
+});
+
+test('extensionless direct WatchLink requires an HLS playlist signature', async () => {
+  const url = 'https://origin.example.invalid/playback?id=fixture';
+  const plugin = loadPlugin(async requestUrl => httpResponse({
+    status: 200, url: 'https://cdn.example.invalid/media/playlist', contentType: 'application/octet-stream',
+    body: '#EXTM3U\n#EXT-X-TARGETDURATION:4\n#EXTINF:4,\nsegment.ts\n'
+  }));
+  const streams = await plugin.__test.resolveLink({ url, type: 'direct', server_name: 'Fixture direct' });
+  assert.equal(streams.length, 1);
+  assert.equal(streams[0].url, 'https://cdn.example.invalid/media/playlist');
+  assert.equal(streams[0].type, 'm3u8');
+});
+
+test('CSS response without an HLS signature remains unsupported', async () => {
+  const url = 'https://origin.example.invalid/playback/fixture.css';
+  const plugin = loadPlugin(async requestUrl => httpResponse({
+    status: 200, url: requestUrl, contentType: 'text/css; charset=utf-8', body: '.fixture { color: red; }'
+  }));
+  const streams = await plugin.__test.resolveLink({ url, type: 'direct', server_name: 'Fixture direct' });
+  assert.deepEqual(Array.from(streams), []);
 });
 
 test('extensionless direct declarations are probed and HTML responses are rejected', async () => {

@@ -803,6 +803,9 @@
   function mediaContentType(contentType) {
     return /^(video\/|application\/(vnd\.apple\.mpegurl|x-mpegurl)|audio\/mpegurl)/i.test(String(contentType || "").toLowerCase());
   }
+  function hlsPlaylistBody(body) {
+    return /^\uFEFF?\s*#EXTM3U(?:\s|$)/i.test(String(body || ""));
+  }
   function isHttpUrl(url) { return /^https?:\/\/[^/?#\s]+(?:[/?#]|$)/i.test(String(url || "").trim()); }
   function hostOf(url) {
     try { if (typeof URL !== "undefined") return new URL(String(url)).hostname.toLowerCase(); } catch (_) {}
@@ -998,7 +1001,7 @@
     // same character bound for runtimes that do not expose a Web ReadableStream.
     try { return String(await response.text()).slice(0, limit); } catch (_) { return ""; }
   }
-  async function resolveWrapper(url, headers, depth, visited) {
+  async function resolveWrapper(url, headers, depth, visited, allowHlsPlaylistSignature) {
     if (!isHttpUrl(url)) return [];
     if (depth > 4) return [];
     visited = visited || {};
@@ -1023,6 +1026,15 @@
       return [{ url: finalUrl, headers: mediaHeaders, contentType: contentType }];
     }
     var html = await boundedResponseText(response, 1048576);
+    // Some OscarTV direct WatchLinks use a non-video suffix and are served as
+    // text/css even though the bounded response is an actual HLS playlist.
+    // Accept only the HLS file signature, and only for a WatchLink declared
+    // direct; never infer video from HTTPS or text/css alone.
+    if (allowHlsPlaylistSignature && hlsPlaylistBody(html)) {
+      var playlistHeaders = {};
+      Object.keys(headers || {}).forEach(function (name) { playlistHeaders[name] = headers[name]; });
+      return [{ url: finalUrl, headers: playlistHeaders, contentType: "application/vnd.apple.mpegurl" }];
+    }
     if (directMedia(finalUrl, contentType) && !htmlResponse(contentType, html)) {
       var extensionMediaHeaders = {};
       Object.keys(headers || {}).forEach(function (name) { extensionMediaHeaders[name] = headers[name]; });
@@ -1040,7 +1052,7 @@
       // while the same signed target succeeds without it. Keep this policy scoped
       // to a verified SeriesMP4 -> Yandex transition only.
       if (!(isSeriesMp4(finalUrl) && isYandex(frameUrl))) frameHeaders.Referer = finalUrl;
-      var nested = await resolveWrapper(frameUrl, frameHeaders, depth + 1, visited);
+      var nested = await resolveWrapper(frameUrl, frameHeaders, depth + 1, visited, allowHlsPlaylistSignature);
       found = found.concat(nested);
     }
     if (found.length) return uniqueResolved(found);
@@ -1052,7 +1064,7 @@
       if (resolved && !obviousAd(resolved) && directMedia(resolved)) {
         var mediaHeaders = { "User-Agent": headers["User-Agent"] || MEDIA_UA };
         if (!(isSeriesMp4(finalUrl) && isYandex(resolved))) mediaHeaders.Referer = finalUrl;
-        var media = await resolveWrapper(resolved, mediaHeaders, depth + 1, visited);
+        var media = await resolveWrapper(resolved, mediaHeaders, depth + 1, visited, allowHlsPlaylistSignature);
         found = found.concat(media);
       }
     }
@@ -1066,7 +1078,7 @@
         if (!isYandex(absoluteUrl) || obviousAd(absoluteUrl)) continue;
         var absoluteMedia = await resolveWrapper(absoluteUrl, {
           "User-Agent": headers["User-Agent"] || MEDIA_UA
-        }, depth + 1, visited);
+        }, depth + 1, visited, allowHlsPlaylistSignature);
         found = found.concat(absoluteMedia);
       }
     }
@@ -1081,7 +1093,8 @@
     if (isSeriesMp4(url) || isYandex(url) || !directMedia(url, "")) {
       // Do not put session cookies or provider Referer values on wrapper
       // requests: fetch may follow redirects before the final media origin is known.
-      var resolved = await resolveWrapper(url, resolverHeaders, 0);
+      var allowHlsPlaylistSignature = text(link && link.type).toLowerCase() === "direct";
+      var resolved = await resolveWrapper(url, resolverHeaders, 0, null, allowHlsPlaylistSignature);
       return resolved.map(function (entry) {
         var mediaHeaders = {};
         Object.keys(entry.headers || resolverHeaders).forEach(function (name) {

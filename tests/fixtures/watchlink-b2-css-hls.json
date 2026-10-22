@@ -1,0 +1,22 @@
+{
+  "episode": {
+    "nativeId": "series_episode:28718",
+    "title": "House of the Dragon",
+    "season": 1,
+    "episode": 1
+  },
+  "watchLink": {
+    "id": 9001,
+    "server_name": "B2",
+    "quality": "1080p",
+    "type": "direct",
+    "url": "https://origin.example.invalid/playback/fixture.css?case=b2",
+    "deep_link": "tdmvideo://play?url=https%3A%2F%2Forigin.example.invalid%2Fplayback%2Ffixture.css&ua=FixtureUA&cookies=fixture%3Dredacted&referer=https%3A%2F%2Forigin.example.invalid%2Fwatch%2Ffixture"
+  },
+  "response": {
+    "status": 206,
+    "finalUrl": "https://cdn.example.invalid/hls/fixture.css?case=redirected",
+    "contentType": "text/css; charset=utf-8",
+    "body": "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:4\n#EXTINF:4,\nsegment-1.ts\n#EXT-X-ENDLIST\n"
+  }
+}

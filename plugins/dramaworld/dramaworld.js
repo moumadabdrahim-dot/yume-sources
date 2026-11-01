@@ -4,6 +4,7 @@
 // CloudStream DramaWorld client. They are API route identifiers, not session
 // credentials. Firebase remains optional and only updates the content hosts.
 var PLUGIN_ID = "dramaworld";
+var PLUGIN_VERSION = "0.3.4";
 var FIREBASE_PROJECT_ID = "alamaldrama2022v2";
 var API_ROUTE_KEY = "4F5A9C3D9A86FA54EACEDDD635185";
 var API_ROUTE_ID = "d506abfd-9fe2-4b71-b979-feff21bcad13";
@@ -30,6 +31,20 @@ function fail(code, message) {
   var error = new Error(code + ": " + message);
   error.code = code;
   throw error;
+}
+
+function traceStreams(stage, counts, failureCode) {
+  if (typeof console === "undefined" || !console.log) return;
+  var event = {
+    pluginId: PLUGIN_ID,
+    version: PLUGIN_VERSION,
+    stage: String(stage || "UNKNOWN").replace(/[^A-Z0-9_]/g, "").slice(0, 40),
+    sourceRows: Math.max(0, Number(counts && counts.sourceRows) || 0),
+    options: Math.max(0, Number(counts && counts.options) || 0),
+    streams: Math.max(0, Number(counts && counts.streams) || 0)
+  };
+  if (failureCode) event.failureCode = String(failureCode).replace(/[^A-Z0-9_]/g, "").slice(0, 64);
+  console.log("DRAMAWORLD_STREAM_TRACE " + JSON.stringify(event));
 }
 
 function isObject(value) {
@@ -548,14 +563,16 @@ function mapStreamOptions(sourceRows, identity) {
   sources.forEach(function (source, index) {
     if (!isObject(source) || source.external === true || options.length >= MAX_SOURCES) return;
     var url = publicHttpUrl(source.url);
-    if (!url || !/^https:\/\//i.test(url) || seen[url] || classifySource(source)) return;
+    if (!url || !/^https:\/\//i.test(url) || seen[url]) return;
     seen[url] = true;
+    var direct = classifySource(source);
     var ordinal = options.length + 1;
     options.push({
       token: sourceOptionToken(source, identity, index),
       title: "سيرفر " + ordinal,
       name: "سيرفر " + ordinal,
-      type: "embed"
+      type: direct ? direct.type : "embed",
+      quality: direct ? direct.quality : null
     });
   });
   return options;
@@ -1199,7 +1216,15 @@ async function getStreams(args) {
   var identity = parseNativeId(args.id || args.nativeId, ["movie", "episode"]);
   var config = await readConfig();
   var route = identity.kind === "movie" ? "movie/source/by/" : "episode/source/by/";
-  var sourceRows = await requestDecodedSources(config, endpointPath(config, route + identity.id));
+  var apiStartedAt = Date.now();
+  var sourceRows;
+  try {
+    sourceRows = await requestDecodedSources(config, endpointPath(config, route + identity.id));
+  } catch (sourceError) {
+    traceStreams("API_FAILURE", {}, sourceError && sourceError.code || "DRAMAWORLD_NETWORK_ERROR");
+    throw sourceError;
+  }
+  var apiMs = Date.now() - apiStartedAt;
   var subtitleRoute = identity.kind === "movie"
     ? "subtitles/by/movie/" + identity.id
     : "subtitles/by/episode/" + identity.id;
@@ -1214,13 +1239,29 @@ async function getStreams(args) {
     if (isCancellation(subtitleError)) throw subtitleError;
     if (typeof console !== "undefined" && console.warn) console.warn("DramaWorld subtitle list unavailable");
   }
+  var parsingStartedAt = Date.now();
   var result = mapStreams(sourceRows, subtitles);
-  result.options = mapStreamOptions(sourceRows, identity);
+  var options = mapStreamOptions(sourceRows, identity);
+  if (args.mode === "options") {
+    if (!options.length) {
+      var optionFailure = sourceRows.length ? "DRAMAWORLD_NO_SUPPORTED_SOURCES" : "DRAMAWORLD_NO_SOURCES";
+      traceStreams("OPTIONS_EMPTY", { sourceRows: sourceRows.length, options: 0, streams: result.streams.length }, optionFailure);
+      fail(optionFailure, sourceRows.length
+        ? "DramaWorld returned sources, but none were safe HTTPS server links"
+        : "DramaWorld returned no sources for this title");
+    }
+    traceStreams("OPTIONS_READY", { sourceRows: sourceRows.length, options: options.length, streams: result.streams.length });
+    return { options: options, timing: { apiMs: apiMs, parsingMs: Date.now() - parsingStartedAt } };
+  }
+  result.options = options;
+  result.timing = { apiMs: apiMs, parsingMs: Date.now() - parsingStartedAt };
   if (!result.streams.length && !result.options.length) {
+    traceStreams("SOURCES_EMPTY", { sourceRows: sourceRows.length }, "DRAMAWORLD_NO_SUPPORTED_SOURCES");
     fail("DRAMAWORLD_NO_SUPPORTED_SOURCES", sourceRows.length
       ? "DramaWorld returned sources, but none were safe HTTPS server links"
       : "DramaWorld returned no sources for this title");
   }
+  traceStreams("STREAMS_READY", { sourceRows: sourceRows.length, options: result.options.length, streams: result.streams.length });
   return result;
 }
 
@@ -1234,7 +1275,13 @@ async function resolveStreamOption(args) {
 
   var config = await readConfig();
   var route = identity.kind === "movie" ? "movie/source/by/" : "episode/source/by/";
-  var sourceRows = await requestDecodedSources(config, endpointPath(config, route + identity.id));
+  var sourceRows;
+  try {
+    sourceRows = await requestDecodedSources(config, endpointPath(config, route + identity.id));
+  } catch (sourceError) {
+    traceStreams("RESOLVE_API_FAILURE", {}, sourceError && sourceError.code || "DRAMAWORLD_NETWORK_ERROR");
+    throw sourceError;
+  }
   var source = sourceRows[selection.index];
   if (!isObject(source) || source.external === true ||
       stableSourceFingerprint(source, identity, selection.index) !== selection.fingerprint) {
@@ -1254,6 +1301,7 @@ async function resolveStreamOption(args) {
     candidates = parseDirectMediaCandidates(embedResponse.body);
   }
   if (!candidates.length) {
+    traceStreams("RESOLVE_UNSUPPORTED", { sourceRows: sourceRows.length, options: 1, streams: 0 }, "DRAMAWORLD_EMBED_UNRESOLVED");
     fail("DRAMAWORLD_EMBED_UNRESOLVED", "selected server returned an embed page without a directly readable HLS or MP4 source");
   }
 
@@ -1267,6 +1315,7 @@ async function resolveStreamOption(args) {
     provider: "DramaWorld",
     headers: playbackHeadersForEmbed(playbackUrl, source)
   };
+  traceStreams("RESOLVE_READY", { sourceRows: sourceRows.length, options: 1, streams: 1 });
   if (selected.quality) stream.quality = selected.quality;
   return { streams: [stream] };
 }

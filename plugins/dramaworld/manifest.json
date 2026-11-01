@@ -1,6 +1,6 @@
 {
   "name": "DramaWorld",
-  "version": "0.3.4",
+  "version": "0.3.5",
   "description": "إضافة DramaWorld لـYume API v2 بعقد المسار المنشور وتحديث مضيف Firebase اختياري.",
   "apiVersion": 2,
   "scrapers": [
@@ -8,7 +8,7 @@
       "id": "dramaworld",
       "name": "DramaWorld",
       "description": "Requires an owner-approved public API configuration for external Yume clients.",
-      "version": "0.3.4",
+      "version": "0.3.5",
       "filename": "dramaworld.js",
       "supportedTypes": ["movie", "tv"],
       "enabled": true,

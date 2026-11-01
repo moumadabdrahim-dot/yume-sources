@@ -4,7 +4,7 @@
 // CloudStream DramaWorld client. They are API route identifiers, not session
 // credentials. Firebase remains optional and only updates the content hosts.
 var PLUGIN_ID = "dramaworld";
-var PLUGIN_VERSION = "0.3.4";
+var PLUGIN_VERSION = "0.3.5";
 var FIREBASE_PROJECT_ID = "alamaldrama2022v2";
 var API_ROUTE_KEY = "4F5A9C3D9A86FA54EACEDDD635185";
 var API_ROUTE_ID = "d506abfd-9fe2-4b71-b979-feff21bcad13";
@@ -33,18 +33,49 @@ function fail(code, message) {
   throw error;
 }
 
-function traceStreams(stage, counts, failureCode) {
+function traceStreams(stage, counts, failureCode, diagnostic) {
   if (typeof console === "undefined" || !console.log) return;
+  diagnostic = isObject(diagnostic) ? diagnostic : {};
   var event = {
     pluginId: PLUGIN_ID,
     version: PLUGIN_VERSION,
     stage: String(stage || "UNKNOWN").replace(/[^A-Z0-9_]/g, "").slice(0, 40),
+    quickJsReached: true,
     sourceRows: Math.max(0, Number(counts && counts.sourceRows) || 0),
     options: Math.max(0, Number(counts && counts.options) || 0),
     streams: Math.max(0, Number(counts && counts.streams) || 0)
   };
   if (failureCode) event.failureCode = String(failureCode).replace(/[^A-Z0-9_]/g, "").slice(0, 64);
+  var host = sourceHost(diagnostic.hostUrl);
+  if (host) event.host = host;
+  var status = Number(diagnostic.httpStatus);
+  if (isFinite(status) && status >= 0 && status <= 599) event.httpStatus = Math.floor(status);
+  if (typeof diagnostic.responseReceived === "boolean") event.responseReceived = diagnostic.responseReceived;
+  if (typeof diagnostic.videoExtracted === "boolean") event.videoExtracted = diagnostic.videoExtracted;
   console.log("DRAMAWORLD_STREAM_TRACE " + JSON.stringify(event));
+}
+
+function failStream(code, message, diagnostic) {
+  var error = new Error(code + ": " + message);
+  error.code = code;
+  if (isObject(diagnostic)) {
+    error.diagnostic = {
+      hostUrl: text(diagnostic.hostUrl),
+      httpStatus: Number.isFinite(Number(diagnostic.httpStatus)) ? Number(diagnostic.httpStatus) : null,
+      responseReceived: diagnostic.responseReceived === true
+    };
+  }
+  throw error;
+}
+
+function traceStreamFailure(error, stage, counts, fallbackHostUrl) {
+  var diagnostic = error && isObject(error.diagnostic) ? error.diagnostic : {};
+  traceStreams(stage, counts, error && error.code || "DRAMAWORLD_STREAM_RESOLVE_FAILED", {
+    hostUrl: diagnostic.hostUrl || fallbackHostUrl,
+    httpStatus: diagnostic.httpStatus,
+    responseReceived: diagnostic.responseReceived === true,
+    videoExtracted: false
+  });
 }
 
 function isObject(value) {
@@ -673,33 +704,60 @@ async function fetchEmbedBody(url) {
       });
     } catch (error) {
       if (isCancellation(error)) throw error;
-      if (error && error.name === "TimeoutError") fail("DRAMAWORLD_EMBED_TIMEOUT", "selected server request timed out");
-      fail("DRAMAWORLD_EMBED_NETWORK_ERROR", "selected server could not be reached");
+      var networkCode = error && error.name === "TimeoutError"
+        ? "DRAMAWORLD_EMBED_TIMEOUT"
+        : "DRAMAWORLD_EMBED_NETWORK_ERROR";
+      failStream(networkCode,
+        networkCode === "DRAMAWORLD_EMBED_TIMEOUT" ? "selected server request timed out" : "selected server could not be reached",
+        { hostUrl: currentUrl, httpStatus: 0, responseReceived: false });
     }
     var status = Number(response && response.status) || 0;
     var location = response && response.headers && response.headers.get("location");
     if (status >= 300 && status < 400) {
-      if (redirectCount >= MAX_REDIRECTS) fail("DRAMAWORLD_EMBED_REDIRECT_LIMIT", "selected server redirected too many times");
-      currentUrl = safeEmbedRedirect(location, currentUrl);
+      if (redirectCount >= MAX_REDIRECTS) {
+        failStream("DRAMAWORLD_EMBED_REDIRECT_LIMIT", "selected server redirected too many times",
+          { hostUrl: currentUrl, httpStatus: status, responseReceived: true });
+      }
+      try {
+        currentUrl = safeEmbedRedirect(location, currentUrl);
+      } catch (error) {
+        if (error && !error.diagnostic) {
+          error.diagnostic = { hostUrl: currentUrl, httpStatus: status, responseReceived: true };
+        }
+        throw error;
+      }
       continue;
     }
-    if (response && response.networkError) fail("DRAMAWORLD_EMBED_NETWORK_ERROR", "selected server could not be reached");
-    if (status === 401 || status === 403) fail("DRAMAWORLD_EMBED_ACCESS_DENIED", "selected server denied the request");
+    if (response && response.networkError) {
+      failStream("DRAMAWORLD_EMBED_NETWORK_ERROR", "selected server could not be reached",
+        { hostUrl: currentUrl, httpStatus: 0, responseReceived: false });
+    }
+    if (status === 401 || status === 403) {
+      failStream("DRAMAWORLD_EMBED_ACCESS_DENIED", "selected server denied the request",
+        { hostUrl: currentUrl, httpStatus: status, responseReceived: true });
+    }
     if (!response || response.ok === false || status < 200 || status >= 300) {
-      fail("DRAMAWORLD_EMBED_HTTP_ERROR", "selected server returned HTTP " + (status || "error"));
+      failStream("DRAMAWORLD_EMBED_HTTP_ERROR", "selected server returned HTTP " + (status || "error"),
+        { hostUrl: currentUrl, httpStatus: status, responseReceived: status > 0 });
     }
     var finalUrl = publicHttpUrl(response.url || currentUrl);
     if (!finalUrl || !/^https:\/\//i.test(finalUrl)) {
-      fail("DRAMAWORLD_EMBED_REDIRECT_REJECTED", "selected server returned an unsafe address");
+      failStream("DRAMAWORLD_EMBED_REDIRECT_REJECTED", "selected server returned an unsafe address",
+        { hostUrl: currentUrl, httpStatus: status, responseReceived: true });
     }
     var body = await response.text();
-    if (typeof body !== "string" || !body) fail("DRAMAWORLD_EMBED_RESPONSE_INVALID", "selected server returned no content");
-    if (body.length > MAX_EMBED_BODY_CHARS || body.indexOf("...[truncated]") >= 0) {
-      fail("DRAMAWORLD_EMBED_RESPONSE_TOO_LARGE", "selected server response exceeded the safe size limit");
+    if (typeof body !== "string" || !body) {
+      failStream("DRAMAWORLD_EMBED_RESPONSE_INVALID", "selected server returned no content",
+        { hostUrl: finalUrl, httpStatus: status, responseReceived: true });
     }
-    return { body: body, finalUrl: finalUrl };
+    if (body.length > MAX_EMBED_BODY_CHARS || body.indexOf("...[truncated]") >= 0) {
+      failStream("DRAMAWORLD_EMBED_RESPONSE_TOO_LARGE", "selected server response exceeded the safe size limit",
+        { hostUrl: finalUrl, httpStatus: status, responseReceived: true });
+    }
+    return { body: body, finalUrl: finalUrl, httpStatus: status, responseReceived: true };
   }
-  fail("DRAMAWORLD_EMBED_REDIRECT_LIMIT", "selected server redirected too many times");
+  failStream("DRAMAWORLD_EMBED_REDIRECT_LIMIT", "selected server redirected too many times",
+    { hostUrl: currentUrl, httpStatus: 0, responseReceived: false });
 }
 
 function playbackHeadersForEmbed(embedUrl, source) {
@@ -713,6 +771,112 @@ function playbackHeadersForEmbed(embedUrl, source) {
   var trustedHeaders = safeSourceHeaders(source);
   Object.keys(trustedHeaders).forEach(function (key) { headers[key] = trustedHeaders[key]; });
   return headers;
+}
+
+async function verifyMediaCandidate(candidate, embedUrl, source) {
+  var currentUrl = candidate.url;
+  var headers = playbackHeadersForEmbed(embedUrl, source);
+  headers.Accept = candidate.type === "hls"
+    ? "application/vnd.apple.mpegurl, application/x-mpegURL, */*;q=0.5"
+    : "video/mp4, application/octet-stream, */*;q=0.5";
+  headers.Range = "bytes=0-1023";
+
+  for (var redirectCount = 0; redirectCount <= MAX_REDIRECTS; redirectCount += 1) {
+    var response;
+    try {
+      response = await fetch(currentUrl, {
+        method: "GET",
+        headers: headers,
+        redirect: "manual",
+        timeoutMs: EMBED_RESOLVE_TIMEOUT_MS
+      });
+    } catch (error) {
+      if (isCancellation(error)) throw error;
+      var networkCode = error && error.name === "TimeoutError"
+        ? "DRAMAWORLD_MEDIA_TIMEOUT"
+        : "DRAMAWORLD_MEDIA_NETWORK_ERROR";
+      failStream(networkCode,
+        networkCode === "DRAMAWORLD_MEDIA_TIMEOUT" ? "direct media validation timed out" : "direct media could not be reached",
+        { hostUrl: currentUrl, httpStatus: 0, responseReceived: false });
+    }
+
+    var status = Number(response && response.status) || 0;
+    var location = response && response.headers && response.headers.get("location");
+    if (status >= 300 && status < 400) {
+      if (redirectCount >= MAX_REDIRECTS) {
+        failStream("DRAMAWORLD_MEDIA_REDIRECT_LIMIT", "direct media redirected too many times",
+          { hostUrl: currentUrl, httpStatus: status, responseReceived: true });
+      }
+      try {
+        currentUrl = safeEmbedRedirect(location, currentUrl);
+      } catch (error) {
+        if (error && !error.diagnostic) {
+          error.diagnostic = { hostUrl: currentUrl, httpStatus: status, responseReceived: true };
+        }
+        throw error;
+      }
+      continue;
+    }
+    if (response && response.networkError) {
+      failStream("DRAMAWORLD_MEDIA_NETWORK_ERROR", "direct media could not be reached",
+        { hostUrl: currentUrl, httpStatus: 0, responseReceived: false });
+    }
+    if (status === 401 || status === 403) {
+      failStream("DRAMAWORLD_MEDIA_ACCESS_DENIED", "direct media denied the validation request",
+        { hostUrl: currentUrl, httpStatus: status, responseReceived: true });
+    }
+    if (!response || response.ok === false || status < 200 || status >= 300) {
+      failStream("DRAMAWORLD_MEDIA_HTTP_ERROR", "direct media returned HTTP " + (status || "error"),
+        { hostUrl: currentUrl, httpStatus: status, responseReceived: status > 0 });
+    }
+
+    var finalUrl = publicHttpUrl(response.url || currentUrl);
+    if (!finalUrl || !/^https:\/\//i.test(finalUrl)) {
+      failStream("DRAMAWORLD_MEDIA_REDIRECT_REJECTED", "direct media returned an unsafe address",
+        { hostUrl: currentUrl, httpStatus: status, responseReceived: true });
+    }
+    var contentType = text(response.headers && response.headers.get("content-type")) || "";
+    var valid = false;
+    if (candidate.type === "hls") {
+      var playlist = await response.text();
+      if (typeof playlist !== "string" || !playlist) {
+        failStream("DRAMAWORLD_MEDIA_RESPONSE_INVALID", "direct media returned no playlist content",
+          { hostUrl: finalUrl, httpStatus: status, responseReceived: true });
+      }
+      if (/(?:cf-mitigated|challenge-platform|__cf_chl|just a moment|checking your browser)/i.test(playlist.slice(0, 8192))) {
+        failStream("DRAMAWORLD_HOST_CHALLENGE", "direct media returned an access challenge",
+          { hostUrl: finalUrl, httpStatus: status, responseReceived: true });
+      }
+      valid = /^\s*#EXTM3U(?:\s|$)/i.test(playlist) && /mpegurl|mpeg-url/i.test(contentType);
+    } else if (candidate.type === "mp4") {
+      var prefix = "";
+      if (response.arrayBuffer) {
+        var buffer = await response.arrayBuffer();
+        var bytes = new Uint8Array(buffer);
+        var prefixLength = Math.min(bytes.length, 64);
+        for (var byteIndex = 0; byteIndex < prefixLength; byteIndex += 1) {
+          prefix += String.fromCharCode(bytes[byteIndex]);
+        }
+      } else {
+        prefix = await response.text();
+      }
+      if (/(?:cf-mitigated|challenge-platform|__cf_chl|just a moment|checking your browser)/i.test(prefix.slice(0, 8192)) ||
+          /^\s*(?:<!doctype\s+html|<html|\{\s*"(?:error|message)")/i.test(prefix)) {
+        failStream("DRAMAWORLD_MEDIA_RESPONSE_INVALID", "direct media returned a page instead of a video file",
+          { hostUrl: finalUrl, httpStatus: status, responseReceived: true });
+      }
+      valid = /^(?:video\/mp4|application\/octet-stream)$/i.test(contentType) && prefix.indexOf("ftyp") >= 0;
+    }
+
+    if (!valid) {
+      failStream("DRAMAWORLD_MEDIA_RESPONSE_INVALID", "direct URL did not return a recognizable HLS playlist or MP4 file",
+        { hostUrl: finalUrl, httpStatus: status, responseReceived: true });
+    }
+    return { url: finalUrl, httpStatus: status, hostUrl: finalUrl, responseReceived: true };
+  }
+
+  failStream("DRAMAWORLD_MEDIA_REDIRECT_LIMIT", "direct media redirected too many times",
+    { hostUrl: currentUrl, httpStatus: 0, responseReceived: false });
 }
 
 function safeSourceHeaders(source) {
@@ -1267,10 +1431,21 @@ async function getStreams(args) {
 
 async function resolveStreamOption(args) {
   args = isObject(args) ? args : {};
-  var identity = parseNativeId(args.id || args.nativeId, ["movie", "episode"]);
-  var selection = parseSourceOptionToken(args.token);
+  var identity;
+  var selection;
+  try {
+    identity = parseNativeId(args.id || args.nativeId, ["movie", "episode"]);
+    selection = parseSourceOptionToken(args.token);
+  } catch (selectionError) {
+    traceStreamFailure(selectionError, "OPTION_TOKEN_INVALID", { options: 1, streams: 0 });
+    throw selectionError;
+  }
   if (selection.kind !== identity.kind || selection.id !== identity.id) {
-    fail("DRAMAWORLD_OPTION_ID_MISMATCH", "selected server belongs to a different DramaWorld title");
+    var identityError;
+    try { fail("DRAMAWORLD_OPTION_ID_MISMATCH", "selected server belongs to a different DramaWorld title"); }
+    catch (error) { identityError = error; }
+    traceStreamFailure(identityError, "OPTION_ID_MISMATCH", { options: 1, streams: 0 });
+    throw identityError;
   }
 
   var config = await readConfig();
@@ -1285,37 +1460,106 @@ async function resolveStreamOption(args) {
   var source = sourceRows[selection.index];
   if (!isObject(source) || source.external === true ||
       stableSourceFingerprint(source, identity, selection.index) !== selection.fingerprint) {
-    fail("DRAMAWORLD_OPTION_EXPIRED", "DramaWorld server list changed; refresh the source list and try again");
+    var expiredError;
+    try { fail("DRAMAWORLD_OPTION_EXPIRED", "DramaWorld server list changed; refresh the source list and try again"); }
+    catch (error) { expiredError = error; }
+    traceStreamFailure(expiredError, "OPTION_EXPIRED", { sourceRows: sourceRows.length, options: 1, streams: 0 });
+    throw expiredError;
   }
 
   var embedUrl = publicHttpUrl(source.url);
   if (!embedUrl || !/^https:\/\//i.test(embedUrl)) {
-    fail("DRAMAWORLD_EMBED_URL_INVALID", "selected DramaWorld server does not provide a public HTTPS address");
+    var embedUrlError;
+    try { fail("DRAMAWORLD_EMBED_URL_INVALID", "selected DramaWorld server does not provide a public HTTPS address"); }
+    catch (error) { embedUrlError = error; }
+    traceStreamFailure(embedUrlError, "EMBED_URL_INVALID", { sourceRows: sourceRows.length, options: 1, streams: 0 });
+    throw embedUrlError;
   }
 
-  var candidates = parseDirectMediaCandidates(JSON.stringify(source));
+  var candidates;
+  try {
+    candidates = parseDirectMediaCandidates(JSON.stringify(source));
+  } catch (parseSourceError) {
+    traceStreamFailure(parseSourceError, "SOURCE_PARSE_FAILURE",
+      { sourceRows: sourceRows.length, options: 1, streams: 0 }, embedUrl);
+    throw parseSourceError;
+  }
   var playbackUrl = embedUrl;
+  var embedResponse = null;
   if (!candidates.length) {
-    var embedResponse = await fetchEmbedBody(embedUrl);
+    try {
+      embedResponse = await fetchEmbedBody(embedUrl);
+    } catch (embedError) {
+      traceStreamFailure(embedError, "EMBED_FETCH_FAILURE",
+        { sourceRows: sourceRows.length, options: 1, streams: 0 }, embedUrl);
+      throw embedError;
+    }
     playbackUrl = embedResponse.finalUrl;
-    candidates = parseDirectMediaCandidates(embedResponse.body);
+    try {
+      candidates = parseDirectMediaCandidates(embedResponse.body);
+    } catch (parseEmbedError) {
+      if (parseEmbedError && !parseEmbedError.diagnostic) {
+        parseEmbedError.diagnostic = {
+          hostUrl: embedResponse.finalUrl,
+          httpStatus: embedResponse.httpStatus,
+          responseReceived: embedResponse.responseReceived
+        };
+      }
+      traceStreamFailure(parseEmbedError, "EMBED_PARSE_FAILURE",
+        { sourceRows: sourceRows.length, options: 1, streams: 0 }, embedResponse.finalUrl);
+      throw parseEmbedError;
+    }
   }
   if (!candidates.length) {
-    traceStreams("RESOLVE_UNSUPPORTED", { sourceRows: sourceRows.length, options: 1, streams: 0 }, "DRAMAWORLD_EMBED_UNRESOLVED");
-    fail("DRAMAWORLD_EMBED_UNRESOLVED", "selected server returned an embed page without a directly readable HLS or MP4 source");
+    var unresolvedError;
+    var unresolvedContext = {
+      hostUrl: embedResponse && embedResponse.finalUrl || embedUrl,
+      httpStatus: embedResponse && embedResponse.httpStatus || null,
+      responseReceived: !!(embedResponse && embedResponse.responseReceived)
+    };
+    try {
+      failStream("DRAMAWORLD_EMBED_UNRESOLVED", "selected server returned an embed page without a directly readable HLS or MP4 source", unresolvedContext);
+    } catch (error) { unresolvedError = error; }
+    traceStreamFailure(unresolvedError, "EMBED_UNRESOLVED",
+      { sourceRows: sourceRows.length, options: 1, streams: 0 }, embedUrl);
+    throw unresolvedError;
   }
 
-  var selected = candidates[0];
+  var selected = null;
+  var verifiedMedia = null;
+  var lastValidationError = null;
+  for (var candidateIndex = 0; candidateIndex < candidates.length; candidateIndex += 1) {
+    try {
+      verifiedMedia = await verifyMediaCandidate(candidates[candidateIndex], playbackUrl, source);
+      selected = candidates[candidateIndex];
+      break;
+    } catch (validationError) {
+      if (isCancellation(validationError)) throw validationError;
+      lastValidationError = validationError;
+      traceStreamFailure(validationError, "MEDIA_CANDIDATE_FAILURE",
+        { sourceRows: sourceRows.length, options: 1, streams: 0 }, candidates[candidateIndex].url);
+    }
+  }
+  if (!selected || !verifiedMedia) {
+    if (lastValidationError) throw lastValidationError;
+    fail("DRAMAWORLD_MEDIA_RESPONSE_INVALID", "selected server did not return a valid video source");
+  }
+
   var streamName = "سيرفر " + (selection.index + 1);
   var stream = {
-    url: selected.url,
+    url: verifiedMedia.url,
     type: selected.type,
     title: streamName,
     name: streamName,
     provider: "DramaWorld",
     headers: playbackHeadersForEmbed(playbackUrl, source)
   };
-  traceStreams("RESOLVE_READY", { sourceRows: sourceRows.length, options: 1, streams: 1 });
+  traceStreams("RESOLVE_READY", { sourceRows: sourceRows.length, options: 1, streams: 1 }, null, {
+    hostUrl: verifiedMedia.hostUrl,
+    httpStatus: verifiedMedia.httpStatus,
+    responseReceived: verifiedMedia.responseReceived,
+    videoExtracted: true
+  });
   if (selected.quality) stream.quality = selected.quality;
   return { streams: [stream] };
 }

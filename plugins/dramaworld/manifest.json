@@ -1,0 +1,86 @@
+{
+  "name": "DramaWorld",
+  "version": "0.3.2",
+  "description": "إضافة DramaWorld لـYume API v2 بعقد المسار المنشور وتحديث مضيف Firebase اختياري.",
+  "apiVersion": 2,
+  "scrapers": [
+    {
+      "id": "dramaworld",
+      "name": "DramaWorld",
+      "description": "Requires an owner-approved public API configuration for external Yume clients.",
+      "version": "0.3.2",
+      "filename": "dramaworld.js",
+      "supportedTypes": ["movie", "tv"],
+      "enabled": true,
+      "autoInstall": false,
+      "hasSettings": true,
+      "contentLanguage": ["ar"],
+      "apiVersion": 2,
+      "capabilities": ["home", "search", "details", "streams"],
+      "catalogs": [
+        {
+          "id": "featured-movies",
+          "type": "movie",
+          "title": "أفلام DramaWorld المميزة",
+          "capabilities": ["home"],
+          "filters": [],
+          "homeOrder": 5,
+          "homeFallback": false,
+          "presentation": { "posterShape": "portrait" }
+        },
+        {
+          "id": "featured-series",
+          "type": "series",
+          "title": "مسلسلات DramaWorld المميزة",
+          "capabilities": ["home"],
+          "filters": [],
+          "homeOrder": 6,
+          "homeFallback": false,
+          "presentation": { "posterShape": "portrait" }
+        },
+        {
+          "id": "movies",
+          "type": "movie",
+          "title": "أفلام DramaWorld",
+          "capabilities": ["home", "browse"],
+          "filters": [
+            { "key": "genre", "kind": "select", "label": "التصنيف", "options": [], "dynamic": true }
+          ],
+          "homeOrder": 10,
+          "homeFallback": false,
+          "presentation": { "posterShape": "portrait" }
+        },
+        {
+          "id": "series",
+          "type": "series",
+          "title": "مسلسلات DramaWorld",
+          "capabilities": ["home", "browse"],
+          "filters": [
+            { "key": "genre", "kind": "select", "label": "التصنيف", "options": [], "dynamic": true }
+          ],
+          "homeOrder": 20,
+          "homeFallback": false,
+          "presentation": { "posterShape": "portrait" }
+        }
+      ],
+      "searchGroups": [
+        {
+          "id": "movies",
+          "title": "أفلام DramaWorld",
+          "types": ["movie"],
+          "pagination": false,
+          "displayType": "movie",
+          "presentation": { "posterShape": "portrait" }
+        },
+        {
+          "id": "series",
+          "title": "مسلسلات DramaWorld",
+          "types": ["series"],
+          "pagination": false,
+          "displayType": "series",
+          "presentation": { "posterShape": "portrait" }
+        }
+      ]
+    }
+  ]
+}

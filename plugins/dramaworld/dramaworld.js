@@ -11,8 +11,12 @@ var MAX_SOURCE_BODY_CHARS = 2 * 1024 * 1024;
 var MAX_SOURCES = 100;
 var MAX_SUBTITLES = 100;
 var MAX_HTTP_BODY_CHARS = 1024 * 1024;
+var MAX_EMBED_BODY_CHARS = 512 * 1024;
 var MAX_REDIRECTS = 3;
 var REQUEST_TIMEOUT_MS = 15000;
+var EMBED_RESOLVE_TIMEOUT_MS = 10000;
+var EMBED_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36";
+var EMBED_ACCEPT_LANGUAGE = "en-US,en;q=0.9";
 var ALLOWED_API_SUFFIX = ".arabypros.com";
 var KNOWN_WORKING_API = "https://dwapp.arabypros.com/api";
 var KNOWN_FALLBACK_APIS = [
@@ -484,6 +488,7 @@ function mapStreams(sourceBody, subtitles) {
       title: serverName,
       name: serverName,
       provider: "DramaWorld",
+      headers: safeSourceHeaders(source),
       subtitles: Array.isArray(subtitles) ? subtitles : []
     };
     var size = text(source.size);
@@ -492,6 +497,222 @@ function mapStreams(sourceBody, subtitles) {
     streams.push(stream);
   });
   return { streams: streams };
+}
+
+function safeSourceIdentifier(source) {
+  if (!isObject(source) || source.id === null || source.id === undefined) return "";
+  var value = typeof source.id === "number" && isFinite(source.id) ? String(source.id) : text(source.id);
+  return value && value.length <= 96 && /^[A-Za-z0-9._:-]+$/.test(value) ? value : "";
+}
+
+function sourceHost(url) {
+  var match = /^https:\/\/([a-z0-9.-]+)(?::[0-9]{1,5})?(?:\/|$)/i.exec(text(url) || "");
+  return match ? match[1].toLowerCase() : "";
+}
+
+function stableSourceFingerprint(source, identity, index) {
+  var material = [
+    identity.kind,
+    identity.id,
+    String(index),
+    safeSourceIdentifier(source),
+    sourceHost(source.url),
+    text(source.type) || "",
+    text(source.name) || text(source.server) || text(source.title) || ""
+  ].join("|");
+  var hash = 2166136261;
+  for (var cursor = 0; cursor < material.length; cursor += 1) {
+    hash = Math.imul(hash ^ material.charCodeAt(cursor), 16777619) >>> 0;
+  }
+  return ("00000000" + hash.toString(16)).slice(-8);
+}
+
+function sourceOptionToken(source, identity, index) {
+  return "dwopt1:" + identity.kind + ":" + identity.id + ":" + index + ":" +
+    stableSourceFingerprint(source, identity, index);
+}
+
+function parseSourceOptionToken(value) {
+  var token = text(value);
+  var match = token && /^dwopt1:(movie|episode):([1-9][0-9]*):([0-9]{1,3}):([0-9a-f]{8})$/i.exec(token);
+  if (!match || Number(match[3]) >= MAX_SOURCES) {
+    fail("DRAMAWORLD_OPTION_TOKEN_INVALID", "selected DramaWorld server is invalid or expired");
+  }
+  return { kind: match[1], id: match[2], index: Number(match[3]), fingerprint: match[4].toLowerCase() };
+}
+
+function mapStreamOptions(sourceRows, identity) {
+  var sources = decodeSourceBody(sourceRows);
+  var seen = Object.create(null);
+  var options = [];
+  sources.forEach(function (source, index) {
+    if (!isObject(source) || source.external === true || options.length >= MAX_SOURCES) return;
+    var url = publicHttpUrl(source.url);
+    if (!url || !/^https:\/\//i.test(url) || seen[url] || classifySource(source)) return;
+    seen[url] = true;
+    var ordinal = options.length + 1;
+    options.push({
+      token: sourceOptionToken(source, identity, index),
+      title: "سيرفر " + ordinal,
+      name: "سيرفر " + ordinal,
+      type: "embed"
+    });
+  });
+  return options;
+}
+
+function qualityRank(value) {
+  var match = /([0-9]{3,4})\s*p?/i.exec(text(value) || "");
+  return match ? Number(match[1]) : 0;
+}
+
+function collectMediaCandidate(value, quality, output) {
+  var rawUrl = typeof value === "string" ? value : (isObject(value) ? text(value.file) || text(value.url) : null);
+  var url = text(rawUrl);
+  if (!url) return;
+  url = url.replace(/\\\//g, "/").replace(/&amp;/gi, "&").replace(/[),;]+$/, "");
+  var direct = classifySource({ url: url, type: "direct" });
+  if (!direct) return;
+  if (output.some(function (entry) { return entry.url === direct.url; })) return;
+  output.push({ url: direct.url, type: direct.type, quality: text(quality) || null, rank: qualityRank(quality) });
+}
+
+function parseMediaJson(value, output, depth) {
+  if (depth > 2 || (!isObject(value) && !Array.isArray(value))) return;
+  if (Array.isArray(value)) {
+    value.forEach(function (entry) { collectMediaCandidate(entry, isObject(entry) ? entry.label || entry.quality : null, output); });
+    return;
+  }
+  if (Array.isArray(value.availableQualities)) {
+    value.availableQualities.forEach(function (entry) {
+      if (isObject(entry)) collectMediaCandidate(entry.url || entry.file, entry.quality || entry.label, output);
+    });
+  }
+  var content = Array.isArray(value.filtered_content) ? value.filtered_content : null;
+  var qualities = Array.isArray(value.Quality) ? value.Quality : (Array.isArray(value.qualities) ? value.qualities : []);
+  if (content) content.forEach(function (entry, index) {
+    collectMediaCandidate(entry, qualities[index] || (isObject(entry) ? entry.label || entry.quality : null), output);
+  });
+  [value.sources, value.links].forEach(function (collection) {
+    if (Array.isArray(collection)) collection.forEach(function (entry) {
+      collectMediaCandidate(entry, isObject(entry) ? entry.label || entry.quality : null, output);
+    });
+  });
+  collectMediaCandidate(value.file || value.url, value.quality || value.label, output);
+  if (isObject(value.data) || Array.isArray(value.data)) parseMediaJson(value.data, output, depth + 1);
+}
+
+function parseDirectMediaCandidates(body) {
+  if (typeof body !== "string" || !body.trim() || body.length > MAX_EMBED_BODY_CHARS) return [];
+  if (/(?:cf-mitigated|challenge-platform|__cf_chl|just a moment|checking your browser)/i.test(body.slice(0, 8192))) {
+    fail("DRAMAWORLD_HOST_CHALLENGE", "selected server returned a browser or access challenge");
+  }
+  var output = [];
+  var trimmed = body.replace(/\\\//g, "/").replace(/&amp;/gi, "&").trim();
+  if (/^[\[{]/.test(trimmed)) {
+    try { parseMediaJson(JSON.parse(trimmed), output, 0); } catch (error) {
+      if (error && error.code) throw error;
+    }
+  }
+  var filePattern = /(?:file|url)\s*[:=]\s*["'](https:\/\/[^"']+)["']/ig;
+  var match;
+  while ((match = filePattern.exec(trimmed)) !== null) collectMediaCandidate(match[1], null, output);
+  var urlPattern = /(https:\/\/[^\s"'<>\\]+?\.(?:m3u8|mp4)(?:\?[^\s"'<>\\]*)?)/ig;
+  while ((match = urlPattern.exec(trimmed)) !== null) collectMediaCandidate(match[1], null, output);
+  return output.sort(function (left, right) {
+    return right.rank - left.rank;
+  });
+}
+
+function safeEmbedRedirect(location, currentUrl) {
+  var value = text(location);
+  if (!value || /[\u0000-\u0020\\]/.test(value)) {
+    fail("DRAMAWORLD_EMBED_REDIRECT_REJECTED", "selected server redirected to an invalid address");
+  }
+  var target;
+  if (/^https:\/\//i.test(value)) target = value;
+  else if (value.charAt(0) === "/" && value.charAt(1) !== "/") target = urlOrigin(currentUrl) + value;
+  else fail("DRAMAWORLD_EMBED_REDIRECT_REJECTED", "selected server used an unsupported redirect");
+  if (!publicHttpUrl(target) || !/^https:\/\//i.test(target)) {
+    fail("DRAMAWORLD_EMBED_REDIRECT_REJECTED", "selected server redirect was not a public HTTPS address");
+  }
+  return target;
+}
+
+async function fetchEmbedBody(url) {
+  var currentUrl = url;
+  for (var redirectCount = 0; redirectCount <= MAX_REDIRECTS; redirectCount += 1) {
+    var response;
+    try {
+      response = await fetch(currentUrl, {
+        method: "GET",
+        headers: {
+          "Accept": "application/json, text/html;q=0.9, */*;q=0.5",
+          "User-Agent": EMBED_USER_AGENT,
+          "Accept-Language": EMBED_ACCEPT_LANGUAGE
+        },
+        redirect: "manual",
+        timeoutMs: EMBED_RESOLVE_TIMEOUT_MS
+      });
+    } catch (error) {
+      if (isCancellation(error)) throw error;
+      if (error && error.name === "TimeoutError") fail("DRAMAWORLD_EMBED_TIMEOUT", "selected server request timed out");
+      fail("DRAMAWORLD_EMBED_NETWORK_ERROR", "selected server could not be reached");
+    }
+    var status = Number(response && response.status) || 0;
+    var location = response && response.headers && response.headers.get("location");
+    if (status >= 300 && status < 400) {
+      if (redirectCount >= MAX_REDIRECTS) fail("DRAMAWORLD_EMBED_REDIRECT_LIMIT", "selected server redirected too many times");
+      currentUrl = safeEmbedRedirect(location, currentUrl);
+      continue;
+    }
+    if (response && response.networkError) fail("DRAMAWORLD_EMBED_NETWORK_ERROR", "selected server could not be reached");
+    if (status === 401 || status === 403) fail("DRAMAWORLD_EMBED_ACCESS_DENIED", "selected server denied the request");
+    if (!response || response.ok === false || status < 200 || status >= 300) {
+      fail("DRAMAWORLD_EMBED_HTTP_ERROR", "selected server returned HTTP " + (status || "error"));
+    }
+    var finalUrl = publicHttpUrl(response.url || currentUrl);
+    if (!finalUrl || !/^https:\/\//i.test(finalUrl)) {
+      fail("DRAMAWORLD_EMBED_REDIRECT_REJECTED", "selected server returned an unsafe address");
+    }
+    var body = await response.text();
+    if (typeof body !== "string" || !body) fail("DRAMAWORLD_EMBED_RESPONSE_INVALID", "selected server returned no content");
+    if (body.length > MAX_EMBED_BODY_CHARS || body.indexOf("...[truncated]") >= 0) {
+      fail("DRAMAWORLD_EMBED_RESPONSE_TOO_LARGE", "selected server response exceeded the safe size limit");
+    }
+    return { body: body, finalUrl: finalUrl };
+  }
+  fail("DRAMAWORLD_EMBED_REDIRECT_LIMIT", "selected server redirected too many times");
+}
+
+function playbackHeadersForEmbed(embedUrl, source) {
+  var origin = urlOrigin(embedUrl);
+  if (!origin) fail("DRAMAWORLD_EMBED_URL_INVALID", "selected server address is invalid");
+  var headers = {
+    "User-Agent": EMBED_USER_AGENT,
+    "Accept-Language": EMBED_ACCEPT_LANGUAGE,
+    "Referer": origin + "/"
+  };
+  var trustedHeaders = safeSourceHeaders(source);
+  Object.keys(trustedHeaders).forEach(function (key) { headers[key] = trustedHeaders[key]; });
+  return headers;
+}
+
+function safeSourceHeaders(source) {
+  var inputHeaders = isObject(source.headers) ? source.headers : {};
+  var headers = {};
+  Object.keys(inputHeaders).forEach(function (key) {
+    var normalized = key.toLowerCase();
+    if (["user-agent", "accept-language", "referer", "origin"].indexOf(normalized) < 0) return;
+    var value = text(inputHeaders[key]);
+    if (!value || value.length > 2048 || /[\r\n\u0000]/.test(value)) return;
+    if ((normalized === "referer" || normalized === "origin") &&
+        (!/^https:\/\//i.test(value) || !publicHttpUrl(value))) return;
+    var canonical = normalized === "user-agent" ? "User-Agent" : normalized === "accept-language" ? "Accept-Language" :
+      normalized === "referer" ? "Referer" : "Origin";
+    headers[canonical] = value;
+  });
+  return headers;
 }
 
 function approvedBaseUrl(value, settingName) {
@@ -993,11 +1214,61 @@ async function getStreams(args) {
     if (isCancellation(subtitleError)) throw subtitleError;
     if (typeof console !== "undefined" && console.warn) console.warn("DramaWorld subtitle list unavailable");
   }
-  return mapStreams(sourceRows, subtitles);
+  var result = mapStreams(sourceRows, subtitles);
+  result.options = mapStreamOptions(sourceRows, identity);
+  if (!result.streams.length && !result.options.length) {
+    fail("DRAMAWORLD_NO_SUPPORTED_SOURCES", sourceRows.length
+      ? "DramaWorld returned sources, but none were safe HTTPS server links"
+      : "DramaWorld returned no sources for this title");
+  }
+  return result;
 }
 
-function resolveStreamOption() {
-  fail("DRAMAWORLD_STREAM_RESOLUTION_UNSUPPORTED", "only direct HLS and MP4 sources are supported; embed resolution is not implemented");
+async function resolveStreamOption(args) {
+  args = isObject(args) ? args : {};
+  var identity = parseNativeId(args.id || args.nativeId, ["movie", "episode"]);
+  var selection = parseSourceOptionToken(args.token);
+  if (selection.kind !== identity.kind || selection.id !== identity.id) {
+    fail("DRAMAWORLD_OPTION_ID_MISMATCH", "selected server belongs to a different DramaWorld title");
+  }
+
+  var config = await readConfig();
+  var route = identity.kind === "movie" ? "movie/source/by/" : "episode/source/by/";
+  var sourceRows = await requestDecodedSources(config, endpointPath(config, route + identity.id));
+  var source = sourceRows[selection.index];
+  if (!isObject(source) || source.external === true ||
+      stableSourceFingerprint(source, identity, selection.index) !== selection.fingerprint) {
+    fail("DRAMAWORLD_OPTION_EXPIRED", "DramaWorld server list changed; refresh the source list and try again");
+  }
+
+  var embedUrl = publicHttpUrl(source.url);
+  if (!embedUrl || !/^https:\/\//i.test(embedUrl)) {
+    fail("DRAMAWORLD_EMBED_URL_INVALID", "selected DramaWorld server does not provide a public HTTPS address");
+  }
+
+  var candidates = parseDirectMediaCandidates(JSON.stringify(source));
+  var playbackUrl = embedUrl;
+  if (!candidates.length) {
+    var embedResponse = await fetchEmbedBody(embedUrl);
+    playbackUrl = embedResponse.finalUrl;
+    candidates = parseDirectMediaCandidates(embedResponse.body);
+  }
+  if (!candidates.length) {
+    fail("DRAMAWORLD_EMBED_UNRESOLVED", "selected server returned an embed page without a directly readable HLS or MP4 source");
+  }
+
+  var selected = candidates[0];
+  var streamName = "سيرفر " + (selection.index + 1);
+  var stream = {
+    url: selected.url,
+    type: selected.type,
+    title: streamName,
+    name: streamName,
+    provider: "DramaWorld",
+    headers: playbackHeadersForEmbed(playbackUrl, source)
+  };
+  if (selected.quality) stream.quality = selected.quality;
+  return { streams: [stream] };
 }
 
 module.exports = {
@@ -1020,6 +1291,11 @@ module.exports = {
     decodeSourceBody: decodeSourceBody,
     classifySource: classifySource,
     mapStreams: mapStreams,
+    mapStreamOptions: mapStreamOptions,
+    sourceOptionToken: sourceOptionToken,
+    parseSourceOptionToken: parseSourceOptionToken,
+    stableSourceFingerprint: stableSourceFingerprint,
+    parseDirectMediaCandidates: parseDirectMediaCandidates,
     mapSubtitles: mapSubtitles,
     parseExplicitNumber: parseExplicitNumber,
     publicHttpUrl: publicHttpUrl,

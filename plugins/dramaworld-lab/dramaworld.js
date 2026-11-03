@@ -4,7 +4,7 @@
 // CloudStream DramaWorld client. They are API route identifiers, not session
 // credentials. Firebase remains optional and only updates the content hosts.
 var PLUGIN_ID = "dramaworld-resolver-lab";
-var PLUGIN_VERSION = "0.3.5-lab.3";
+var PLUGIN_VERSION = "0.3.5-lab.4";
 var FIREBASE_PROJECT_ID = "alamaldrama2022v2";
 var API_ROUTE_KEY = "4F5A9C3D9A86FA54EACEDDD635185";
 var API_ROUTE_ID = "d506abfd-9fe2-4b71-b979-feff21bcad13";
@@ -606,6 +606,32 @@ function mapSubtitles(value) {
     return Number(rightArabic) - Number(leftArabic);
   });
   return subtitles;
+}
+
+async function fetchSubtitlesForIdentity(config, identity) {
+  var startedAt = Date.now();
+  var subtitleRoute = identity.kind === "movie"
+    ? "subtitles/by/movie/" + identity.id
+    : "subtitles/by/episode/" + identity.id;
+  try {
+    var rawSubtitles = await requestValidatedJson(config, endpointPath(config, subtitleRoute), function (value) {
+      var data = unwrapData(value);
+      return Array.isArray(value) || Array.isArray(data);
+    }, "DRAMAWORLD_SUBTITLES_INVALID", "DramaWorld returned invalid subtitle data");
+    return { subtitles: mapSubtitles(rawSubtitles), elapsedMs: Date.now() - startedAt, available: true };
+  } catch (subtitleError) {
+    if (isCancellation(subtitleError)) throw subtitleError;
+    if (typeof console !== "undefined" && console.warn) console.warn("DramaWorld subtitle list unavailable");
+    return { subtitles: [], elapsedMs: Date.now() - startedAt, available: false };
+  }
+}
+
+function attachSubtitles(streams, subtitles) {
+  if (!Array.isArray(streams) || !Array.isArray(subtitles) || !subtitles.length) return streams;
+  streams.forEach(function (stream) {
+    if (isObject(stream)) stream.subtitles = subtitles;
+  });
+  return streams;
 }
 
 function mapStreams(sourceBody, subtitles) {
@@ -1410,7 +1436,7 @@ function homeCatalogItems(home, catalogId) {
 
 function onSettings() {
   return [
-    { type: "header", label: "DramaWorld Resolver Lab · 0.3.5-lab.3" },
+    { type: "header", label: "DramaWorld Resolver Lab · 0.3.5-lab.4" },
     { type: "toggle", key: "localPackedResolver", label: "تجربة المحلّل المحلي لصفحات Embed", defaultValue: true, description: "يعمل بعد فشل المسار المباشر القديم. يفك Packer نصياً ولا ينفّذ JavaScript، ولا يستخدم WebView أو خدمة استخراج خارجية." },
     { type: "toggle", key: "debugResolverDiagnostics", label: "تشخيص Debug منقّح", defaultValue: false, description: "سجلات اختيارية لاسم المضيف والمرحلة والحالة ونوع الاستجابة والزمن والعدادات فقط؛ لا تسجل الروابط أو Query Parameters أو Cookies أو محتوى الصفحة. فعّلها يدوياً أثناء اختبار نسخة Debug فقط." },
     { type: "info", label: "هذه نسخة مستقلة بمعرّف تجريبي. تستخدم مضيف API المعروف فقط؛ تحديث Remote Config الأصلي يتطلب موصل Yume الموثوق الخاص بإصدار DramaWorld المنشور." }
@@ -1520,7 +1546,10 @@ async function getDetails(args) {
 async function getStreams(args) {
   args = isObject(args) ? args : {};
   var identity = parseNativeId(args.id || args.nativeId, ["movie", "episode"]);
+  var configStartedAt = Date.now();
   var config = await readConfig();
+  traceDetailed("CONFIG_RESULT", { sourceRows: 0, options: 0, streams: 0 }, null,
+    { elapsedMs: Date.now() - configStartedAt });
   var route = identity.kind === "movie" ? "movie/source/by/" : "episode/source/by/";
   var apiStartedAt = Date.now();
   var sourceRows;
@@ -1531,34 +1560,25 @@ async function getStreams(args) {
     throw sourceError;
   }
   var apiMs = Date.now() - apiStartedAt;
-  var subtitleRoute = identity.kind === "movie"
-    ? "subtitles/by/movie/" + identity.id
-    : "subtitles/by/episode/" + identity.id;
-  var subtitles = [];
-  try {
-    var rawSubtitles = await requestValidatedJson(config, endpointPath(config, subtitleRoute), function (value) {
-      var data = unwrapData(value);
-      return Array.isArray(value) || Array.isArray(data);
-    }, "DRAMAWORLD_SUBTITLES_INVALID", "DramaWorld returned invalid subtitle data");
-    subtitles = mapSubtitles(rawSubtitles);
-  } catch (subtitleError) {
-    if (isCancellation(subtitleError)) throw subtitleError;
-    if (typeof console !== "undefined" && console.warn) console.warn("DramaWorld subtitle list unavailable");
-  }
   var parsingStartedAt = Date.now();
-  var result = mapStreams(sourceRows, subtitles);
   var options = mapStreamOptions(sourceRows, identity);
   if (args.mode === "options") {
     if (!options.length) {
       var optionFailure = sourceRows.length ? "DRAMAWORLD_NO_SUPPORTED_SOURCES" : "DRAMAWORLD_NO_SOURCES";
-      traceStreams("OPTIONS_EMPTY", { sourceRows: sourceRows.length, options: 0, streams: result.streams.length }, optionFailure);
+      traceStreams("OPTIONS_EMPTY", { sourceRows: sourceRows.length, options: 0, streams: 0 }, optionFailure);
       fail(optionFailure, sourceRows.length
         ? "DramaWorld returned sources, but none were safe HTTPS server links"
         : "DramaWorld returned no sources for this title");
     }
-    traceStreams("OPTIONS_READY", { sourceRows: sourceRows.length, options: options.length, streams: result.streams.length });
+    traceDetailed("SOURCE_LIST_RESULT", { sourceRows: sourceRows.length, options: options.length, streams: 0 }, null,
+      { elapsedMs: apiMs });
+    traceStreams("OPTIONS_READY", { sourceRows: sourceRows.length, options: options.length, streams: 0 });
     return { options: options, timing: { apiMs: apiMs, parsingMs: Date.now() - parsingStartedAt } };
   }
+  var subtitleResult = await fetchSubtitlesForIdentity(config, identity);
+  traceDetailed("SUBTITLES_RESULT", { sourceRows: sourceRows.length, options: options.length, streams: 0 },
+    subtitleResult.available ? null : "DRAMAWORLD_SUBTITLES_UNAVAILABLE", { elapsedMs: subtitleResult.elapsedMs });
+  var result = mapStreams(sourceRows, subtitleResult.subtitles);
   result.options = options;
   result.timing = { apiMs: apiMs, parsingMs: Date.now() - parsingStartedAt };
   if (!result.streams.length && !result.options.length) {
@@ -1601,9 +1621,16 @@ function isHlsPlaylist(body, contentType) {
 }
 
 function streamsFromHlsPlaylist(body, manifestUrl, playbackUrl, baseHeaders, sourceIndex, fallbackQuality) {
+  var startedAt = Date.now();
   var resolver = YUME_DRAMAWORLD_LOCAL_RESOLVER;
-  if (!resolver || typeof resolver.parseHlsMaster !== "function" || !isHlsPlaylist(body)) return [];
+  if (!resolver || typeof resolver.parseHlsMaster !== "function" || !isHlsPlaylist(body)) {
+    traceDetailed("HLS_MASTER_RESULT", { options: 1, streams: 0 }, "HLS_PLAYLIST_INVALID",
+      { hostUrl: manifestUrl, elapsedMs: Date.now() - startedAt });
+    return [];
+  }
   var variants = resolver.parseHlsMaster(body, manifestUrl, {});
+  traceDetailed("HLS_MASTER_RESULT", { options: 1, streams: variants.length }, null,
+    { hostUrl: manifestUrl, elapsedMs: Date.now() - startedAt });
   var hasVariants = variants.length > 0;
   var mediaRows = hasVariants ? variants : [{ url: manifestUrl, type: "hls", quality: text(fallbackQuality) }];
   var output = [];
@@ -1713,11 +1740,15 @@ async function resolveEmbedLocally(embedResponse, sourceIndex, source, directCan
   }
   var family = resolver.familyFromUrl(familyUrl);
   var candidateCount = 0;
+  var parseStartedAt = Date.now();
   try {
     candidateCount = hasEmbedBody && typeof resolver.parseCandidates === "function"
       ? resolver.parseCandidates(response.body, resolverUrl, {}).length
       : directCandidate ? 1 : 0;
   } catch (_) { candidateCount = directCandidate ? 1 : 0; }
+  traceDetailed("LOCAL_PARSE_RESULT", { options: 1, streams: 0 },
+    candidateCount ? null : "NO_MEDIA_CANDIDATE",
+    { hostUrl: familyUrl, candidateCount: candidateCount, elapsedMs: Date.now() - parseStartedAt });
   var resolverStartedAt = Date.now();
   var mediaDiagnostics = [];
   traceStreams("LOCAL_RESOLVER_START", { options: 1, streams: 0 }, null, {
@@ -1849,15 +1880,25 @@ async function resolveStreamOption(args) {
     throw identityError;
   }
 
+  var configStartedAt = Date.now();
   var config = await readConfig();
+  traceDetailed("CONFIG_RESULT", { sourceRows: 0, options: 1, streams: 0 }, null,
+    { elapsedMs: Date.now() - configStartedAt });
   var route = identity.kind === "movie" ? "movie/source/by/" : "episode/source/by/";
   var sourceRows;
+  var subtitlePromise = fetchSubtitlesForIdentity(config, identity);
+  var sourceStartedAt = Date.now();
   try {
     sourceRows = await requestDecodedSources(config, endpointPath(config, route + identity.id));
   } catch (sourceError) {
     traceStreams("RESOLVE_API_FAILURE", {}, sourceError && sourceError.code || "DRAMAWORLD_NETWORK_ERROR");
     throw sourceError;
   }
+  var sourceElapsedMs = Date.now() - sourceStartedAt;
+  var subtitleResult = await subtitlePromise;
+  traceDetailed("RESOLVE_INPUTS_READY", { sourceRows: sourceRows.length, options: 1, streams: 0 },
+    subtitleResult.available ? null : "DRAMAWORLD_SUBTITLES_UNAVAILABLE",
+    { elapsedMs: Math.max(sourceElapsedMs, subtitleResult.elapsedMs) });
   var source = sourceRows[selection.index];
   if (!isObject(source) || source.external === true ||
       stableSourceFingerprint(source, identity, selection.index) !== selection.fingerprint) {
@@ -1904,7 +1945,7 @@ async function resolveStreamOption(args) {
           hostUrl: embedResponse.finalUrl, httpStatus: embedResponse.httpStatus,
           responseReceived: embedResponse.responseReceived, videoExtracted: true
         });
-        return { streams: playlistStreams };
+        return { streams: attachSubtitles(playlistStreams, subtitleResult.subtitles) };
       }
     }
     var embedParseStartedAt = Date.now();
@@ -1940,7 +1981,7 @@ async function resolveStreamOption(args) {
           httpStatus: embedResponse && embedResponse.httpStatus || null,
           responseReceived: !!(embedResponse && embedResponse.responseReceived), videoExtracted: true
         });
-        return { streams: localResult.streams };
+        return { streams: attachSubtitles(localResult.streams, subtitleResult.subtitles) };
       }
     }
     var unresolvedError;
@@ -2000,7 +2041,7 @@ async function resolveStreamOption(args) {
           httpStatus: embedResponse && embedResponse.httpStatus || null,
           responseReceived: !!(embedResponse && embedResponse.responseReceived), videoExtracted: true
         });
-        return { streams: fallbackResult.streams };
+        return { streams: attachSubtitles(fallbackResult.streams, subtitleResult.subtitles) };
       }
       if (fallbackResult && fallbackResult.errorCode) {
         traceStreams("LOCAL_RESOLVER_FALLBACK_FAILED", { options: 1, streams: 0 }, fallbackResult.errorCode, {
@@ -2031,7 +2072,7 @@ async function resolveStreamOption(args) {
         hostUrl: verifiedMedia.hostUrl, httpStatus: verifiedMedia.httpStatus,
         responseReceived: verifiedMedia.responseReceived, videoExtracted: true
       });
-      return { streams: hlsStreams };
+      return { streams: attachSubtitles(hlsStreams, subtitleResult.subtitles) };
     }
   }
 
@@ -2053,7 +2094,7 @@ async function resolveStreamOption(args) {
     videoExtracted: true
   });
   if (selected.quality) stream.quality = selected.quality;
-  return { streams: [stream] };
+  return { streams: attachSubtitles([stream], subtitleResult.subtitles) };
 }
 
 module.exports = {

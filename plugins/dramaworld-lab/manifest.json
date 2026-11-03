@@ -1,6 +1,6 @@
 {
   "name": "DramaWorld Resolver Lab",
-  "version": "0.3.5-lab.3",
+  "version": "0.3.5-lab.4",
   "description": "نسخة مختبر مستقلة من DramaWorld 0.3.5 مع محلّل Embed محلي اختياري.",
   "apiVersion": 2,
   "scrapers": [
@@ -8,7 +8,7 @@
       "id": "dramaworld-resolver-lab",
       "name": "DramaWorld Resolver Lab",
       "description": "Experimental local Packer/JWPlayer fallback based on DramaWorld 0.3.5.",
-      "version": "0.3.5-lab.3",
+      "version": "0.3.5-lab.4",
       "filename": "dramaworld.js",
       "supportedTypes": [
         "movie",

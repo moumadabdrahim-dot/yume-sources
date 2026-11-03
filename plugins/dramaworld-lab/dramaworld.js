@@ -4,7 +4,7 @@
 // CloudStream DramaWorld client. They are API route identifiers, not session
 // credentials. Firebase remains optional and only updates the content hosts.
 var PLUGIN_ID = "dramaworld-resolver-lab";
-var PLUGIN_VERSION = "0.3.5-lab.2";
+var PLUGIN_VERSION = "0.3.5-lab.3";
 var FIREBASE_PROJECT_ID = "alamaldrama2022v2";
 var API_ROUTE_KEY = "4F5A9C3D9A86FA54EACEDDD635185";
 var API_ROUTE_ID = "d506abfd-9fe2-4b71-b979-feff21bcad13";
@@ -46,13 +46,86 @@ function traceStreams(stage, counts, failureCode, diagnostic) {
     streams: Math.max(0, Number(counts && counts.streams) || 0)
   };
   if (failureCode) event.failureCode = String(failureCode).replace(/[^A-Z0-9_]/g, "").slice(0, 64);
-  var host = sourceHost(diagnostic.hostUrl);
+  var host = safeDiagnosticHost(diagnostic.host) || sourceHost(diagnostic.hostUrl);
   if (host) event.host = host;
   var status = Number(diagnostic.httpStatus);
   if (isFinite(status) && status >= 0 && status <= 599) event.httpStatus = Math.floor(status);
   if (typeof diagnostic.responseReceived === "boolean") event.responseReceived = diagnostic.responseReceived;
   if (typeof diagnostic.videoExtracted === "boolean") event.videoExtracted = diagnostic.videoExtracted;
+  if (diagnosticsEnabled()) {
+    var mediaHost = safeDiagnosticHost(diagnostic.mediaHost || diagnostic.host);
+    if (mediaHost) event.mediaHost = mediaHost;
+    var mediaStatus = diagnosticNumber(diagnostic.mediaHttpStatus, 0, 599);
+    if (mediaStatus !== null) event.mediaHttpStatus = mediaStatus;
+    var contentType = diagnosticContentType(diagnostic.contentType);
+    if (contentType) event.contentType = contentType;
+    var mediaContentType = diagnosticContentType(diagnostic.mediaContentType);
+    if (mediaContentType) event.mediaContentType = mediaContentType;
+    var responseKind = diagnosticResponseKind(diagnostic.responseKind);
+    if (responseKind) event.responseKind = responseKind;
+    var mediaResponseKind = diagnosticResponseKind(diagnostic.mediaResponseKind);
+    if (mediaResponseKind) event.mediaResponseKind = mediaResponseKind;
+    ["candidateCount", "verifiedCount", "candidateIndex", "elapsedMs", "mediaElapsedMs"]
+      .forEach(function (key) {
+        var max = key.indexOf("Count") >= 0 ? MAX_SOURCES : key.indexOf("Index") >= 0 ? MAX_SOURCES - 1 : 600000;
+        var value = diagnosticNumber(diagnostic[key], 0, max);
+        if (value !== null) event[key] = value;
+      });
+    if (diagnostic.candidateFailureCode) {
+      event.candidateFailureCode = String(diagnostic.candidateFailureCode).replace(/[^A-Z0-9_]/g, "").slice(0, 64);
+    }
+  }
   console.log("DRAMAWORLD_STREAM_TRACE " + JSON.stringify(event));
+}
+
+function diagnosticsEnabled() {
+  var settings = typeof SCRAPER_SETTINGS !== "undefined" && isObject(SCRAPER_SETTINGS)
+    ? SCRAPER_SETTINGS : {};
+  return settings.debugResolverDiagnostics === true;
+}
+
+function diagnosticNumber(value, minimum, maximum) {
+  var number = Number(value);
+  return isFinite(number) && number >= minimum && number <= maximum ? Math.floor(number) : null;
+}
+
+function safeDiagnosticHost(value) {
+  if (typeof value !== "string") return null;
+  var host = value.toLowerCase().replace(/\.$/, "");
+  return host.length <= 253 && /^[a-z0-9.-]+$/.test(host) && host.indexOf("..") < 0 ? host : null;
+}
+
+function diagnosticContentType(value) {
+  if (typeof value !== "string") return null;
+  var mime = value.split(";")[0].trim().toLowerCase();
+  var allowed = ["text/html", "application/xhtml+xml", "application/json", "text/plain",
+    "application/vnd.apple.mpegurl", "application/x-mpegurl", "video/mp4", "application/octet-stream"];
+  return allowed.indexOf(mime) >= 0 ? mime : (mime ? "other" : null);
+}
+
+function diagnosticResponseKind(value) {
+  return ["html", "hls", "mp4", "unknown"].indexOf(value) >= 0 ? value : null;
+}
+
+function responseKindFromBody(contentType, body) {
+  if (/^(?:text\/html|application\/xhtml\+xml)$/i.test(diagnosticContentType(contentType) || "") ||
+      (typeof body === "string" && /^\s*(?:<!doctype\s+html|<html|<body)\b/i.test(body.slice(0, 1024)))) return "html";
+  if (typeof body === "string" && /^\s*#EXTM3U(?:\s|$)/i.test(body)) return "hls";
+  if (typeof body === "string" && body.length >= 8 && body.slice(4, 8) === "ftyp") return "mp4";
+  if (body && typeof body.byteLength === "number" && typeof Uint8Array !== "undefined") {
+    var bytes = new Uint8Array(body, 0, Math.min(body.byteLength, 1024));
+    var prefix = "";
+    for (var index = 0; index < Math.min(bytes.length, 1024); index += 1) prefix += String.fromCharCode(bytes[index]);
+    if (/^\s*(?:<!doctype\s+html|<html|<body)\b/i.test(prefix)) return "html";
+    if (/^\s*#EXTM3U(?:\s|$)/i.test(prefix)) return "hls";
+    if (bytes.length >= 8 && bytes[4] === 0x66 && bytes[5] === 0x74 && bytes[6] === 0x79 && bytes[7] === 0x70) return "mp4";
+  }
+  return "unknown";
+}
+
+function traceDetailed(stage, counts, failureCode, diagnostic) {
+  if (!diagnosticsEnabled()) return;
+  traceStreams(stage, counts, failureCode, diagnostic);
 }
 
 function failStream(code, message, diagnostic) {
@@ -64,6 +137,11 @@ function failStream(code, message, diagnostic) {
       httpStatus: Number.isFinite(Number(diagnostic.httpStatus)) ? Number(diagnostic.httpStatus) : null,
       responseReceived: diagnostic.responseReceived === true
     };
+    ["contentType", "responseKind", "mediaHost", "mediaContentType", "mediaResponseKind",
+      "candidateCount", "verifiedCount", "candidateIndex", "elapsedMs", "mediaElapsedMs", "mediaHttpStatus"]
+      .forEach(function (key) {
+        if (diagnostic[key] !== undefined && diagnostic[key] !== null) error.diagnostic[key] = diagnostic[key];
+      });
   }
   throw error;
 }
@@ -74,7 +152,19 @@ function traceStreamFailure(error, stage, counts, fallbackHostUrl) {
     hostUrl: diagnostic.hostUrl || fallbackHostUrl,
     httpStatus: diagnostic.httpStatus,
     responseReceived: diagnostic.responseReceived === true,
-    videoExtracted: false
+    videoExtracted: false,
+    contentType: diagnostic.contentType,
+    responseKind: diagnostic.responseKind,
+    mediaHost: diagnostic.mediaHost,
+    mediaHttpStatus: diagnostic.mediaHttpStatus,
+    mediaContentType: diagnostic.mediaContentType,
+    mediaResponseKind: diagnostic.mediaResponseKind,
+    candidateCount: diagnostic.candidateCount,
+    verifiedCount: diagnostic.verifiedCount,
+    candidateIndex: diagnostic.candidateIndex,
+    candidateFailureCode: error && error.code,
+    elapsedMs: diagnostic.elapsedMs,
+    mediaElapsedMs: diagnostic.mediaElapsedMs
   });
 }
 
@@ -688,7 +778,9 @@ function safeEmbedRedirect(location, currentUrl) {
 }
 
 async function fetchEmbedBody(url) {
+  var stageStartedAt = Date.now();
   var currentUrl = url;
+  traceDetailed("EMBED_FETCH_START", { options: 1, streams: 0 }, null, { hostUrl: currentUrl, elapsedMs: 0 });
   for (var redirectCount = 0; redirectCount <= MAX_REDIRECTS; redirectCount += 1) {
     var response;
     try {
@@ -709,20 +801,22 @@ async function fetchEmbedBody(url) {
         : "DRAMAWORLD_EMBED_NETWORK_ERROR";
       failStream(networkCode,
         networkCode === "DRAMAWORLD_EMBED_TIMEOUT" ? "selected server request timed out" : "selected server could not be reached",
-        { hostUrl: currentUrl, httpStatus: 0, responseReceived: false });
+        { hostUrl: currentUrl, httpStatus: 0, responseReceived: false, elapsedMs: Date.now() - stageStartedAt,
+          responseKind: "unknown" });
     }
     var status = Number(response && response.status) || 0;
     var location = response && response.headers && response.headers.get("location");
     if (status >= 300 && status < 400) {
       if (redirectCount >= MAX_REDIRECTS) {
         failStream("DRAMAWORLD_EMBED_REDIRECT_LIMIT", "selected server redirected too many times",
-          { hostUrl: currentUrl, httpStatus: status, responseReceived: true });
+          { hostUrl: currentUrl, httpStatus: status, responseReceived: true, elapsedMs: Date.now() - stageStartedAt });
       }
       try {
         currentUrl = safeEmbedRedirect(location, currentUrl);
       } catch (error) {
         if (error && !error.diagnostic) {
-          error.diagnostic = { hostUrl: currentUrl, httpStatus: status, responseReceived: true };
+          error.diagnostic = { hostUrl: currentUrl, httpStatus: status, responseReceived: true,
+            elapsedMs: Date.now() - stageStartedAt };
         }
         throw error;
       }
@@ -730,35 +824,45 @@ async function fetchEmbedBody(url) {
     }
     if (response && response.networkError) {
       failStream("DRAMAWORLD_EMBED_NETWORK_ERROR", "selected server could not be reached",
-        { hostUrl: currentUrl, httpStatus: 0, responseReceived: false });
+        { hostUrl: currentUrl, httpStatus: 0, responseReceived: false, elapsedMs: Date.now() - stageStartedAt,
+          responseKind: "unknown" });
     }
     if (status === 401 || status === 403) {
       failStream("DRAMAWORLD_EMBED_ACCESS_DENIED", "selected server denied the request",
-        { hostUrl: currentUrl, httpStatus: status, responseReceived: true });
+        { hostUrl: currentUrl, httpStatus: status, responseReceived: true, elapsedMs: Date.now() - stageStartedAt,
+          contentType: response.headers && response.headers.get("content-type"), responseKind: "unknown" });
     }
     if (!response || response.ok === false || status < 200 || status >= 300) {
       failStream("DRAMAWORLD_EMBED_HTTP_ERROR", "selected server returned HTTP " + (status || "error"),
-        { hostUrl: currentUrl, httpStatus: status, responseReceived: status > 0 });
+        { hostUrl: currentUrl, httpStatus: status, responseReceived: status > 0, elapsedMs: Date.now() - stageStartedAt,
+          contentType: response && response.headers && response.headers.get("content-type"), responseKind: "unknown" });
     }
     var finalUrl = publicHttpUrl(response.url || currentUrl);
     if (!finalUrl || !/^https:\/\//i.test(finalUrl)) {
       failStream("DRAMAWORLD_EMBED_REDIRECT_REJECTED", "selected server returned an unsafe address",
-        { hostUrl: currentUrl, httpStatus: status, responseReceived: true });
+        { hostUrl: currentUrl, httpStatus: status, responseReceived: true, elapsedMs: Date.now() - stageStartedAt });
     }
     var body = await response.text();
     var contentType = text(response.headers && response.headers.get("content-type")) || "";
+    var responseKind = responseKindFromBody(contentType, body);
     if (typeof body !== "string" || !body) {
       failStream("DRAMAWORLD_EMBED_RESPONSE_INVALID", "selected server returned no content",
-        { hostUrl: finalUrl, httpStatus: status, responseReceived: true });
+        { hostUrl: finalUrl, httpStatus: status, responseReceived: true, contentType: contentType,
+          responseKind: responseKind, elapsedMs: Date.now() - stageStartedAt });
     }
     if (body.length > MAX_EMBED_BODY_CHARS || body.indexOf("...[truncated]") >= 0) {
       failStream("DRAMAWORLD_EMBED_RESPONSE_TOO_LARGE", "selected server response exceeded the safe size limit",
-        { hostUrl: finalUrl, httpStatus: status, responseReceived: true });
+        { hostUrl: finalUrl, httpStatus: status, responseReceived: true, contentType: contentType,
+          responseKind: responseKind, elapsedMs: Date.now() - stageStartedAt });
     }
+    traceDetailed("EMBED_FETCH_RESULT", { options: 1, streams: 0 }, null, {
+      hostUrl: finalUrl, httpStatus: status, responseReceived: true, contentType: contentType,
+      responseKind: responseKind, elapsedMs: Date.now() - stageStartedAt
+    });
     return { body: body, finalUrl: finalUrl, httpStatus: status, contentType: contentType, responseReceived: true };
   }
   failStream("DRAMAWORLD_EMBED_REDIRECT_LIMIT", "selected server redirected too many times",
-    { hostUrl: currentUrl, httpStatus: 0, responseReceived: false });
+    { hostUrl: currentUrl, httpStatus: 0, responseReceived: false, elapsedMs: Date.now() - stageStartedAt });
 }
 
 function playbackHeadersForEmbed(embedUrl, source) {
@@ -774,7 +878,8 @@ function playbackHeadersForEmbed(embedUrl, source) {
   return headers;
 }
 
-async function verifyMediaCandidate(candidate, embedUrl, source) {
+async function verifyMediaCandidate(candidate, embedUrl, source, candidateIndex, candidateCount) {
+  var stageStartedAt = Date.now();
   var currentUrl = candidate.url;
   var headers = playbackHeadersForEmbed(embedUrl, source);
   headers.Accept = candidate.type === "hls"
@@ -798,7 +903,8 @@ async function verifyMediaCandidate(candidate, embedUrl, source) {
         : "DRAMAWORLD_MEDIA_NETWORK_ERROR";
       failStream(networkCode,
         networkCode === "DRAMAWORLD_MEDIA_TIMEOUT" ? "direct media validation timed out" : "direct media could not be reached",
-        { hostUrl: currentUrl, httpStatus: 0, responseReceived: false });
+        { hostUrl: currentUrl, httpStatus: 0, responseReceived: false, candidateIndex: candidateIndex,
+          candidateCount: candidateCount, elapsedMs: Date.now() - stageStartedAt, responseKind: "unknown" });
     }
 
     var status = Number(response && response.status) || 0;
@@ -806,13 +912,15 @@ async function verifyMediaCandidate(candidate, embedUrl, source) {
     if (status >= 300 && status < 400) {
       if (redirectCount >= MAX_REDIRECTS) {
         failStream("DRAMAWORLD_MEDIA_REDIRECT_LIMIT", "direct media redirected too many times",
-          { hostUrl: currentUrl, httpStatus: status, responseReceived: true });
+          { hostUrl: currentUrl, httpStatus: status, responseReceived: true, candidateIndex: candidateIndex,
+            candidateCount: candidateCount, elapsedMs: Date.now() - stageStartedAt });
       }
       try {
         currentUrl = safeEmbedRedirect(location, currentUrl);
       } catch (error) {
         if (error && !error.diagnostic) {
-          error.diagnostic = { hostUrl: currentUrl, httpStatus: status, responseReceived: true };
+          error.diagnostic = { hostUrl: currentUrl, httpStatus: status, responseReceived: true,
+            candidateIndex: candidateIndex, candidateCount: candidateCount, elapsedMs: Date.now() - stageStartedAt };
         }
         throw error;
       }
@@ -820,33 +928,45 @@ async function verifyMediaCandidate(candidate, embedUrl, source) {
     }
     if (response && response.networkError) {
       failStream("DRAMAWORLD_MEDIA_NETWORK_ERROR", "direct media could not be reached",
-        { hostUrl: currentUrl, httpStatus: 0, responseReceived: false });
+        { hostUrl: currentUrl, httpStatus: 0, responseReceived: false, candidateIndex: candidateIndex,
+          candidateCount: candidateCount, elapsedMs: Date.now() - stageStartedAt, responseKind: "unknown" });
     }
     if (status === 401 || status === 403) {
       failStream("DRAMAWORLD_MEDIA_ACCESS_DENIED", "direct media denied the validation request",
-        { hostUrl: currentUrl, httpStatus: status, responseReceived: true });
+        { hostUrl: currentUrl, httpStatus: status, responseReceived: true, candidateIndex: candidateIndex,
+          candidateCount: candidateCount, elapsedMs: Date.now() - stageStartedAt,
+          contentType: response.headers && response.headers.get("content-type"), responseKind: "unknown" });
     }
     if (!response || response.ok === false || status < 200 || status >= 300) {
       failStream("DRAMAWORLD_MEDIA_HTTP_ERROR", "direct media returned HTTP " + (status || "error"),
-        { hostUrl: currentUrl, httpStatus: status, responseReceived: status > 0 });
+        { hostUrl: currentUrl, httpStatus: status, responseReceived: status > 0, candidateIndex: candidateIndex,
+          candidateCount: candidateCount, elapsedMs: Date.now() - stageStartedAt,
+          contentType: response && response.headers && response.headers.get("content-type"), responseKind: "unknown" });
     }
 
     var finalUrl = publicHttpUrl(response.url || currentUrl);
     if (!finalUrl || !/^https:\/\//i.test(finalUrl)) {
       failStream("DRAMAWORLD_MEDIA_REDIRECT_REJECTED", "direct media returned an unsafe address",
-        { hostUrl: currentUrl, httpStatus: status, responseReceived: true });
+        { hostUrl: currentUrl, httpStatus: status, responseReceived: true, candidateIndex: candidateIndex,
+          candidateCount: candidateCount, elapsedMs: Date.now() - stageStartedAt });
     }
     var contentType = text(response.headers && response.headers.get("content-type")) || "";
     var valid = false;
+    var responseKind = "unknown";
     if (candidate.type === "hls") {
       var playlist = await response.text();
+      responseKind = responseKindFromBody(contentType, playlist);
       if (typeof playlist !== "string" || !playlist) {
         failStream("DRAMAWORLD_MEDIA_RESPONSE_INVALID", "direct media returned no playlist content",
-          { hostUrl: finalUrl, httpStatus: status, responseReceived: true });
+          { hostUrl: finalUrl, httpStatus: status, responseReceived: true, candidateIndex: candidateIndex,
+            candidateCount: candidateCount, contentType: contentType, responseKind: responseKind,
+            elapsedMs: Date.now() - stageStartedAt });
       }
       if (/(?:cf-mitigated|challenge-platform|__cf_chl|just a moment|checking your browser)/i.test(playlist.slice(0, 8192))) {
         failStream("DRAMAWORLD_HOST_CHALLENGE", "direct media returned an access challenge",
-          { hostUrl: finalUrl, httpStatus: status, responseReceived: true });
+          { hostUrl: finalUrl, httpStatus: status, responseReceived: true, candidateIndex: candidateIndex,
+            candidateCount: candidateCount, contentType: contentType, responseKind: "html",
+            elapsedMs: Date.now() - stageStartedAt });
       }
       valid = /^\s*#EXTM3U(?:\s|$)/i.test(playlist) &&
         !/(?:text\/html|application\/xhtml\+xml)/i.test(contentType) && !/<\s*html/i.test(playlist.slice(0, 1024));
@@ -855,29 +975,40 @@ async function verifyMediaCandidate(candidate, embedUrl, source) {
       if (response.arrayBuffer) {
         var buffer = await response.arrayBuffer();
         var bytes = new Uint8Array(buffer);
+        responseKind = responseKindFromBody(contentType, buffer);
         var prefixLength = Math.min(bytes.length, 64);
         for (var byteIndex = 0; byteIndex < prefixLength; byteIndex += 1) {
           prefix += String.fromCharCode(bytes[byteIndex]);
         }
       } else {
         prefix = await response.text();
+        responseKind = responseKindFromBody(contentType, prefix);
       }
       if (/(?:cf-mitigated|challenge-platform|__cf_chl|just a moment|checking your browser)/i.test(prefix.slice(0, 8192)) ||
           /^\s*(?:<!doctype\s+html|<html|\{\s*"(?:error|message)")/i.test(prefix)) {
         failStream("DRAMAWORLD_MEDIA_RESPONSE_INVALID", "direct media returned a page instead of a video file",
-          { hostUrl: finalUrl, httpStatus: status, responseReceived: true });
+          { hostUrl: finalUrl, httpStatus: status, responseReceived: true, candidateIndex: candidateIndex,
+            candidateCount: candidateCount, contentType: contentType, responseKind: "html",
+            elapsedMs: Date.now() - stageStartedAt });
       }
       valid = /^(?:video\/mp4|application\/octet-stream)$/i.test(contentType) && prefix.indexOf("ftyp") >= 0;
     }
 
     if (!valid) {
       failStream("DRAMAWORLD_MEDIA_RESPONSE_INVALID", "direct URL did not return a recognizable HLS playlist or MP4 file",
-        { hostUrl: finalUrl, httpStatus: status, responseReceived: true });
+        { hostUrl: finalUrl, httpStatus: status, responseReceived: true, candidateIndex: candidateIndex,
+          candidateCount: candidateCount, contentType: contentType, responseKind: responseKind,
+          elapsedMs: Date.now() - stageStartedAt });
     }
     var playbackHeaders = YUME_DRAMAWORLD_LOCAL_RESOLVER &&
       typeof YUME_DRAMAWORLD_LOCAL_RESOLVER.headersForSubresource === "function"
       ? YUME_DRAMAWORLD_LOCAL_RESOLVER.headersForSubresource(headers, candidate.url, finalUrl)
       : headers;
+    traceDetailed("MEDIA_CANDIDATE_VALID", { options: 1, streams: 1 }, null, {
+      hostUrl: finalUrl, httpStatus: status, responseReceived: true, candidateIndex: candidateIndex,
+      candidateCount: candidateCount, verifiedCount: 1, contentType: contentType,
+      responseKind: responseKind, elapsedMs: Date.now() - stageStartedAt
+    });
     return {
       url: finalUrl, httpStatus: status, hostUrl: finalUrl, responseReceived: true,
       body: candidate.type === "hls" ? playlist : null,
@@ -887,7 +1018,8 @@ async function verifyMediaCandidate(candidate, embedUrl, source) {
   }
 
   failStream("DRAMAWORLD_MEDIA_REDIRECT_LIMIT", "direct media redirected too many times",
-    { hostUrl: currentUrl, httpStatus: 0, responseReceived: false });
+    { hostUrl: currentUrl, httpStatus: 0, responseReceived: false, candidateIndex: candidateIndex,
+      candidateCount: candidateCount, elapsedMs: Date.now() - stageStartedAt });
 }
 
 function safeSourceHeaders(source) {
@@ -1278,8 +1410,9 @@ function homeCatalogItems(home, catalogId) {
 
 function onSettings() {
   return [
-    { type: "header", label: "DramaWorld Resolver Lab · 0.3.5-lab.2" },
+    { type: "header", label: "DramaWorld Resolver Lab · 0.3.5-lab.3" },
     { type: "toggle", key: "localPackedResolver", label: "تجربة المحلّل المحلي لصفحات Embed", defaultValue: true, description: "يعمل بعد فشل المسار المباشر القديم. يفك Packer نصياً ولا ينفّذ JavaScript، ولا يستخدم WebView أو خدمة استخراج خارجية." },
+    { type: "toggle", key: "debugResolverDiagnostics", label: "تشخيص Debug منقّح", defaultValue: false, description: "سجلات اختيارية لاسم المضيف والمرحلة والحالة ونوع الاستجابة والزمن والعدادات فقط؛ لا تسجل الروابط أو Query Parameters أو Cookies أو محتوى الصفحة. فعّلها يدوياً أثناء اختبار نسخة Debug فقط." },
     { type: "info", label: "هذه نسخة مستقلة بمعرّف تجريبي. تستخدم مضيف API المعروف فقط؛ تحديث Remote Config الأصلي يتطلب موصل Yume الموثوق الخاص بإصدار DramaWorld المنشور." }
   ];
 }
@@ -1496,6 +1629,76 @@ function streamsFromHlsPlaylist(body, manifestUrl, playbackUrl, baseHeaders, sou
   return output;
 }
 
+function mediaCandidateFailureCode(status, contentType, responseKind) {
+  if (status === 401 || status === 403) return "HTTP_STATUS_DENIED";
+  if (status < 200 || status >= 300) return "MEDIA_HTTP_ERROR";
+  if (diagnosticContentType(contentType) === "text/html" ||
+      diagnosticContentType(contentType) === "application/xhtml+xml" || responseKind === "html") return "HTML_RESPONSE";
+  return responseKind === "hls" || responseKind === "mp4" ? null : "MEDIA_SIGNATURE_INVALID";
+}
+
+function diagnosticFetch(transport, records) {
+  var nextCandidateIndex = 0;
+  var activeCandidateIndex = -1;
+  var previousWasRedirect = false;
+  return async function (input, init) {
+    var requestUrl = typeof input === "string" ? input : text(input && input.url);
+    if (activeCandidateIndex < 0 || !previousWasRedirect) activeCandidateIndex = nextCandidateIndex++;
+    var candidateIndex = activeCandidateIndex;
+    var startedAt = Date.now();
+    var response;
+    try {
+      response = await transport(input, init);
+    } catch (error) {
+      previousWasRedirect = false;
+      records.push({
+        host: sourceHost(requestUrl), httpStatus: 0, contentType: null,
+        responseKind: "unknown", elapsedMs: Date.now() - startedAt,
+        candidateIndex: candidateIndex, failureCode: "NETWORK_ERROR"
+      });
+      throw error;
+    }
+    var status = Number(response && response.status) || 0;
+    var contentType = response && response.headers && response.headers.get("content-type") || null;
+    var record = {
+      host: sourceHost(requestUrl), httpStatus: status,
+      contentType: diagnosticContentType(contentType), responseKind: "unknown",
+      elapsedMs: Date.now() - startedAt, candidateIndex: candidateIndex, failureCode: null
+    };
+    var saved = false;
+    function save(kind, bodyElapsed) {
+      if (saved) return;
+      saved = true;
+      record.responseKind = kind || "unknown";
+      record.elapsedMs = Date.now() - startedAt;
+      record.failureCode = status >= 300 && status < 400
+        ? null : mediaCandidateFailureCode(status, contentType, record.responseKind);
+      records.push(record);
+    }
+    previousWasRedirect = status >= 300 && status < 400;
+    if (previousWasRedirect || status < 200 || status >= 300) save("unknown");
+    var wrapped = {
+      ok: response && response.ok,
+      status: response && response.status,
+      statusText: response && response.statusText,
+      url: response && response.url,
+      headers: response && response.headers,
+      networkError: response && response.networkError,
+      text: async function () {
+        var body = await response.text();
+        save(responseKindFromBody(contentType, body));
+        return body;
+      },
+      arrayBuffer: async function () {
+        var body = await response.arrayBuffer();
+        save(responseKindFromBody(contentType, body));
+        return body;
+      }
+    };
+    return wrapped;
+  };
+}
+
 async function resolveEmbedLocally(embedResponse, sourceIndex, source, directCandidate) {
   var resolver = YUME_DRAMAWORLD_LOCAL_RESOLVER;
   var response = isObject(embedResponse) ? embedResponse : {};
@@ -1509,10 +1712,31 @@ async function resolveEmbedLocally(embedResponse, sourceIndex, source, directCan
     return { streams: [], family: null, errorCode: "DRAMAWORLD_LOCAL_RESOLVER_UNAVAILABLE" };
   }
   var family = resolver.familyFromUrl(familyUrl);
+  var candidateCount = 0;
+  try {
+    candidateCount = hasEmbedBody && typeof resolver.parseCandidates === "function"
+      ? resolver.parseCandidates(response.body, resolverUrl, {}).length
+      : directCandidate ? 1 : 0;
+  } catch (_) { candidateCount = directCandidate ? 1 : 0; }
+  var resolverStartedAt = Date.now();
+  var mediaDiagnostics = [];
   traceStreams("LOCAL_RESOLVER_START", { options: 1, streams: 0 }, null, {
     hostUrl: familyUrl,
     httpStatus: Number(response.httpStatus) || null,
-    responseReceived: response.responseReceived === true
+    responseReceived: response.responseReceived === true,
+    contentType: response.contentType,
+    responseKind: responseKindFromBody(response.contentType, response.body),
+    candidateCount: candidateCount,
+    elapsedMs: 0
+  });
+  traceDetailed("LOCAL_RESOLVER_DETAIL_START", { options: 1, streams: 0 }, null, {
+    hostUrl: familyUrl,
+    httpStatus: Number(response.httpStatus) || null,
+    responseReceived: response.responseReceived === true,
+    contentType: response.contentType,
+    responseKind: responseKindFromBody(response.contentType, response.body),
+    candidateCount: candidateCount,
+    elapsedMs: 0
   });
   var result;
   var caughtErrorCode = null;
@@ -1530,7 +1754,7 @@ async function resolveEmbedLocally(embedResponse, sourceIndex, source, directCan
       quality: text(directCandidate && directCandidate.quality) || text(source && source.quality) || undefined
     };
     var resolverContext = {
-      fetch: fetch,
+      fetch: diagnosticsEnabled() ? diagnosticFetch(fetch, mediaDiagnostics) : fetch,
       timeoutMs: EMBED_RESOLVE_TIMEOUT_MS,
       userAgent: EMBED_USER_AGENT,
       acceptLanguage: EMBED_ACCEPT_LANGUAGE,
@@ -1545,6 +1769,24 @@ async function resolveEmbedLocally(embedResponse, sourceIndex, source, directCan
     result = null;
   }
   var mediaRows = result && Array.isArray(result.streams) ? result.streams : [];
+  var verifiedCount = mediaDiagnostics.filter(function (item) {
+    return item.httpStatus >= 200 && item.httpStatus < 300 &&
+      !item.failureCode && (item.responseKind === "hls" || item.responseKind === "mp4");
+  }).length;
+  var lastProbe = mediaDiagnostics.length ? mediaDiagnostics[mediaDiagnostics.length - 1] : null;
+  mediaDiagnostics.forEach(function (item) {
+    traceDetailed("MEDIA_CANDIDATE_RESULT", { options: 1, streams: 0 }, item.failureCode, {
+      host: item.host,
+      httpStatus: item.httpStatus,
+      contentType: item.contentType,
+      responseKind: item.responseKind,
+      candidateIndex: item.candidateIndex,
+      candidateCount: candidateCount,
+      verifiedCount: verifiedCount,
+      elapsedMs: item.elapsedMs,
+      candidateFailureCode: item.failureCode
+    });
+  });
   var output = [];
   mediaRows.forEach(function (media) {
     if (!isObject(media) || media.verified !== true ||
@@ -1565,16 +1807,27 @@ async function resolveEmbedLocally(embedResponse, sourceIndex, source, directCan
     if (quality) stream.quality = quality;
     output.push(stream);
   });
-  var status = mediaRows.length && Number(mediaRows[0].httpStatus) ||
-    Number(result && result.httpStatus) || Number(response.httpStatus) || null;
   var errorCode = output.length ? null : caughtErrorCode || result && result.errorCode || "DRAMAWORLD_LOCAL_RESOLVER_NO_STREAMS";
   traceStreams("LOCAL_RESOLVER_RESULT", { options: 1, streams: output.length }, errorCode, {
     hostUrl: familyUrl,
-    httpStatus: status,
+    httpStatus: Number(response.httpStatus) || null,
     responseReceived: response.responseReceived === true || mediaRows.length > 0,
-    videoExtracted: output.length > 0
+    videoExtracted: output.length > 0,
+    contentType: response.contentType,
+    responseKind: responseKindFromBody(response.contentType, response.body),
+    candidateCount: candidateCount,
+    verifiedCount: verifiedCount,
+    elapsedMs: Date.now() - resolverStartedAt,
+    mediaHost: lastProbe && lastProbe.host,
+    mediaHttpStatus: lastProbe && lastProbe.httpStatus,
+    mediaContentType: lastProbe && lastProbe.contentType,
+    mediaResponseKind: lastProbe && lastProbe.responseKind,
+    mediaElapsedMs: lastProbe && lastProbe.elapsedMs,
+    candidateFailureCode: lastProbe && lastProbe.failureCode
   });
-  return { streams: output, family: family || null, errorCode: errorCode };
+  return { streams: output, family: family || null, errorCode: errorCode,
+    candidateCount: candidateCount, verifiedCount: verifiedCount, elapsedMs: Date.now() - resolverStartedAt,
+    mediaDiagnostic: lastProbe };
 }
 
 async function resolveStreamOption(args) {
@@ -1654,6 +1907,7 @@ async function resolveStreamOption(args) {
         return { streams: playlistStreams };
       }
     }
+    var embedParseStartedAt = Date.now();
     try {
       candidates = parseDirectMediaCandidates(embedResponse.body);
     } catch (parseEmbedError) {
@@ -1668,6 +1922,12 @@ async function resolveStreamOption(args) {
         { sourceRows: sourceRows.length, options: 1, streams: 0 }, embedResponse.finalUrl);
       throw parseEmbedError;
     }
+    traceDetailed("EMBED_PARSE_RESULT", { sourceRows: sourceRows.length, options: 1, streams: 0 }, null, {
+      hostUrl: embedResponse.finalUrl, httpStatus: embedResponse.httpStatus,
+      responseReceived: embedResponse.responseReceived, contentType: embedResponse.contentType,
+      responseKind: responseKindFromBody(embedResponse.contentType, embedResponse.body),
+      candidateCount: candidates.length, verifiedCount: 0, elapsedMs: Date.now() - embedParseStartedAt
+    });
   }
 
   if (!candidates.length) {
@@ -1695,7 +1955,17 @@ async function resolveStreamOption(args) {
     traceStreamFailure(unresolvedError, "EMBED_UNRESOLVED",
       { sourceRows: sourceRows.length, options: 1, streams: 0 }, embedUrl);
     if (localResult && localResult.errorCode) {
-      traceStreams("LOCAL_RESOLVER_FALLBACK_FAILED", { options: 1, streams: 0 }, localResult.errorCode, unresolvedContext);
+      traceStreams("LOCAL_RESOLVER_FALLBACK_FAILED", { options: 1, streams: 0 }, localResult.errorCode, Object.assign({}, unresolvedContext, {
+        candidateCount: localResult.candidateCount,
+        verifiedCount: localResult.verifiedCount,
+        elapsedMs: localResult.elapsedMs,
+        mediaHost: localResult.mediaDiagnostic && localResult.mediaDiagnostic.host,
+        mediaHttpStatus: localResult.mediaDiagnostic && localResult.mediaDiagnostic.httpStatus,
+        mediaContentType: localResult.mediaDiagnostic && localResult.mediaDiagnostic.contentType,
+        mediaResponseKind: localResult.mediaDiagnostic && localResult.mediaDiagnostic.responseKind,
+        mediaElapsedMs: localResult.mediaDiagnostic && localResult.mediaDiagnostic.elapsedMs,
+        candidateFailureCode: localResult.mediaDiagnostic && localResult.mediaDiagnostic.failureCode
+      }));
     }
     throw unresolvedError;
   }
@@ -1705,7 +1975,8 @@ async function resolveStreamOption(args) {
   var lastValidationError = null;
   for (var candidateIndex = 0; candidateIndex < candidates.length; candidateIndex += 1) {
     try {
-      verifiedMedia = await verifyMediaCandidate(candidates[candidateIndex], playbackUrl, source);
+      verifiedMedia = await verifyMediaCandidate(candidates[candidateIndex], playbackUrl, source,
+        candidateIndex, candidates.length);
       selected = candidates[candidateIndex];
       break;
     } catch (validationError) {
@@ -1721,7 +1992,7 @@ async function resolveStreamOption(args) {
     // in the already-fetched embed page. Reuse that page and preserve the old
     // validation error if the fallback also fails.
     var fallbackResult = null;
-    if (localResolverEnabled() && (embedResponse || candidates[0].type === "hls")) {
+    if (localResolverEnabled() && embedResponse) {
       fallbackResult = await resolveEmbedLocally(embedResponse, selection.index, source, candidates[0]);
       if (fallbackResult && fallbackResult.streams.length) {
         traceStreams("RESOLVE_READY", { sourceRows: sourceRows.length, options: 1, streams: fallbackResult.streams.length }, null, {
@@ -1735,7 +2006,16 @@ async function resolveStreamOption(args) {
         traceStreams("LOCAL_RESOLVER_FALLBACK_FAILED", { options: 1, streams: 0 }, fallbackResult.errorCode, {
           hostUrl: embedResponse && embedResponse.finalUrl || candidates[0].url,
           httpStatus: embedResponse && embedResponse.httpStatus || null,
-          responseReceived: !!(embedResponse && embedResponse.responseReceived)
+          responseReceived: !!(embedResponse && embedResponse.responseReceived),
+          candidateCount: fallbackResult.candidateCount,
+          verifiedCount: fallbackResult.verifiedCount,
+          elapsedMs: fallbackResult.elapsedMs,
+          mediaHost: fallbackResult.mediaDiagnostic && fallbackResult.mediaDiagnostic.host,
+          mediaHttpStatus: fallbackResult.mediaDiagnostic && fallbackResult.mediaDiagnostic.httpStatus,
+          mediaContentType: fallbackResult.mediaDiagnostic && fallbackResult.mediaDiagnostic.contentType,
+          mediaResponseKind: fallbackResult.mediaDiagnostic && fallbackResult.mediaDiagnostic.responseKind,
+          mediaElapsedMs: fallbackResult.mediaDiagnostic && fallbackResult.mediaDiagnostic.elapsedMs,
+          candidateFailureCode: fallbackResult.mediaDiagnostic && fallbackResult.mediaDiagnostic.failureCode
         });
       }
     }
@@ -2130,6 +2410,14 @@ var YUME_DRAMAWORLD_LOCAL_RESOLVER = (function () {
       var tail = text.slice(fileMatch.index + fileMatch[0].length, fileMatch.index + fileMatch[0].length + 180);
       var label = /\blabel\s*:\s*(["'])(.*?)\1/i.exec(tail);
       addCandidate(output, fileMatch[2], label && label[2], baseUrl, null, context);
+    }
+    // Uqload's core extractor also accepts a literal `sources: ["<url>"]`
+    // entry. The endpoint may be extensionless, so let media-signature
+    // verification determine HLS vs MP4 instead of guessing from its path.
+    var sourceArrayRegex = /\bsources\s*:\s*\[\s*(["'])(https?:\/\/[^"']+)\1/gi;
+    var sourceArrayMatch;
+    while ((sourceArrayMatch = sourceArrayRegex.exec(text)) && output.length < MAX_CANDIDATES) {
+      addCandidate(output, sourceArrayMatch[2], null, baseUrl, null, context);
     }
     var urlRegex = /https?:\/\/[^\s"'<>\\]+/gi;
     var urlMatch;

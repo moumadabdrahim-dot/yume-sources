@@ -4,7 +4,7 @@
 // CloudStream DramaWorld client. They are API route identifiers, not session
 // credentials. Firebase remains optional and only updates the content hosts.
 var PLUGIN_ID = "dramaworld-resolver-lab";
-var PLUGIN_VERSION = "0.3.5-lab.1";
+var PLUGIN_VERSION = "0.3.5-lab.2";
 var FIREBASE_PROJECT_ID = "alamaldrama2022v2";
 var API_ROUTE_KEY = "4F5A9C3D9A86FA54EACEDDD635185";
 var API_ROUTE_ID = "d506abfd-9fe2-4b71-b979-feff21bcad13";
@@ -746,6 +746,7 @@ async function fetchEmbedBody(url) {
         { hostUrl: currentUrl, httpStatus: status, responseReceived: true });
     }
     var body = await response.text();
+    var contentType = text(response.headers && response.headers.get("content-type")) || "";
     if (typeof body !== "string" || !body) {
       failStream("DRAMAWORLD_EMBED_RESPONSE_INVALID", "selected server returned no content",
         { hostUrl: finalUrl, httpStatus: status, responseReceived: true });
@@ -754,7 +755,7 @@ async function fetchEmbedBody(url) {
       failStream("DRAMAWORLD_EMBED_RESPONSE_TOO_LARGE", "selected server response exceeded the safe size limit",
         { hostUrl: finalUrl, httpStatus: status, responseReceived: true });
     }
-    return { body: body, finalUrl: finalUrl, httpStatus: status, responseReceived: true };
+    return { body: body, finalUrl: finalUrl, httpStatus: status, contentType: contentType, responseReceived: true };
   }
   failStream("DRAMAWORLD_EMBED_REDIRECT_LIMIT", "selected server redirected too many times",
     { hostUrl: currentUrl, httpStatus: 0, responseReceived: false });
@@ -847,7 +848,8 @@ async function verifyMediaCandidate(candidate, embedUrl, source) {
         failStream("DRAMAWORLD_HOST_CHALLENGE", "direct media returned an access challenge",
           { hostUrl: finalUrl, httpStatus: status, responseReceived: true });
       }
-      valid = /^\s*#EXTM3U(?:\s|$)/i.test(playlist) && /mpegurl|mpeg-url/i.test(contentType);
+      valid = /^\s*#EXTM3U(?:\s|$)/i.test(playlist) &&
+        !/(?:text\/html|application\/xhtml\+xml)/i.test(contentType) && !/<\s*html/i.test(playlist.slice(0, 1024));
     } else if (candidate.type === "mp4") {
       var prefix = "";
       if (response.arrayBuffer) {
@@ -872,7 +874,16 @@ async function verifyMediaCandidate(candidate, embedUrl, source) {
       failStream("DRAMAWORLD_MEDIA_RESPONSE_INVALID", "direct URL did not return a recognizable HLS playlist or MP4 file",
         { hostUrl: finalUrl, httpStatus: status, responseReceived: true });
     }
-    return { url: finalUrl, httpStatus: status, hostUrl: finalUrl, responseReceived: true };
+    var playbackHeaders = YUME_DRAMAWORLD_LOCAL_RESOLVER &&
+      typeof YUME_DRAMAWORLD_LOCAL_RESOLVER.headersForSubresource === "function"
+      ? YUME_DRAMAWORLD_LOCAL_RESOLVER.headersForSubresource(headers, candidate.url, finalUrl)
+      : headers;
+    return {
+      url: finalUrl, httpStatus: status, hostUrl: finalUrl, responseReceived: true,
+      body: candidate.type === "hls" ? playlist : null,
+      contentType: contentType,
+      playbackHeaders: playbackHeaders
+    };
   }
 
   failStream("DRAMAWORLD_MEDIA_REDIRECT_LIMIT", "direct media redirected too many times",
@@ -1267,7 +1278,7 @@ function homeCatalogItems(home, catalogId) {
 
 function onSettings() {
   return [
-    { type: "header", label: "DramaWorld Resolver Lab · 0.3.5-lab.1" },
+    { type: "header", label: "DramaWorld Resolver Lab · 0.3.5-lab.2" },
     { type: "toggle", key: "localPackedResolver", label: "تجربة المحلّل المحلي لصفحات Embed", defaultValue: true, description: "يعمل بعد فشل المسار المباشر القديم. يفك Packer نصياً ولا ينفّذ JavaScript، ولا يستخدم WebView أو خدمة استخراج خارجية." },
     { type: "info", label: "هذه نسخة مستقلة بمعرّف تجريبي. تستخدم مضيف API المعروف فقط؛ تحديث Remote Config الأصلي يتطلب موصل Yume الموثوق الخاص بإصدار DramaWorld المنشور." }
   ];
@@ -1450,31 +1461,87 @@ function localResolverPlaybackHeaders(embedUrl, resolverHeaders) {
   return headers;
 }
 
-async function resolveEmbedLocally(embedResponse, sourceIndex) {
+function isHlsPlaylist(body, contentType) {
+  return typeof body === "string" && /^\s*#EXTM3U(?:\s|$)/i.test(body) &&
+    !/(?:text\/html|application\/xhtml\+xml)/i.test(text(contentType) || "") &&
+    !/<\s*html/i.test(body.slice(0, 1024));
+}
+
+function streamsFromHlsPlaylist(body, manifestUrl, playbackUrl, baseHeaders, sourceIndex, fallbackQuality) {
   var resolver = YUME_DRAMAWORLD_LOCAL_RESOLVER;
-  if (!resolver || typeof resolver.resolve !== "function" || typeof fetch !== "function") return null;
-  var sourceUrl = embedResponse.finalUrl;
-  var family = resolver.familyFromUrl(sourceUrl);
+  if (!resolver || typeof resolver.parseHlsMaster !== "function" || !isHlsPlaylist(body)) return [];
+  var variants = resolver.parseHlsMaster(body, manifestUrl, {});
+  var hasVariants = variants.length > 0;
+  var mediaRows = hasVariants ? variants : [{ url: manifestUrl, type: "hls", quality: text(fallbackQuality) }];
+  var output = [];
+  mediaRows.forEach(function (media) {
+    var url = publicHttpUrl(media && media.url);
+    if (!url || !/^https:\/\//i.test(url) || output.some(function (item) { return item.url === url; })) return;
+    var scopedHeaders = typeof resolver.headersForSubresource === "function"
+      ? resolver.headersForSubresource(baseHeaders || {}, manifestUrl, url)
+      : (baseHeaders || {});
+    var quality = text(media.quality) || (!hasVariants ? text(fallbackQuality) : null);
+    var serverName = "سيرفر " + (Number(sourceIndex) + 1);
+    var stream = {
+      url: url,
+      type: "hls",
+      title: serverName,
+      name: serverName,
+      provider: "DramaWorld",
+      headers: Object.assign({}, localResolverPlaybackHeaders(playbackUrl, scopedHeaders))
+    };
+    if (quality) stream.quality = quality;
+    output.push(stream);
+  });
+  return output;
+}
+
+async function resolveEmbedLocally(embedResponse, sourceIndex, source, directCandidate) {
+  var resolver = YUME_DRAMAWORLD_LOCAL_RESOLVER;
+  var response = isObject(embedResponse) ? embedResponse : {};
+  var hasEmbedBody = typeof response.body === "string";
+  var sourceUrl = text(response.finalUrl) || text(source && source.url) || text(directCandidate && directCandidate.url);
+  var resolverUrl = hasEmbedBody
+    ? (text(response.finalUrl) || sourceUrl)
+    : (text(directCandidate && directCandidate.url) || sourceUrl);
+  var familyUrl = text(response.finalUrl) || text(source && source.url) || resolverUrl;
+  if (!resolver || typeof resolver.resolve !== "function" || typeof fetch !== "function") {
+    return { streams: [], family: null, errorCode: "DRAMAWORLD_LOCAL_RESOLVER_UNAVAILABLE" };
+  }
+  var family = resolver.familyFromUrl(familyUrl);
   traceStreams("LOCAL_RESOLVER_START", { options: 1, streams: 0 }, null, {
-    hostUrl: sourceUrl,
-    httpStatus: embedResponse.httpStatus,
-    responseReceived: embedResponse.responseReceived
+    hostUrl: familyUrl,
+    httpStatus: Number(response.httpStatus) || null,
+    responseReceived: response.responseReceived === true
   });
   var result;
+  var caughtErrorCode = null;
   try {
-    result = await resolver.resolve({
-      url: sourceUrl,
+    var resolverHeaders = safeSourceHeaders(source || {});
+    // The local engine generates a referer from the embed origin. Ignore API
+    // supplied cross-origin Referer/Origin values so its scoped playback
+    // headers remain stable and cannot leak to a media host.
+    delete resolverHeaders.Referer;
+    delete resolverHeaders.Origin;
+    var resolverSource = {
+      url: resolverUrl,
       family: family || undefined,
-      headers: {}
-    }, {
-      embedBody: embedResponse.body,
+      headers: resolverHeaders,
+      quality: text(directCandidate && directCandidate.quality) || text(source && source.quality) || undefined
+    };
+    var resolverContext = {
       fetch: fetch,
       timeoutMs: EMBED_RESOLVE_TIMEOUT_MS,
       userAgent: EMBED_USER_AGENT,
       acceptLanguage: EMBED_ACCEPT_LANGUAGE,
+      playbackHeaders: { Referer: (urlOrigin(familyUrl) || "") + "/" },
       allowExternalResolver: false
-    });
-  } catch (_) {
+    };
+    if (hasEmbedBody) resolverContext.embedBody = response.body;
+    result = await resolver.resolve(resolverSource, resolverContext);
+  } catch (error) {
+    if (isCancellation(error)) throw error;
+    caughtErrorCode = error && error.code || "DRAMAWORLD_LOCAL_RESOLVER_EXCEPTION";
     result = null;
   }
   var mediaRows = result && Array.isArray(result.streams) ? result.streams : [];
@@ -1485,8 +1552,8 @@ async function resolveEmbedLocally(embedResponse, sourceIndex) {
         !publicHttpUrl(media.url) || !/^https:\/\//i.test(media.url)) return;
     if (output.some(function (existing) { return existing.url === media.url; })) return;
     var quality = text(media.quality);
-    var label = quality ? "سيرفر · " + quality : "سيرفر " + (Number(sourceIndex) + 1);
-    var playbackHeaders = localResolverPlaybackHeaders(sourceUrl, media.playbackHeaders);
+    var label = "سيرفر " + (Number(sourceIndex) + 1);
+    var playbackHeaders = localResolverPlaybackHeaders(familyUrl, media.playbackHeaders);
     var stream = {
       url: media.url,
       type: media.type,
@@ -1499,15 +1566,15 @@ async function resolveEmbedLocally(embedResponse, sourceIndex) {
     output.push(stream);
   });
   var status = mediaRows.length && Number(mediaRows[0].httpStatus) ||
-    Number(result && result.httpStatus) || Number(embedResponse.httpStatus) || null;
-  traceStreams("LOCAL_RESOLVER_RESULT", { options: 1, streams: output.length },
-    output.length ? null : result && result.errorCode || "DRAMAWORLD_LOCAL_RESOLVER_NO_STREAMS", {
-      hostUrl: sourceUrl,
-      httpStatus: status,
-      responseReceived: true,
-      videoExtracted: output.length > 0
-    });
-  return output.length ? { streams: output, family: family || null } : null;
+    Number(result && result.httpStatus) || Number(response.httpStatus) || null;
+  var errorCode = output.length ? null : caughtErrorCode || result && result.errorCode || "DRAMAWORLD_LOCAL_RESOLVER_NO_STREAMS";
+  traceStreams("LOCAL_RESOLVER_RESULT", { options: 1, streams: output.length }, errorCode, {
+    hostUrl: familyUrl,
+    httpStatus: status,
+    responseReceived: response.responseReceived === true || mediaRows.length > 0,
+    videoExtracted: output.length > 0
+  });
+  return { streams: output, family: family || null, errorCode: errorCode };
 }
 
 async function resolveStreamOption(args) {
@@ -1576,6 +1643,17 @@ async function resolveStreamOption(args) {
       throw embedError;
     }
     playbackUrl = embedResponse.finalUrl;
+    if (isHlsPlaylist(embedResponse.body, embedResponse.contentType)) {
+      var playlistStreams = streamsFromHlsPlaylist(embedResponse.body, embedResponse.finalUrl,
+        playbackUrl, playbackHeadersForEmbed(playbackUrl, source), selection.index, source.quality);
+      if (playlistStreams.length) {
+        traceStreams("RESOLVE_READY", { sourceRows: sourceRows.length, options: 1, streams: playlistStreams.length }, null, {
+          hostUrl: embedResponse.finalUrl, httpStatus: embedResponse.httpStatus,
+          responseReceived: embedResponse.responseReceived, videoExtracted: true
+        });
+        return { streams: playlistStreams };
+      }
+    }
     try {
       candidates = parseDirectMediaCandidates(embedResponse.body);
     } catch (parseEmbedError) {
@@ -1591,10 +1669,19 @@ async function resolveStreamOption(args) {
       throw parseEmbedError;
     }
   }
+
   if (!candidates.length) {
-    if (embedResponse && localResolverEnabled()) {
-      var localResult = await resolveEmbedLocally(embedResponse, selection.index);
-      if (localResult && localResult.streams.length) return { streams: localResult.streams };
+    var localResult = null;
+    if (localResolverEnabled()) {
+      localResult = await resolveEmbedLocally(embedResponse, selection.index, source, null);
+      if (localResult && localResult.streams.length) {
+        traceStreams("RESOLVE_READY", { sourceRows: sourceRows.length, options: 1, streams: localResult.streams.length }, null, {
+          hostUrl: embedResponse && embedResponse.finalUrl || embedUrl,
+          httpStatus: embedResponse && embedResponse.httpStatus || null,
+          responseReceived: !!(embedResponse && embedResponse.responseReceived), videoExtracted: true
+        });
+        return { streams: localResult.streams };
+      }
     }
     var unresolvedError;
     var unresolvedContext = {
@@ -1607,6 +1694,9 @@ async function resolveStreamOption(args) {
     } catch (error) { unresolvedError = error; }
     traceStreamFailure(unresolvedError, "EMBED_UNRESOLVED",
       { sourceRows: sourceRows.length, options: 1, streams: 0 }, embedUrl);
+    if (localResult && localResult.errorCode) {
+      traceStreams("LOCAL_RESOLVER_FALLBACK_FAILED", { options: 1, streams: 0 }, localResult.errorCode, unresolvedContext);
+    }
     throw unresolvedError;
   }
 
@@ -1626,8 +1716,43 @@ async function resolveStreamOption(args) {
     }
   }
   if (!selected || !verifiedMedia) {
+    // The legacy parser may identify a URL that fails signature validation while
+    // the structural local parser can still find a different, valid rendition
+    // in the already-fetched embed page. Reuse that page and preserve the old
+    // validation error if the fallback also fails.
+    var fallbackResult = null;
+    if (localResolverEnabled() && (embedResponse || candidates[0].type === "hls")) {
+      fallbackResult = await resolveEmbedLocally(embedResponse, selection.index, source, candidates[0]);
+      if (fallbackResult && fallbackResult.streams.length) {
+        traceStreams("RESOLVE_READY", { sourceRows: sourceRows.length, options: 1, streams: fallbackResult.streams.length }, null, {
+          hostUrl: embedResponse && embedResponse.finalUrl || candidates[0].url,
+          httpStatus: embedResponse && embedResponse.httpStatus || null,
+          responseReceived: !!(embedResponse && embedResponse.responseReceived), videoExtracted: true
+        });
+        return { streams: fallbackResult.streams };
+      }
+      if (fallbackResult && fallbackResult.errorCode) {
+        traceStreams("LOCAL_RESOLVER_FALLBACK_FAILED", { options: 1, streams: 0 }, fallbackResult.errorCode, {
+          hostUrl: embedResponse && embedResponse.finalUrl || candidates[0].url,
+          httpStatus: embedResponse && embedResponse.httpStatus || null,
+          responseReceived: !!(embedResponse && embedResponse.responseReceived)
+        });
+      }
+    }
     if (lastValidationError) throw lastValidationError;
     fail("DRAMAWORLD_MEDIA_RESPONSE_INVALID", "selected server did not return a valid video source");
+  }
+
+  if (selected.type === "hls") {
+    var hlsStreams = streamsFromHlsPlaylist(verifiedMedia.body, verifiedMedia.url,
+      playbackUrl, verifiedMedia.playbackHeaders, selection.index, selected.quality);
+    if (hlsStreams.length) {
+      traceStreams("RESOLVE_READY", { sourceRows: sourceRows.length, options: 1, streams: hlsStreams.length }, null, {
+        hostUrl: verifiedMedia.hostUrl, httpStatus: verifiedMedia.httpStatus,
+        responseReceived: verifiedMedia.responseReceived, videoExtracted: true
+      });
+      return { streams: hlsStreams };
+    }
   }
 
   var streamName = "سيرفر " + (selection.index + 1);
@@ -1637,7 +1762,9 @@ async function resolveStreamOption(args) {
     title: streamName,
     name: streamName,
     provider: "DramaWorld",
-    headers: playbackHeadersForEmbed(playbackUrl, source)
+    headers: selected.type === "mp4"
+      ? playbackHeadersForEmbed(playbackUrl, source)
+      : verifiedMedia.playbackHeaders || playbackHeadersForEmbed(playbackUrl, source)
   };
   traceStreams("RESOLVE_READY", { sourceRows: sourceRows.length, options: 1, streams: 1 }, null, {
     hostUrl: verifiedMedia.hostUrl,
@@ -2015,22 +2142,36 @@ var YUME_DRAMAWORLD_LOCAL_RESOLVER = (function () {
 
   function parseHlsMaster(text, masterUrl, context) {
     if (typeof text !== "string" || !/^\s*#EXTM3U(?:\s|$)/i.test(text) || /<\s*html/i.test(text)) return [];
-    var lines = text.split(/\r?\n/), variants = [];
+    var lines = text.split(/\r?\n/), variants = [], master = parseHttpUrl(masterUrl);
     for (var i = 0; i < lines.length; i += 1) {
       var line = lines[i].trim();
       if (line.indexOf("#EXT-X-STREAM-INF:") !== 0) continue;
       var attrs = line.substring(line.indexOf(":") + 1);
       var resolution = /(?:^|,)RESOLUTION=(\d+)x(\d+)/i.exec(attrs);
       var name = /(?:^|,)NAME="([^"]+)"/i.exec(attrs);
+      var bandwidth = /(?:^|,)BANDWIDTH=(\d+)/i.exec(attrs);
       var next = i + 1;
       while (next < lines.length && (!lines[next].trim() || lines[next].trim().charAt(0) === "#")) next += 1;
       if (next >= lines.length) continue;
-      var url = resolveUrl(lines[next].trim(), masterUrl);
+      var reference = lines[next].trim();
+      var url = resolveUrl(reference, masterUrl);
       if (!url || !isAllowedUrl(url, context)) continue;
+      var parsedVariant = parseHttpUrl(url);
+      // Signed master URLs often authorize sibling playlists. Preserve that
+      // query only for a relative same-origin child without its own query;
+      // never copy credentials onto absolute or cross-origin URLs.
+      if (master && master.query && parsedVariant && parsedVariant.origin === master.origin &&
+          !/[?]/.test(reference) && !/^(?:https?:)?\/\//i.test(reference)) {
+        var fragmentAt = url.indexOf("#");
+        url = (fragmentAt < 0 ? url : url.slice(0, fragmentAt)) + "?" + master.query +
+          (fragmentAt < 0 ? "" : url.slice(fragmentAt));
+      }
+      if (variants.some(function (item) { return item.url === url; })) continue;
       var height = resolution ? Number(resolution[2]) : 0;
-      variants.push({ url: url, height: height, quality: name ? name[1] : height ? height + "p" : null, type: "hls" });
+      variants.push({ url: url, height: height, bandwidth: bandwidth ? Number(bandwidth[1]) : 0,
+        quality: name ? name[1] : height ? height + "p" : null, type: "hls" });
     }
-    variants.sort(function (a, b) { return b.height - a.height; });
+    variants.sort(function (a, b) { return b.height - a.height || b.bandwidth - a.bandwidth; });
     return variants;
   }
 
@@ -2355,7 +2496,8 @@ var YUME_DRAMAWORLD_LOCAL_RESOLVER = (function () {
         var streamHeaders = checked.playbackHeaders || playbackHeaders;
         if (hlsVariants.length) streamHeaders = headersForSubresource(streamHeaders, checked.url, item.url);
         streams.push({
-          url: item.url, type: checked.type, quality: item.quality || checked.quality || null,
+          url: item.url, type: checked.type,
+          quality: item.quality || (hlsVariants.length ? null : checked.quality) || null,
           playbackHeaders: Object.assign({}, streamHeaders), verified: true,
           verification: hlsVariants.length ? "master-playlist-reference" : checked.structure,
           variantFetched: !hlsVariants.length, httpStatus: checked.httpStatus,

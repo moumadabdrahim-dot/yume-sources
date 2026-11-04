@@ -4,7 +4,7 @@
 // CloudStream DramaWorld client. They are API route identifiers, not session
 // credentials. Firebase remains optional and only updates the content hosts.
 var PLUGIN_ID = "dramaworld-resolver-lab-phase4";
-var PLUGIN_VERSION = "0.3.5-lab.4-phase4.2";
+var PLUGIN_VERSION = "0.3.5-lab.4-phase5.1";
 var FIREBASE_PROJECT_ID = "alamaldrama2022v2";
 var API_ROUTE_KEY = "4F5A9C3D9A86FA54EACEDDD635185";
 var API_ROUTE_ID = "d506abfd-9fe2-4b71-b979-feff21bcad13";
@@ -72,7 +72,7 @@ function traceStreams(stage, counts, failureCode, diagnostic) {
         if (value !== null) event[key] = value;
       });
     if (Array.isArray(diagnostic.parserIds)) {
-      var allowedParserIds = ["uqload", "json", "jwplayer", "packer"];
+      var allowedParserIds = ["uqload", "json", "jwplayer", "packer", "direct-text"];
       var parserIds = diagnostic.parserIds.filter(function (id) { return allowedParserIds.indexOf(id) >= 0; });
       if (parserIds.length) event.parserIds = parserIds.slice(0, allowedParserIds.length);
     }
@@ -1441,7 +1441,7 @@ function homeCatalogItems(home, catalogId) {
 
 function onSettings() {
   return [
-    { type: "header", label: "DramaWorld Resolver Lab Phase 4 · 0.3.5-lab.4-phase4.2" },
+    { type: "header", label: "DramaWorld Resolver Lab Phase 5 · 0.3.5-lab.4-phase5.1" },
     { type: "toggle", key: "localPackedResolver", label: "تجربة المحلّل المحلي لصفحات Embed", defaultValue: true, description: "يعمل بعد فشل المسار المباشر القديم. يفك Packer نصياً ولا ينفّذ JavaScript، ولا يستخدم WebView أو خدمة استخراج خارجية." },
     { type: "toggle", key: "experimentalUniversalExtractor", label: "محرك Yume المركزي أولاً (تجريبي)", defaultValue: false, description: "عند التفعيل يجرب محرك Yume المركزي أولاً، ثم يعود مرة واحدة إلى المحلّل المحلي القديم إذا لم يُرجع نتيجة صالحة. Legacy Only يبقى الوضع الافتراضي." },
     { type: "toggle", key: "debugResolverDiagnostics", label: "تشخيص Debug منقّح", defaultValue: false, description: "سجلات اختيارية لاسم المضيف والمرحلة والحالة ونوع الاستجابة والزمن والعدادات فقط؛ لا تسجل الروابط أو Query Parameters أو Cookies أو محتوى الصفحة. فعّلها يدوياً أثناء اختبار نسخة Debug فقط." },
@@ -1651,7 +1651,7 @@ function universalDiagnosticSummary(diagnostics, streamCount, elapsedMs) {
   var candidates = rows.filter(function (row) { return row.stage === "VERIFY_CANDIDATE"; });
   var parserIds = rows.filter(function (row) {
     return row.stage === "PARSE_EXTRACTOR" && row.outcome === "CANDIDATES" &&
-      ["uqload", "json", "jwplayer", "packer"].indexOf(row.extractorId) >= 0;
+      ["uqload", "json", "jwplayer", "packer", "direct-text"].indexOf(row.extractorId) >= 0;
   }).map(function (row) { return row.extractorId; });
   parserIds = parserIds.filter(function (id, index) { return parserIds.indexOf(id) === index; });
   var fetch = fetchRows.length ? fetchRows[fetchRows.length - 1] : null;

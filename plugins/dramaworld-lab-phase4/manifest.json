@@ -1,6 +1,6 @@
 {
   "name": "DramaWorld Resolver Lab Phase 4",
-  "version": "0.3.5-lab.4-phase4.2",
+  "version": "0.3.5-lab.4-phase5.1",
   "description": "نسخة اختبار Phase 4 مستقلة لمقارنة Legacy Only وUniversal First دون استبدال الإضافات المنشورة.",
   "apiVersion": 2,
   "scrapers": [
@@ -8,7 +8,7 @@
       "id": "dramaworld-resolver-lab-phase4",
       "name": "DramaWorld Resolver Lab Phase 4",
       "description": "Isolated Phase 4 A/B package: Legacy Only by default, Universal First when explicitly enabled.",
-      "version": "0.3.5-lab.4-phase4.2",
+      "version": "0.3.5-lab.4-phase5.1",
       "filename": "dramaworld.js",
       "supportedTypes": [
         "movie",

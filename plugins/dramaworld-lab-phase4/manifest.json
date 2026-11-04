@@ -1,0 +1,134 @@
+{
+  "name": "DramaWorld Resolver Lab Phase 4",
+  "version": "0.3.5-lab.4-phase4.1",
+  "description": "نسخة اختبار Phase 4 مستقلة لمقارنة Legacy Only وUniversal First دون استبدال الإضافات المنشورة.",
+  "apiVersion": 2,
+  "scrapers": [
+    {
+      "id": "dramaworld-resolver-lab-phase4",
+      "name": "DramaWorld Resolver Lab Phase 4",
+      "description": "Isolated Phase 4 A/B package: Legacy Only by default, Universal First when explicitly enabled.",
+      "version": "0.3.5-lab.4-phase4.1",
+      "filename": "dramaworld.js",
+      "supportedTypes": [
+        "movie",
+        "tv"
+      ],
+      "enabled": true,
+      "autoInstall": false,
+      "hasSettings": true,
+      "contentLanguage": [
+        "ar"
+      ],
+      "apiVersion": 2,
+      "capabilities": [
+        "home",
+        "search",
+        "details",
+        "streams"
+      ],
+      "catalogs": [
+        {
+          "id": "featured-movies",
+          "type": "movie",
+          "title": "أفلام DramaWorld المميزة",
+          "capabilities": [
+            "home"
+          ],
+          "filters": [],
+          "homeOrder": 5,
+          "homeFallback": false,
+          "presentation": {
+            "posterShape": "portrait"
+          }
+        },
+        {
+          "id": "featured-series",
+          "type": "series",
+          "title": "مسلسلات DramaWorld المميزة",
+          "capabilities": [
+            "home"
+          ],
+          "filters": [],
+          "homeOrder": 6,
+          "homeFallback": false,
+          "presentation": {
+            "posterShape": "portrait"
+          }
+        },
+        {
+          "id": "movies",
+          "type": "movie",
+          "title": "أفلام DramaWorld",
+          "capabilities": [
+            "home",
+            "browse"
+          ],
+          "filters": [
+            {
+              "key": "genre",
+              "kind": "select",
+              "label": "التصنيف",
+              "options": [],
+              "dynamic": true
+            }
+          ],
+          "homeOrder": 10,
+          "homeFallback": false,
+          "presentation": {
+            "posterShape": "portrait"
+          }
+        },
+        {
+          "id": "series",
+          "type": "series",
+          "title": "مسلسلات DramaWorld",
+          "capabilities": [
+            "home",
+            "browse"
+          ],
+          "filters": [
+            {
+              "key": "genre",
+              "kind": "select",
+              "label": "التصنيف",
+              "options": [],
+              "dynamic": true
+            }
+          ],
+          "homeOrder": 20,
+          "homeFallback": false,
+          "presentation": {
+            "posterShape": "portrait"
+          }
+        }
+      ],
+      "searchGroups": [
+        {
+          "id": "movies",
+          "title": "أفلام DramaWorld",
+          "types": [
+            "movie"
+          ],
+          "pagination": false,
+          "displayType": "movie",
+          "presentation": {
+            "posterShape": "portrait"
+          }
+        },
+        {
+          "id": "series",
+          "title": "مسلسلات DramaWorld",
+          "types": [
+            "series"
+          ],
+          "pagination": false,
+          "displayType": "series",
+          "presentation": {
+            "posterShape": "portrait"
+          }
+        }
+      ]
+    }
+  ]
+}

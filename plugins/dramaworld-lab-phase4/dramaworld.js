@@ -4,7 +4,7 @@
 // CloudStream DramaWorld client. They are API route identifiers, not session
 // credentials. Firebase remains optional and only updates the content hosts.
 var PLUGIN_ID = "dramaworld-resolver-lab-phase4";
-var PLUGIN_VERSION = "0.3.5-lab.4-phase4.1";
+var PLUGIN_VERSION = "0.3.5-lab.4-phase4.2";
 var FIREBASE_PROJECT_ID = "alamaldrama2022v2";
 var API_ROUTE_KEY = "4F5A9C3D9A86FA54EACEDDD635185";
 var API_ROUTE_ID = "d506abfd-9fe2-4b71-b979-feff21bcad13";
@@ -71,6 +71,11 @@ function traceStreams(stage, counts, failureCode, diagnostic) {
         var value = diagnosticNumber(diagnostic[key], 0, max);
         if (value !== null) event[key] = value;
       });
+    if (Array.isArray(diagnostic.parserIds)) {
+      var allowedParserIds = ["uqload", "json", "jwplayer", "packer"];
+      var parserIds = diagnostic.parserIds.filter(function (id) { return allowedParserIds.indexOf(id) >= 0; });
+      if (parserIds.length) event.parserIds = parserIds.slice(0, allowedParserIds.length);
+    }
     if (diagnostic.candidateFailureCode) {
       event.candidateFailureCode = String(diagnostic.candidateFailureCode).replace(/[^A-Z0-9_]/g, "").slice(0, 64);
     }
@@ -104,7 +109,7 @@ function diagnosticContentType(value) {
 }
 
 function diagnosticResponseKind(value) {
-  return ["html", "hls", "mp4", "unknown"].indexOf(value) >= 0 ? value : null;
+  return ["html", "json", "hls", "mp4", "dash", "unknown"].indexOf(value) >= 0 ? value : null;
 }
 
 function responseKindFromBody(contentType, body) {
@@ -1436,7 +1441,7 @@ function homeCatalogItems(home, catalogId) {
 
 function onSettings() {
   return [
-    { type: "header", label: "DramaWorld Resolver Lab Phase 4 · 0.3.5-lab.4-phase4.1" },
+    { type: "header", label: "DramaWorld Resolver Lab Phase 4 · 0.3.5-lab.4-phase4.2" },
     { type: "toggle", key: "localPackedResolver", label: "تجربة المحلّل المحلي لصفحات Embed", defaultValue: true, description: "يعمل بعد فشل المسار المباشر القديم. يفك Packer نصياً ولا ينفّذ JavaScript، ولا يستخدم WebView أو خدمة استخراج خارجية." },
     { type: "toggle", key: "experimentalUniversalExtractor", label: "محرك Yume المركزي أولاً (تجريبي)", defaultValue: false, description: "عند التفعيل يجرب محرك Yume المركزي أولاً، ثم يعود مرة واحدة إلى المحلّل المحلي القديم إذا لم يُرجع نتيجة صالحة. Legacy Only يبقى الوضع الافتراضي." },
     { type: "toggle", key: "debugResolverDiagnostics", label: "تشخيص Debug منقّح", defaultValue: false, description: "سجلات اختيارية لاسم المضيف والمرحلة والحالة ونوع الاستجابة والزمن والعدادات فقط؛ لا تسجل الروابط أو Query Parameters أو Cookies أو محتوى الصفحة. فعّلها يدوياً أثناء اختبار نسخة Debug فقط." },
@@ -1605,6 +1610,73 @@ function universalExtractorEnabled() {
   return settings.experimentalUniversalExtractor === true && typeof __yume_extract_v1 === "function";
 }
 
+// Reduce native diagnostics to an allow-listed code; never forward URLs, headers, tokens, or
+// exception text from the bridge into resolver logs.
+function universalEmptyReason(diagnostics) {
+  if (!Array.isArray(diagnostics)) return "NO_DIAGNOSTICS";
+  var rows = diagnostics.filter(isObject);
+  var outcomes = rows.filter(function (row) { return row.stage === "VERIFY_CANDIDATE"; })
+    .map(function (row) { return row.outcome; });
+  var known = [
+    "DNS_FAILURE", "CONNECT_FAILURE", "NETWORK_TIMEOUT", "TIMEOUT", "HTTP_REFUSED",
+    "HTTP_STATUS_ERROR", "REDIRECT_LIMIT", "HTML_RESPONSE", "MEDIA_SIGNATURE_INVALID",
+    "INVALID_CANDIDATE_URL", "NETWORK_FAILURE"
+  ];
+  for (var i = 0; i < known.length; i += 1) {
+    if (outcomes.indexOf(known[i]) >= 0) return known[i] === "NETWORK_TIMEOUT" ? "TIMEOUT" : known[i];
+  }
+  if (rows.some(function (row) { return row.stage === "PARSE" && row.outcome === "NO_CANDIDATES"; })) return "NO_CANDIDATES";
+  var fetchFailure = rows.find(function (row) { return row.stage === "FETCH" &&
+    ["DNS_FAILURE", "CONNECT_FAILURE", "NETWORK_TIMEOUT", "NETWORK_FAILURE", "HTTP_REFUSED", "HTTP_STATUS_ERROR"].indexOf(row.outcome) >= 0; });
+  if (fetchFailure) return fetchFailure.outcome === "NETWORK_TIMEOUT" ? "TIMEOUT" : fetchFailure.outcome;
+  if (rows.some(function (row) { return row.stage === "PARSE" && row.outcome === "UNSUPPORTED_DOCUMENT"; })) return "UNSUPPORTED_DOCUMENT";
+  return "NO_VALID_MEDIA";
+}
+
+function universalDiagnosticKind(row) {
+  if (!isObject(row)) return null;
+  var signature = row.mediaSignature;
+  if (signature === "HLS_PLAYLIST") return "hls";
+  if (signature === "MP4_FTYP" || signature === "MP4_MIME_ONLY") return "mp4";
+  if (signature === "DASH_MPD" || signature === "DASH_MIME_ONLY") return "dash";
+  if (signature === "HTML_MARKUP" || row.outcome === "HTML") return "html";
+  if (signature === "JSON_DOCUMENT" || row.outcome === "JSON") return "json";
+  return "unknown";
+}
+
+function universalDiagnosticSummary(diagnostics, streamCount, elapsedMs) {
+  var rows = Array.isArray(diagnostics) ? diagnostics.filter(isObject) : [];
+  var fetchRows = rows.filter(function (row) { return row.stage === "FETCH"; });
+  var parse = rows.find(function (row) { return row.stage === "PARSE"; });
+  var candidates = rows.filter(function (row) { return row.stage === "VERIFY_CANDIDATE"; });
+  var parserIds = rows.filter(function (row) {
+    return row.stage === "PARSE_EXTRACTOR" && row.outcome === "CANDIDATES" &&
+      ["uqload", "json", "jwplayer", "packer"].indexOf(row.extractorId) >= 0;
+  }).map(function (row) { return row.extractorId; });
+  parserIds = parserIds.filter(function (id, index) { return parserIds.indexOf(id) === index; });
+  var fetch = fetchRows.length ? fetchRows[fetchRows.length - 1] : null;
+  var media = candidates.length ? candidates[candidates.length - 1] : null;
+  var reason = streamCount ? null : universalEmptyReason(rows);
+  return {
+    candidateFailureCode: reason,
+    candidateCount: parse && diagnosticNumber(parse.candidateCount, 0, MAX_SOURCES) !== null
+      ? diagnosticNumber(parse.candidateCount, 0, MAX_SOURCES) : 0,
+    parserIds: parserIds,
+    verifiedCount: diagnosticNumber(streamCount, 0, MAX_SOURCES) || 0,
+    elapsedMs: diagnosticNumber(elapsedMs, 0, 600000),
+    host: fetch && safeDiagnosticHost(fetch.host),
+    httpStatus: fetch && diagnosticNumber(fetch.httpStatus, 0, 599),
+    contentType: fetch && diagnosticContentType(fetch.contentType),
+    responseReceived: !!(fetch && diagnosticNumber(fetch.httpStatus, 0, 599) !== null),
+    responseKind: fetch ? universalDiagnosticKind(fetch) : null,
+    mediaHost: media && safeDiagnosticHost(media.host),
+    mediaHttpStatus: media && diagnosticNumber(media.httpStatus, 0, 599),
+    mediaContentType: media && diagnosticContentType(media.contentType),
+    mediaResponseKind: media ? universalDiagnosticKind(media) : null,
+    mediaElapsedMs: media && diagnosticNumber(media.elapsedMs, 0, 600000)
+  };
+}
+
 async function resolveWithUniversalExtractor(embedUrl, sourceIndex, source) {
   if (!universalExtractorEnabled()) return { attempted: false, streams: null };
   var startedAt = Date.now();
@@ -1620,6 +1692,7 @@ async function resolveWithUniversalExtractor(embedUrl, sourceIndex, source) {
     }));
     var payload = typeof raw === "string" ? JSON.parse(raw) : raw;
     var rows = payload && Array.isArray(payload.streams) ? payload.streams : [];
+    var diagnostics = payload && Array.isArray(payload.diagnostics) ? payload.diagnostics : [];
     var name = "سيرفر " + (sourceIndex + 1);
     var streams = rows.map(function (row) {
       if (!isObject(row)) return null;
@@ -1633,7 +1706,7 @@ async function resolveWithUniversalExtractor(embedUrl, sourceIndex, source) {
     }).filter(Boolean);
     traceDetailed(streams.length ? "UNIVERSAL_SUCCESS" : "UNIVERSAL_FAILED",
       { options: 1, streams: streams.length }, streams.length ? null : "UNIVERSAL_EMPTY",
-      { elapsedMs: Date.now() - startedAt, candidateCount: rows.length, verifiedCount: streams.length });
+      universalDiagnosticSummary(diagnostics, streams.length, Date.now() - startedAt));
     return { attempted: true, streams: streams.length ? streams : null };
   } catch (error) {
     if (isCancellation(error)) throw error;

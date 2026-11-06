@@ -4,7 +4,7 @@
 // CloudStream DramaWorld client. They are API route identifiers, not session
 // credentials. Firebase remains optional and only updates the content hosts.
 var PLUGIN_ID = "dramaworld";
-var PLUGIN_VERSION = "0.3.5";
+var PLUGIN_VERSION = "0.3.6-rc.1";
 var FIREBASE_PROJECT_ID = "alamaldrama2022v2";
 var API_ROUTE_KEY = "4F5A9C3D9A86FA54EACEDDD635185";
 var API_ROUTE_ID = "d506abfd-9fe2-4b71-b979-feff21bcad13";
@@ -46,13 +46,99 @@ function traceStreams(stage, counts, failureCode, diagnostic) {
     streams: Math.max(0, Number(counts && counts.streams) || 0)
   };
   if (failureCode) event.failureCode = String(failureCode).replace(/[^A-Z0-9_]/g, "").slice(0, 64);
-  var host = sourceHost(diagnostic.hostUrl);
+  var host = safeDiagnosticHost(diagnostic.host) || sourceHost(diagnostic.hostUrl);
   if (host) event.host = host;
   var status = Number(diagnostic.httpStatus);
-  if (isFinite(status) && status >= 0 && status <= 599) event.httpStatus = Math.floor(status);
+  if (diagnostic.responseReceived !== false && isFinite(status) && status >= 100 && status <= 599) {
+    event.httpStatus = Math.floor(status);
+  }
   if (typeof diagnostic.responseReceived === "boolean") event.responseReceived = diagnostic.responseReceived;
   if (typeof diagnostic.videoExtracted === "boolean") event.videoExtracted = diagnostic.videoExtracted;
+  if (diagnosticsEnabled()) {
+    var mediaHost = safeDiagnosticHost(diagnostic.mediaHost || diagnostic.host);
+    if (mediaHost) event.mediaHost = mediaHost;
+    var mediaStatus = diagnosticNumber(diagnostic.mediaHttpStatus, 100, 599);
+    if (mediaStatus !== null) event.mediaHttpStatus = mediaStatus;
+    var contentType = diagnosticContentType(diagnostic.contentType);
+    if (contentType) event.contentType = contentType;
+    var mediaContentType = diagnosticContentType(diagnostic.mediaContentType);
+    if (mediaContentType) event.mediaContentType = mediaContentType;
+    var responseKind = diagnosticResponseKind(diagnostic.responseKind);
+    if (responseKind) event.responseKind = responseKind;
+    var mediaResponseKind = diagnosticResponseKind(diagnostic.mediaResponseKind);
+    if (mediaResponseKind) event.mediaResponseKind = mediaResponseKind;
+    ["candidateCount", "verifiedCount", "candidateIndex", "elapsedMs", "mediaElapsedMs"]
+      .forEach(function (key) {
+        var max = key.indexOf("Count") >= 0 ? MAX_SOURCES : key.indexOf("Index") >= 0 ? MAX_SOURCES - 1 : 600000;
+        var value = diagnosticNumber(diagnostic[key], 0, max);
+        if (value !== null) event[key] = value;
+      });
+    if (Array.isArray(diagnostic.parserIds)) {
+      var allowedParserIds = ["uqload", "json", "jwplayer", "packer", "direct-text"];
+      var parserIds = diagnostic.parserIds.filter(function (id) { return allowedParserIds.indexOf(id) >= 0; });
+      if (parserIds.length) event.parserIds = parserIds.slice(0, allowedParserIds.length);
+    }
+    if (/^c[1-9][0-9]?$/.test(String(diagnostic.acceptedCandidateId || ""))) {
+      event.acceptedCandidateId = String(diagnostic.acceptedCandidateId);
+    }
+    if (["uqload", "json", "jwplayer", "packer", "direct-text"].indexOf(diagnostic.acceptedParserId) >= 0) {
+      event.acceptedParserId = diagnostic.acceptedParserId;
+    }
+    if (diagnostic.candidateFailureCode) {
+      event.candidateFailureCode = String(diagnostic.candidateFailureCode).replace(/[^A-Z0-9_]/g, "").slice(0, 64);
+    }
+  }
   console.log("DRAMAWORLD_STREAM_TRACE " + JSON.stringify(event));
+}
+
+function diagnosticsEnabled() {
+  var settings = typeof SCRAPER_SETTINGS !== "undefined" && isObject(SCRAPER_SETTINGS)
+    ? SCRAPER_SETTINGS : {};
+  return settings.debugResolverDiagnostics === true;
+}
+
+function diagnosticNumber(value, minimum, maximum) {
+  var number = Number(value);
+  return isFinite(number) && number >= minimum && number <= maximum ? Math.floor(number) : null;
+}
+
+function safeDiagnosticHost(value) {
+  if (typeof value !== "string") return null;
+  var host = value.toLowerCase().replace(/\.$/, "");
+  return host.length <= 253 && /^[a-z0-9.-]+$/.test(host) && host.indexOf("..") < 0 ? host : null;
+}
+
+function diagnosticContentType(value) {
+  if (typeof value !== "string") return null;
+  var mime = value.split(";")[0].trim().toLowerCase();
+  var allowed = ["text/html", "application/xhtml+xml", "application/json", "text/plain",
+    "application/vnd.apple.mpegurl", "application/x-mpegurl", "video/mp4", "application/octet-stream"];
+  return allowed.indexOf(mime) >= 0 ? mime : (mime ? "other" : null);
+}
+
+function diagnosticResponseKind(value) {
+  return ["html", "json", "hls", "mp4", "dash", "unknown"].indexOf(value) >= 0 ? value : null;
+}
+
+function responseKindFromBody(contentType, body) {
+  if (/^(?:text\/html|application\/xhtml\+xml)$/i.test(diagnosticContentType(contentType) || "") ||
+      (typeof body === "string" && /^\s*(?:<!doctype\s+html|<html|<body)\b/i.test(body.slice(0, 1024)))) return "html";
+  if (typeof body === "string" && /^\s*#EXTM3U(?:\s|$)/i.test(body)) return "hls";
+  if (typeof body === "string" && body.length >= 8 && body.slice(4, 8) === "ftyp") return "mp4";
+  if (body && typeof body.byteLength === "number" && typeof Uint8Array !== "undefined") {
+    var bytes = new Uint8Array(body, 0, Math.min(body.byteLength, 1024));
+    var prefix = "";
+    for (var index = 0; index < Math.min(bytes.length, 1024); index += 1) prefix += String.fromCharCode(bytes[index]);
+    if (/^\s*(?:<!doctype\s+html|<html|<body)\b/i.test(prefix)) return "html";
+    if (/^\s*#EXTM3U(?:\s|$)/i.test(prefix)) return "hls";
+    if (bytes.length >= 8 && bytes[4] === 0x66 && bytes[5] === 0x74 && bytes[6] === 0x79 && bytes[7] === 0x70) return "mp4";
+  }
+  return "unknown";
+}
+
+function traceDetailed(stage, counts, failureCode, diagnostic) {
+  if (!diagnosticsEnabled()) return;
+  traceStreams(stage, counts, failureCode, diagnostic);
 }
 
 function failStream(code, message, diagnostic) {
@@ -64,6 +150,11 @@ function failStream(code, message, diagnostic) {
       httpStatus: Number.isFinite(Number(diagnostic.httpStatus)) ? Number(diagnostic.httpStatus) : null,
       responseReceived: diagnostic.responseReceived === true
     };
+    ["contentType", "responseKind", "mediaHost", "mediaContentType", "mediaResponseKind",
+      "candidateCount", "verifiedCount", "candidateIndex", "elapsedMs", "mediaElapsedMs", "mediaHttpStatus"]
+      .forEach(function (key) {
+        if (diagnostic[key] !== undefined && diagnostic[key] !== null) error.diagnostic[key] = diagnostic[key];
+      });
   }
   throw error;
 }
@@ -74,7 +165,19 @@ function traceStreamFailure(error, stage, counts, fallbackHostUrl) {
     hostUrl: diagnostic.hostUrl || fallbackHostUrl,
     httpStatus: diagnostic.httpStatus,
     responseReceived: diagnostic.responseReceived === true,
-    videoExtracted: false
+    videoExtracted: false,
+    contentType: diagnostic.contentType,
+    responseKind: diagnostic.responseKind,
+    mediaHost: diagnostic.mediaHost,
+    mediaHttpStatus: diagnostic.mediaHttpStatus,
+    mediaContentType: diagnostic.mediaContentType,
+    mediaResponseKind: diagnostic.mediaResponseKind,
+    candidateCount: diagnostic.candidateCount,
+    verifiedCount: diagnostic.verifiedCount,
+    candidateIndex: diagnostic.candidateIndex,
+    candidateFailureCode: error && error.code,
+    elapsedMs: diagnostic.elapsedMs,
+    mediaElapsedMs: diagnostic.mediaElapsedMs
   });
 }
 
@@ -518,6 +621,32 @@ function mapSubtitles(value) {
   return subtitles;
 }
 
+async function fetchSubtitlesForIdentity(config, identity) {
+  var startedAt = Date.now();
+  var subtitleRoute = identity.kind === "movie"
+    ? "subtitles/by/movie/" + identity.id
+    : "subtitles/by/episode/" + identity.id;
+  try {
+    var rawSubtitles = await requestValidatedJson(config, endpointPath(config, subtitleRoute), function (value) {
+      var data = unwrapData(value);
+      return Array.isArray(value) || Array.isArray(data);
+    }, "DRAMAWORLD_SUBTITLES_INVALID", "DramaWorld returned invalid subtitle data");
+    return { subtitles: mapSubtitles(rawSubtitles), elapsedMs: Date.now() - startedAt, available: true };
+  } catch (subtitleError) {
+    if (isCancellation(subtitleError)) throw subtitleError;
+    if (typeof console !== "undefined" && console.warn) console.warn("DramaWorld subtitle list unavailable");
+    return { subtitles: [], elapsedMs: Date.now() - startedAt, available: false };
+  }
+}
+
+function attachSubtitles(streams, subtitles) {
+  if (!Array.isArray(streams) || !Array.isArray(subtitles) || !subtitles.length) return streams;
+  streams.forEach(function (stream) {
+    if (isObject(stream)) stream.subtitles = subtitles;
+  });
+  return streams;
+}
+
 function mapStreams(sourceBody, subtitles) {
   var sources = decodeSourceBody(sourceBody);
   var seen = Object.create(null);
@@ -688,7 +817,9 @@ function safeEmbedRedirect(location, currentUrl) {
 }
 
 async function fetchEmbedBody(url) {
+  var stageStartedAt = Date.now();
   var currentUrl = url;
+  traceDetailed("EMBED_FETCH_START", { options: 1, streams: 0 }, null, { hostUrl: currentUrl, elapsedMs: 0 });
   for (var redirectCount = 0; redirectCount <= MAX_REDIRECTS; redirectCount += 1) {
     var response;
     try {
@@ -709,20 +840,22 @@ async function fetchEmbedBody(url) {
         : "DRAMAWORLD_EMBED_NETWORK_ERROR";
       failStream(networkCode,
         networkCode === "DRAMAWORLD_EMBED_TIMEOUT" ? "selected server request timed out" : "selected server could not be reached",
-        { hostUrl: currentUrl, httpStatus: 0, responseReceived: false });
+        { hostUrl: currentUrl, httpStatus: 0, responseReceived: false, elapsedMs: Date.now() - stageStartedAt,
+          responseKind: "unknown" });
     }
     var status = Number(response && response.status) || 0;
     var location = response && response.headers && response.headers.get("location");
     if (status >= 300 && status < 400) {
       if (redirectCount >= MAX_REDIRECTS) {
         failStream("DRAMAWORLD_EMBED_REDIRECT_LIMIT", "selected server redirected too many times",
-          { hostUrl: currentUrl, httpStatus: status, responseReceived: true });
+          { hostUrl: currentUrl, httpStatus: status, responseReceived: true, elapsedMs: Date.now() - stageStartedAt });
       }
       try {
         currentUrl = safeEmbedRedirect(location, currentUrl);
       } catch (error) {
         if (error && !error.diagnostic) {
-          error.diagnostic = { hostUrl: currentUrl, httpStatus: status, responseReceived: true };
+          error.diagnostic = { hostUrl: currentUrl, httpStatus: status, responseReceived: true,
+            elapsedMs: Date.now() - stageStartedAt };
         }
         throw error;
       }
@@ -730,34 +863,45 @@ async function fetchEmbedBody(url) {
     }
     if (response && response.networkError) {
       failStream("DRAMAWORLD_EMBED_NETWORK_ERROR", "selected server could not be reached",
-        { hostUrl: currentUrl, httpStatus: 0, responseReceived: false });
+        { hostUrl: currentUrl, httpStatus: 0, responseReceived: false, elapsedMs: Date.now() - stageStartedAt,
+          responseKind: "unknown" });
     }
     if (status === 401 || status === 403) {
       failStream("DRAMAWORLD_EMBED_ACCESS_DENIED", "selected server denied the request",
-        { hostUrl: currentUrl, httpStatus: status, responseReceived: true });
+        { hostUrl: currentUrl, httpStatus: status, responseReceived: true, elapsedMs: Date.now() - stageStartedAt,
+          contentType: response.headers && response.headers.get("content-type"), responseKind: "unknown" });
     }
     if (!response || response.ok === false || status < 200 || status >= 300) {
       failStream("DRAMAWORLD_EMBED_HTTP_ERROR", "selected server returned HTTP " + (status || "error"),
-        { hostUrl: currentUrl, httpStatus: status, responseReceived: status > 0 });
+        { hostUrl: currentUrl, httpStatus: status, responseReceived: status > 0, elapsedMs: Date.now() - stageStartedAt,
+          contentType: response && response.headers && response.headers.get("content-type"), responseKind: "unknown" });
     }
     var finalUrl = publicHttpUrl(response.url || currentUrl);
     if (!finalUrl || !/^https:\/\//i.test(finalUrl)) {
       failStream("DRAMAWORLD_EMBED_REDIRECT_REJECTED", "selected server returned an unsafe address",
-        { hostUrl: currentUrl, httpStatus: status, responseReceived: true });
+        { hostUrl: currentUrl, httpStatus: status, responseReceived: true, elapsedMs: Date.now() - stageStartedAt });
     }
     var body = await response.text();
+    var contentType = text(response.headers && response.headers.get("content-type")) || "";
+    var responseKind = responseKindFromBody(contentType, body);
     if (typeof body !== "string" || !body) {
       failStream("DRAMAWORLD_EMBED_RESPONSE_INVALID", "selected server returned no content",
-        { hostUrl: finalUrl, httpStatus: status, responseReceived: true });
+        { hostUrl: finalUrl, httpStatus: status, responseReceived: true, contentType: contentType,
+          responseKind: responseKind, elapsedMs: Date.now() - stageStartedAt });
     }
     if (body.length > MAX_EMBED_BODY_CHARS || body.indexOf("...[truncated]") >= 0) {
       failStream("DRAMAWORLD_EMBED_RESPONSE_TOO_LARGE", "selected server response exceeded the safe size limit",
-        { hostUrl: finalUrl, httpStatus: status, responseReceived: true });
+        { hostUrl: finalUrl, httpStatus: status, responseReceived: true, contentType: contentType,
+          responseKind: responseKind, elapsedMs: Date.now() - stageStartedAt });
     }
-    return { body: body, finalUrl: finalUrl, httpStatus: status, responseReceived: true };
+    traceDetailed("EMBED_FETCH_RESULT", { options: 1, streams: 0 }, null, {
+      hostUrl: finalUrl, httpStatus: status, responseReceived: true, contentType: contentType,
+      responseKind: responseKind, elapsedMs: Date.now() - stageStartedAt
+    });
+    return { body: body, finalUrl: finalUrl, httpStatus: status, contentType: contentType, responseReceived: true };
   }
   failStream("DRAMAWORLD_EMBED_REDIRECT_LIMIT", "selected server redirected too many times",
-    { hostUrl: currentUrl, httpStatus: 0, responseReceived: false });
+    { hostUrl: currentUrl, httpStatus: 0, responseReceived: false, elapsedMs: Date.now() - stageStartedAt });
 }
 
 function playbackHeadersForEmbed(embedUrl, source) {
@@ -773,7 +917,8 @@ function playbackHeadersForEmbed(embedUrl, source) {
   return headers;
 }
 
-async function verifyMediaCandidate(candidate, embedUrl, source) {
+async function verifyMediaCandidate(candidate, embedUrl, source, candidateIndex, candidateCount) {
+  var stageStartedAt = Date.now();
   var currentUrl = candidate.url;
   var headers = playbackHeadersForEmbed(embedUrl, source);
   headers.Accept = candidate.type === "hls"
@@ -797,7 +942,8 @@ async function verifyMediaCandidate(candidate, embedUrl, source) {
         : "DRAMAWORLD_MEDIA_NETWORK_ERROR";
       failStream(networkCode,
         networkCode === "DRAMAWORLD_MEDIA_TIMEOUT" ? "direct media validation timed out" : "direct media could not be reached",
-        { hostUrl: currentUrl, httpStatus: 0, responseReceived: false });
+        { hostUrl: currentUrl, httpStatus: 0, responseReceived: false, candidateIndex: candidateIndex,
+          candidateCount: candidateCount, elapsedMs: Date.now() - stageStartedAt, responseKind: "unknown" });
     }
 
     var status = Number(response && response.status) || 0;
@@ -805,13 +951,15 @@ async function verifyMediaCandidate(candidate, embedUrl, source) {
     if (status >= 300 && status < 400) {
       if (redirectCount >= MAX_REDIRECTS) {
         failStream("DRAMAWORLD_MEDIA_REDIRECT_LIMIT", "direct media redirected too many times",
-          { hostUrl: currentUrl, httpStatus: status, responseReceived: true });
+          { hostUrl: currentUrl, httpStatus: status, responseReceived: true, candidateIndex: candidateIndex,
+            candidateCount: candidateCount, elapsedMs: Date.now() - stageStartedAt });
       }
       try {
         currentUrl = safeEmbedRedirect(location, currentUrl);
       } catch (error) {
         if (error && !error.diagnostic) {
-          error.diagnostic = { hostUrl: currentUrl, httpStatus: status, responseReceived: true };
+          error.diagnostic = { hostUrl: currentUrl, httpStatus: status, responseReceived: true,
+            candidateIndex: candidateIndex, candidateCount: candidateCount, elapsedMs: Date.now() - stageStartedAt };
         }
         throw error;
       }
@@ -819,64 +967,98 @@ async function verifyMediaCandidate(candidate, embedUrl, source) {
     }
     if (response && response.networkError) {
       failStream("DRAMAWORLD_MEDIA_NETWORK_ERROR", "direct media could not be reached",
-        { hostUrl: currentUrl, httpStatus: 0, responseReceived: false });
+        { hostUrl: currentUrl, httpStatus: 0, responseReceived: false, candidateIndex: candidateIndex,
+          candidateCount: candidateCount, elapsedMs: Date.now() - stageStartedAt, responseKind: "unknown" });
     }
     if (status === 401 || status === 403) {
       failStream("DRAMAWORLD_MEDIA_ACCESS_DENIED", "direct media denied the validation request",
-        { hostUrl: currentUrl, httpStatus: status, responseReceived: true });
+        { hostUrl: currentUrl, httpStatus: status, responseReceived: true, candidateIndex: candidateIndex,
+          candidateCount: candidateCount, elapsedMs: Date.now() - stageStartedAt,
+          contentType: response.headers && response.headers.get("content-type"), responseKind: "unknown" });
     }
     if (!response || response.ok === false || status < 200 || status >= 300) {
       failStream("DRAMAWORLD_MEDIA_HTTP_ERROR", "direct media returned HTTP " + (status || "error"),
-        { hostUrl: currentUrl, httpStatus: status, responseReceived: status > 0 });
+        { hostUrl: currentUrl, httpStatus: status, responseReceived: status > 0, candidateIndex: candidateIndex,
+          candidateCount: candidateCount, elapsedMs: Date.now() - stageStartedAt,
+          contentType: response && response.headers && response.headers.get("content-type"), responseKind: "unknown" });
     }
 
     var finalUrl = publicHttpUrl(response.url || currentUrl);
     if (!finalUrl || !/^https:\/\//i.test(finalUrl)) {
       failStream("DRAMAWORLD_MEDIA_REDIRECT_REJECTED", "direct media returned an unsafe address",
-        { hostUrl: currentUrl, httpStatus: status, responseReceived: true });
+        { hostUrl: currentUrl, httpStatus: status, responseReceived: true, candidateIndex: candidateIndex,
+          candidateCount: candidateCount, elapsedMs: Date.now() - stageStartedAt });
     }
     var contentType = text(response.headers && response.headers.get("content-type")) || "";
     var valid = false;
+    var responseKind = "unknown";
     if (candidate.type === "hls") {
       var playlist = await response.text();
+      responseKind = responseKindFromBody(contentType, playlist);
       if (typeof playlist !== "string" || !playlist) {
         failStream("DRAMAWORLD_MEDIA_RESPONSE_INVALID", "direct media returned no playlist content",
-          { hostUrl: finalUrl, httpStatus: status, responseReceived: true });
+          { hostUrl: finalUrl, httpStatus: status, responseReceived: true, candidateIndex: candidateIndex,
+            candidateCount: candidateCount, contentType: contentType, responseKind: responseKind,
+            elapsedMs: Date.now() - stageStartedAt });
       }
       if (/(?:cf-mitigated|challenge-platform|__cf_chl|just a moment|checking your browser)/i.test(playlist.slice(0, 8192))) {
         failStream("DRAMAWORLD_HOST_CHALLENGE", "direct media returned an access challenge",
-          { hostUrl: finalUrl, httpStatus: status, responseReceived: true });
+          { hostUrl: finalUrl, httpStatus: status, responseReceived: true, candidateIndex: candidateIndex,
+            candidateCount: candidateCount, contentType: contentType, responseKind: "html",
+            elapsedMs: Date.now() - stageStartedAt });
       }
-      valid = /^\s*#EXTM3U(?:\s|$)/i.test(playlist) && /mpegurl|mpeg-url/i.test(contentType);
+      valid = /^\s*#EXTM3U(?:\s|$)/i.test(playlist) &&
+        !/(?:text\/html|application\/xhtml\+xml)/i.test(contentType) && !/<\s*html/i.test(playlist.slice(0, 1024));
     } else if (candidate.type === "mp4") {
       var prefix = "";
       if (response.arrayBuffer) {
         var buffer = await response.arrayBuffer();
         var bytes = new Uint8Array(buffer);
+        responseKind = responseKindFromBody(contentType, buffer);
         var prefixLength = Math.min(bytes.length, 64);
         for (var byteIndex = 0; byteIndex < prefixLength; byteIndex += 1) {
           prefix += String.fromCharCode(bytes[byteIndex]);
         }
       } else {
         prefix = await response.text();
+        responseKind = responseKindFromBody(contentType, prefix);
       }
       if (/(?:cf-mitigated|challenge-platform|__cf_chl|just a moment|checking your browser)/i.test(prefix.slice(0, 8192)) ||
           /^\s*(?:<!doctype\s+html|<html|\{\s*"(?:error|message)")/i.test(prefix)) {
         failStream("DRAMAWORLD_MEDIA_RESPONSE_INVALID", "direct media returned a page instead of a video file",
-          { hostUrl: finalUrl, httpStatus: status, responseReceived: true });
+          { hostUrl: finalUrl, httpStatus: status, responseReceived: true, candidateIndex: candidateIndex,
+            candidateCount: candidateCount, contentType: contentType, responseKind: "html",
+            elapsedMs: Date.now() - stageStartedAt });
       }
       valid = /^(?:video\/mp4|application\/octet-stream)$/i.test(contentType) && prefix.indexOf("ftyp") >= 0;
     }
 
     if (!valid) {
       failStream("DRAMAWORLD_MEDIA_RESPONSE_INVALID", "direct URL did not return a recognizable HLS playlist or MP4 file",
-        { hostUrl: finalUrl, httpStatus: status, responseReceived: true });
+        { hostUrl: finalUrl, httpStatus: status, responseReceived: true, candidateIndex: candidateIndex,
+          candidateCount: candidateCount, contentType: contentType, responseKind: responseKind,
+          elapsedMs: Date.now() - stageStartedAt });
     }
-    return { url: finalUrl, httpStatus: status, hostUrl: finalUrl, responseReceived: true };
+    var playbackHeaders = YUME_DRAMAWORLD_LOCAL_RESOLVER &&
+      typeof YUME_DRAMAWORLD_LOCAL_RESOLVER.headersForSubresource === "function"
+      ? YUME_DRAMAWORLD_LOCAL_RESOLVER.headersForSubresource(headers, candidate.url, finalUrl)
+      : headers;
+    traceDetailed("MEDIA_CANDIDATE_VALID", { options: 1, streams: 1 }, null, {
+      hostUrl: finalUrl, httpStatus: status, responseReceived: true, candidateIndex: candidateIndex,
+      candidateCount: candidateCount, verifiedCount: 1, contentType: contentType,
+      responseKind: responseKind, elapsedMs: Date.now() - stageStartedAt
+    });
+    return {
+      url: finalUrl, httpStatus: status, hostUrl: finalUrl, responseReceived: true,
+      body: candidate.type === "hls" ? playlist : null,
+      contentType: contentType,
+      playbackHeaders: playbackHeaders
+    };
   }
 
   failStream("DRAMAWORLD_MEDIA_REDIRECT_LIMIT", "direct media redirected too many times",
-    { hostUrl: currentUrl, httpStatus: 0, responseReceived: false });
+    { hostUrl: currentUrl, httpStatus: 0, responseReceived: false, candidateIndex: candidateIndex,
+      candidateCount: candidateCount, elapsedMs: Date.now() - stageStartedAt });
 }
 
 function safeSourceHeaders(source) {
@@ -1267,11 +1449,11 @@ function homeCatalogItems(home, catalogId) {
 
 function onSettings() {
   return [
-    { type: "header", label: "اتصال DramaWorld" },
-    { type: "info", label: "يعمل الاتصال بالمضيف المعروف دون إعداد Firebase. أدخل بيانات عميل Firebase العامة المعتمدة اختيارياً لتحديث عناوين المضيفين؛ لا تُستخدم قيم Remote Config لبناء مسار API." },
-    { type: "text", key: "firebaseApiKey", label: "Firebase public API key (اختياري)", placeholder: "مفتاح العميل العام المعتمد" },
-    { type: "text", key: "firebaseAppId", label: "Firebase Android/Web App ID", placeholder: "1:…:android:… أو 1:…:web:…", description: "استخدم إعداداً عاماً أذن به مالك المشروع. لا تدخل رمز جلسة أو مفتاحاً خاصاً." },
-    { type: "info", label: "تُحفظ رموز Firebase مشفرة داخل Android ولا تُمرر إلى JavaScript أو السجلات. يبدأ اختيار المضيف بآخر HOME صالح ثم dwapp المعروف." }
+    { type: "header", label: "DramaWorld Resolver Lab Phase 5 · 0.3.5-lab.4-phase5.1" },
+    { type: "toggle", key: "localPackedResolver", label: "تجربة المحلّل المحلي لصفحات Embed", defaultValue: true, description: "يعمل بعد فشل المسار المباشر القديم. يفك Packer نصياً ولا ينفّذ JavaScript، ولا يستخدم WebView أو خدمة استخراج خارجية." },
+    { type: "toggle", key: "universalExtractorEnabled", label: "محرك Yume المركزي", defaultValue: true, description: "يجرب المحرك المركزي أولاً ثم يعود مرة واحدة إلى المحلّل المحلي عند الفشل. عطّل هذا الخيار للرجوع الفوري إلى Legacy Only." },
+    { type: "toggle", key: "debugResolverDiagnostics", label: "تشخيص Debug منقّح", defaultValue: false, description: "سجلات اختيارية لاسم المضيف والمرحلة والحالة ونوع الاستجابة والزمن والعدادات فقط؛ لا تسجل الروابط أو Query Parameters أو Cookies أو محتوى الصفحة. فعّلها يدوياً أثناء اختبار نسخة Debug فقط." },
+    { type: "info", label: "هذه نسخة مستقلة بمعرّف تجريبي. تستخدم مضيف API المعروف فقط؛ تحديث Remote Config الأصلي يتطلب موصل Yume الموثوق الخاص بإصدار DramaWorld المنشور." }
   ];
 }
 
@@ -1378,7 +1560,10 @@ async function getDetails(args) {
 async function getStreams(args) {
   args = isObject(args) ? args : {};
   var identity = parseNativeId(args.id || args.nativeId, ["movie", "episode"]);
+  var configStartedAt = Date.now();
   var config = await readConfig();
+  traceDetailed("CONFIG_RESULT", { sourceRows: 0, options: 0, streams: 0 }, null,
+    { elapsedMs: Date.now() - configStartedAt });
   var route = identity.kind === "movie" ? "movie/source/by/" : "episode/source/by/";
   var apiStartedAt = Date.now();
   var sourceRows;
@@ -1389,34 +1574,25 @@ async function getStreams(args) {
     throw sourceError;
   }
   var apiMs = Date.now() - apiStartedAt;
-  var subtitleRoute = identity.kind === "movie"
-    ? "subtitles/by/movie/" + identity.id
-    : "subtitles/by/episode/" + identity.id;
-  var subtitles = [];
-  try {
-    var rawSubtitles = await requestValidatedJson(config, endpointPath(config, subtitleRoute), function (value) {
-      var data = unwrapData(value);
-      return Array.isArray(value) || Array.isArray(data);
-    }, "DRAMAWORLD_SUBTITLES_INVALID", "DramaWorld returned invalid subtitle data");
-    subtitles = mapSubtitles(rawSubtitles);
-  } catch (subtitleError) {
-    if (isCancellation(subtitleError)) throw subtitleError;
-    if (typeof console !== "undefined" && console.warn) console.warn("DramaWorld subtitle list unavailable");
-  }
   var parsingStartedAt = Date.now();
-  var result = mapStreams(sourceRows, subtitles);
   var options = mapStreamOptions(sourceRows, identity);
   if (args.mode === "options") {
     if (!options.length) {
       var optionFailure = sourceRows.length ? "DRAMAWORLD_NO_SUPPORTED_SOURCES" : "DRAMAWORLD_NO_SOURCES";
-      traceStreams("OPTIONS_EMPTY", { sourceRows: sourceRows.length, options: 0, streams: result.streams.length }, optionFailure);
+      traceStreams("OPTIONS_EMPTY", { sourceRows: sourceRows.length, options: 0, streams: 0 }, optionFailure);
       fail(optionFailure, sourceRows.length
         ? "DramaWorld returned sources, but none were safe HTTPS server links"
         : "DramaWorld returned no sources for this title");
     }
-    traceStreams("OPTIONS_READY", { sourceRows: sourceRows.length, options: options.length, streams: result.streams.length });
+    traceDetailed("SOURCE_LIST_RESULT", { sourceRows: sourceRows.length, options: options.length, streams: 0 }, null,
+      { elapsedMs: apiMs });
+    traceStreams("OPTIONS_READY", { sourceRows: sourceRows.length, options: options.length, streams: 0 });
     return { options: options, timing: { apiMs: apiMs, parsingMs: Date.now() - parsingStartedAt } };
   }
+  var subtitleResult = await fetchSubtitlesForIdentity(config, identity);
+  traceDetailed("SUBTITLES_RESULT", { sourceRows: sourceRows.length, options: options.length, streams: 0 },
+    subtitleResult.available ? null : "DRAMAWORLD_SUBTITLES_UNAVAILABLE", { elapsedMs: subtitleResult.elapsedMs });
+  var result = mapStreams(sourceRows, subtitleResult.subtitles);
   result.options = options;
   result.timing = { apiMs: apiMs, parsingMs: Date.now() - parsingStartedAt };
   if (!result.streams.length && !result.options.length) {
@@ -1427,6 +1603,416 @@ async function getStreams(args) {
   }
   traceStreams("STREAMS_READY", { sourceRows: sourceRows.length, options: result.options.length, streams: result.streams.length });
   return result;
+}
+
+function localResolverEnabled() {
+  var settings = typeof SCRAPER_SETTINGS !== "undefined" && isObject(SCRAPER_SETTINGS)
+    ? SCRAPER_SETTINGS
+    : {};
+  return settings.localPackedResolver !== false;
+}
+
+function universalExtractorEnabled() {
+  var settings = typeof SCRAPER_SETTINGS !== "undefined" && isObject(SCRAPER_SETTINGS)
+    ? SCRAPER_SETTINGS : {};
+  return settings.universalExtractorEnabled !== false && typeof __yume_extract_v1 === "function";
+}
+
+// Reduce native diagnostics to an allow-listed code; never forward URLs, headers, tokens, or
+// exception text from the bridge into resolver logs.
+function universalErrorCode(value) {
+  var allowed = [
+    "NETWORK_FAILURE", "DNS_FAILURE", "TIMEOUT", "NO_CANDIDATES",
+    "MEDIA_SIGNATURE_INVALID", "HTTP_REFUSED", "CANCELLED"
+  ];
+  value = text(value);
+  return value && allowed.indexOf(value) >= 0 ? value : null;
+}
+
+function universalEmptyReason(diagnostics, errorCode) {
+  var topLevel = universalErrorCode(errorCode);
+  if (topLevel) return topLevel;
+  if (!Array.isArray(diagnostics)) return "NO_DIAGNOSTICS";
+  var rows = diagnostics.filter(isObject);
+  var outcomes = rows.filter(function (row) { return row.stage === "VERIFY_CANDIDATE"; })
+    .map(function (row) { return row.outcome; });
+  var known = [
+    "DNS_FAILURE", "CONNECT_FAILURE", "NETWORK_TIMEOUT", "TIMEOUT", "HTTP_REFUSED",
+    "HTTP_STATUS_ERROR", "REDIRECT_LIMIT", "HTML_RESPONSE", "MEDIA_SIGNATURE_INVALID",
+    "INVALID_CANDIDATE_URL", "NETWORK_FAILURE"
+  ];
+  for (var i = 0; i < known.length; i += 1) {
+    if (outcomes.indexOf(known[i]) >= 0) return known[i] === "NETWORK_TIMEOUT" ? "TIMEOUT" : known[i];
+  }
+  if (rows.some(function (row) { return row.stage === "PARSE" && row.outcome === "NO_CANDIDATES"; })) return "NO_CANDIDATES";
+  var fetchFailure = rows.find(function (row) { return row.stage === "FETCH" &&
+    ["DNS_FAILURE", "CONNECT_FAILURE", "NETWORK_TIMEOUT", "NETWORK_FAILURE", "HTTP_REFUSED", "HTTP_STATUS_ERROR"].indexOf(row.outcome) >= 0; });
+  if (fetchFailure) return fetchFailure.outcome === "NETWORK_TIMEOUT" ? "TIMEOUT" : fetchFailure.outcome;
+  if (rows.some(function (row) { return row.stage === "PARSE" && row.outcome === "UNSUPPORTED_DOCUMENT"; })) return "UNSUPPORTED_DOCUMENT";
+  return "NO_VALID_MEDIA";
+}
+
+function universalDiagnosticKind(row) {
+  if (!isObject(row)) return null;
+  var signature = row.mediaSignature;
+  if (signature === "HLS_PLAYLIST") return "hls";
+  if (signature === "MP4_FTYP" || signature === "MP4_MIME_ONLY") return "mp4";
+  if (signature === "DASH_MPD" || signature === "DASH_MIME_ONLY") return "dash";
+  if (signature === "HTML_MARKUP" || row.outcome === "HTML") return "html";
+  if (signature === "JSON_DOCUMENT" || row.outcome === "JSON") return "json";
+  return "unknown";
+}
+
+function universalDiagnosticSummary(diagnostics, streamCount, elapsedMs, errorCode) {
+  var rows = Array.isArray(diagnostics) ? diagnostics.filter(isObject) : [];
+  var fetchRows = rows.filter(function (row) { return row.stage === "FETCH"; });
+  var parse = rows.find(function (row) { return row.stage === "PARSE"; });
+  var candidates = rows.filter(function (row) { return row.stage === "VERIFY_CANDIDATE"; });
+  var parserIds = rows.filter(function (row) {
+    return row.stage === "PARSE_EXTRACTOR" && row.outcome === "CANDIDATES" &&
+      ["uqload", "json", "jwplayer", "packer", "direct-text"].indexOf(row.extractorId) >= 0;
+  }).map(function (row) { return row.extractorId; });
+  parserIds = parserIds.filter(function (id, index) { return parserIds.indexOf(id) === index; });
+  var fetch = fetchRows.length ? fetchRows[fetchRows.length - 1] : null;
+  var accepted = candidates.find(function (row) {
+    return /^VALID_(?:HLS|MP4|DASH)$/.test(String(row.outcome || "")) && Number(row.validCount) > 0;
+  });
+  // On success, report the candidate that actually produced the returned stream. On failure there
+  // is no accepted candidate, so retain the final failed probe as the most useful terminal detail.
+  var media = streamCount && accepted ? accepted : (candidates.length ? candidates[candidates.length - 1] : null);
+  var reason = streamCount ? null : universalEmptyReason(rows, errorCode);
+  var fetchStatus = fetch && diagnosticNumber(fetch.httpStatus, 100, 599);
+  var fetchResponseReceived = !!(fetch && (typeof fetch.responseReceived === "boolean"
+    ? fetch.responseReceived : fetchStatus !== null));
+  var mediaStatus = media && diagnosticNumber(media.httpStatus, 100, 599);
+  return {
+    candidateFailureCode: reason,
+    candidateCount: parse && diagnosticNumber(parse.candidateCount, 0, MAX_SOURCES) !== null
+      ? diagnosticNumber(parse.candidateCount, 0, MAX_SOURCES) : 0,
+    parserIds: parserIds,
+    acceptedCandidateId: accepted && accepted.candidateId,
+    acceptedParserId: accepted && accepted.extractorId,
+    verifiedCount: diagnosticNumber(streamCount, 0, MAX_SOURCES) || 0,
+    elapsedMs: diagnosticNumber(elapsedMs, 0, 600000),
+    host: fetch && safeDiagnosticHost(fetch.host),
+    httpStatus: fetchResponseReceived ? fetchStatus : null,
+    contentType: fetch && diagnosticContentType(fetch.contentType),
+    responseReceived: fetchResponseReceived,
+    responseKind: fetch ? universalDiagnosticKind(fetch) : null,
+    mediaHost: media && safeDiagnosticHost(media.host),
+    mediaHttpStatus: mediaStatus,
+    mediaContentType: media && diagnosticContentType(media.contentType),
+    mediaResponseKind: media ? universalDiagnosticKind(media) : null,
+    mediaElapsedMs: media && diagnosticNumber(media.elapsedMs, 0, 600000)
+  };
+}
+
+async function resolveWithUniversalExtractor(embedUrl, sourceIndex, source) {
+  if (!universalExtractorEnabled()) return { attempted: false, streams: null };
+  var startedAt = Date.now();
+  traceDetailed("UNIVERSAL_ATTEMPT", { options: 1, streams: 0 }, null,
+    { elapsedMs: 0, candidateCount: 0, verifiedCount: 0 });
+  try {
+    var raw = await __yume_extract_v1(JSON.stringify({
+      url: embedUrl,
+      referrer: embedUrl,
+      headers: playbackHeadersForEmbed(embedUrl, source),
+      timeoutMs: 12000,
+      perAttemptTimeoutMs: 5000
+    }));
+    var payload = typeof raw === "string" ? JSON.parse(raw) : raw;
+    var rows = payload && Array.isArray(payload.streams) ? payload.streams : [];
+    var diagnostics = payload && Array.isArray(payload.diagnostics) ? payload.diagnostics : [];
+    var errorCode = payload && universalErrorCode(payload.errorCode);
+    var name = "سيرفر " + (sourceIndex + 1);
+    var streams = rows.map(function (row) {
+      if (!isObject(row)) return null;
+      var url = publicHttpUrl(row.url);
+      var type = text(row.type) && text(row.type).toLowerCase();
+      if (!url || (type !== "hls" && type !== "mp4" && type !== "dash")) return null;
+      var stream = { url: url, type: type, title: name, name: name, provider: "DramaWorld",
+        headers: isObject(row.headers) ? row.headers : {} };
+      if (text(row.quality)) stream.quality = text(row.quality);
+      return stream;
+    }).filter(Boolean);
+    traceDetailed(streams.length ? "UNIVERSAL_SUCCESS" : "UNIVERSAL_FAILED",
+      { options: 1, streams: streams.length }, streams.length ? null : "UNIVERSAL_EMPTY",
+      universalDiagnosticSummary(diagnostics, streams.length, Date.now() - startedAt, errorCode));
+    return { attempted: true, streams: streams.length ? streams : null, errorCode: streams.length ? null : errorCode };
+  } catch (error) {
+    if (isCancellation(error)) throw error;
+    traceDetailed("UNIVERSAL_FAILED", { options: 1, streams: 0 },
+      "UNIVERSAL_ERROR", { elapsedMs: Date.now() - startedAt, candidateCount: 0, verifiedCount: 0 });
+    return { attempted: true, streams: null };
+  }
+}
+
+function legacySuccess(streams, subtitles, diagnostic) {
+  traceDetailed("LEGACY_SUCCESS", { options: 1, streams: streams.length }, null, diagnostic || {});
+  return { streams: attachSubtitles(streams, subtitles) };
+}
+
+function localResolverPlaybackHeaders(embedUrl, resolverHeaders) {
+  var origin = urlOrigin(embedUrl);
+  if (!origin) return {};
+  var headers = {
+    "User-Agent": EMBED_USER_AGENT,
+    "Accept-Language": EMBED_ACCEPT_LANGUAGE
+  };
+  var verifiedReferer = isObject(resolverHeaders) ? text(resolverHeaders.Referer) : null;
+  // Keep only the origin-only Referer that the resolver scoped to this media
+  // origin. A cross-origin media redirect removes it before it reaches the
+  // destination. Probe-only Range/Accept and source-supplied credentials never
+  // enter the Media3 stream headers.
+  if (verifiedReferer === origin + "/") headers.Referer = verifiedReferer;
+  return headers;
+}
+
+function isHlsPlaylist(body, contentType) {
+  return typeof body === "string" && /^\s*#EXTM3U(?:\s|$)/i.test(body) &&
+    !/(?:text\/html|application\/xhtml\+xml)/i.test(text(contentType) || "") &&
+    !/<\s*html/i.test(body.slice(0, 1024));
+}
+
+function streamsFromHlsPlaylist(body, manifestUrl, playbackUrl, baseHeaders, sourceIndex, fallbackQuality) {
+  var startedAt = Date.now();
+  var resolver = YUME_DRAMAWORLD_LOCAL_RESOLVER;
+  if (!resolver || typeof resolver.parseHlsMaster !== "function" || !isHlsPlaylist(body)) {
+    traceDetailed("HLS_MASTER_RESULT", { options: 1, streams: 0 }, "HLS_PLAYLIST_INVALID",
+      { hostUrl: manifestUrl, elapsedMs: Date.now() - startedAt });
+    return [];
+  }
+  var variants = resolver.parseHlsMaster(body, manifestUrl, {});
+  traceDetailed("HLS_MASTER_RESULT", { options: 1, streams: variants.length }, null,
+    { hostUrl: manifestUrl, elapsedMs: Date.now() - startedAt });
+  var hasVariants = variants.length > 0;
+  var mediaRows = hasVariants ? variants : [{ url: manifestUrl, type: "hls", quality: text(fallbackQuality) }];
+  var output = [];
+  mediaRows.forEach(function (media) {
+    var url = publicHttpUrl(media && media.url);
+    if (!url || !/^https:\/\//i.test(url) || output.some(function (item) { return item.url === url; })) return;
+    var scopedHeaders = typeof resolver.headersForSubresource === "function"
+      ? resolver.headersForSubresource(baseHeaders || {}, manifestUrl, url)
+      : (baseHeaders || {});
+    var quality = text(media.quality) || (!hasVariants ? text(fallbackQuality) : null);
+    var serverName = "سيرفر " + (Number(sourceIndex) + 1);
+    var stream = {
+      url: url,
+      type: "hls",
+      title: serverName,
+      name: serverName,
+      provider: "DramaWorld",
+      headers: Object.assign({}, localResolverPlaybackHeaders(playbackUrl, scopedHeaders))
+    };
+    if (quality) stream.quality = quality;
+    output.push(stream);
+  });
+  return output;
+}
+
+function mediaCandidateFailureCode(status, contentType, responseKind) {
+  if (status === 401 || status === 403) return "HTTP_STATUS_DENIED";
+  if (status < 200 || status >= 300) return "MEDIA_HTTP_ERROR";
+  if (diagnosticContentType(contentType) === "text/html" ||
+      diagnosticContentType(contentType) === "application/xhtml+xml" || responseKind === "html") return "HTML_RESPONSE";
+  return responseKind === "hls" || responseKind === "mp4" ? null : "MEDIA_SIGNATURE_INVALID";
+}
+
+function diagnosticFetch(transport, records) {
+  var nextCandidateIndex = 0;
+  var activeCandidateIndex = -1;
+  var previousWasRedirect = false;
+  return async function (input, init) {
+    var requestUrl = typeof input === "string" ? input : text(input && input.url);
+    if (activeCandidateIndex < 0 || !previousWasRedirect) activeCandidateIndex = nextCandidateIndex++;
+    var candidateIndex = activeCandidateIndex;
+    var startedAt = Date.now();
+    var response;
+    try {
+      response = await transport(input, init);
+    } catch (error) {
+      previousWasRedirect = false;
+      records.push({
+        host: sourceHost(requestUrl), httpStatus: 0, contentType: null,
+        responseKind: "unknown", elapsedMs: Date.now() - startedAt,
+        candidateIndex: candidateIndex, failureCode: "NETWORK_ERROR"
+      });
+      throw error;
+    }
+    var status = Number(response && response.status) || 0;
+    var contentType = response && response.headers && response.headers.get("content-type") || null;
+    var record = {
+      host: sourceHost(requestUrl), httpStatus: status,
+      contentType: diagnosticContentType(contentType), responseKind: "unknown",
+      elapsedMs: Date.now() - startedAt, candidateIndex: candidateIndex, failureCode: null
+    };
+    var saved = false;
+    function save(kind, bodyElapsed) {
+      if (saved) return;
+      saved = true;
+      record.responseKind = kind || "unknown";
+      record.elapsedMs = Date.now() - startedAt;
+      record.failureCode = status >= 300 && status < 400
+        ? null : mediaCandidateFailureCode(status, contentType, record.responseKind);
+      records.push(record);
+    }
+    previousWasRedirect = status >= 300 && status < 400;
+    if (previousWasRedirect || status < 200 || status >= 300) save("unknown");
+    var wrapped = {
+      ok: response && response.ok,
+      status: response && response.status,
+      statusText: response && response.statusText,
+      url: response && response.url,
+      headers: response && response.headers,
+      networkError: response && response.networkError,
+      text: async function () {
+        var body = await response.text();
+        save(responseKindFromBody(contentType, body));
+        return body;
+      },
+      arrayBuffer: async function () {
+        var body = await response.arrayBuffer();
+        save(responseKindFromBody(contentType, body));
+        return body;
+      }
+    };
+    return wrapped;
+  };
+}
+
+async function resolveEmbedLocally(embedResponse, sourceIndex, source, directCandidate) {
+  var resolver = YUME_DRAMAWORLD_LOCAL_RESOLVER;
+  var response = isObject(embedResponse) ? embedResponse : {};
+  var hasEmbedBody = typeof response.body === "string";
+  var sourceUrl = text(response.finalUrl) || text(source && source.url) || text(directCandidate && directCandidate.url);
+  var resolverUrl = hasEmbedBody
+    ? (text(response.finalUrl) || sourceUrl)
+    : (text(directCandidate && directCandidate.url) || sourceUrl);
+  var familyUrl = text(response.finalUrl) || text(source && source.url) || resolverUrl;
+  if (!resolver || typeof resolver.resolve !== "function" || typeof fetch !== "function") {
+    return { streams: [], family: null, errorCode: "DRAMAWORLD_LOCAL_RESOLVER_UNAVAILABLE" };
+  }
+  var family = resolver.familyFromUrl(familyUrl);
+  var candidateCount = 0;
+  var parseStartedAt = Date.now();
+  try {
+    candidateCount = hasEmbedBody && typeof resolver.parseCandidates === "function"
+      ? resolver.parseCandidates(response.body, resolverUrl, {}).length
+      : directCandidate ? 1 : 0;
+  } catch (_) { candidateCount = directCandidate ? 1 : 0; }
+  traceDetailed("LOCAL_PARSE_RESULT", { options: 1, streams: 0 },
+    candidateCount ? null : "NO_MEDIA_CANDIDATE",
+    { hostUrl: familyUrl, candidateCount: candidateCount, elapsedMs: Date.now() - parseStartedAt });
+  var resolverStartedAt = Date.now();
+  var mediaDiagnostics = [];
+  traceStreams("LOCAL_RESOLVER_START", { options: 1, streams: 0 }, null, {
+    hostUrl: familyUrl,
+    httpStatus: Number(response.httpStatus) || null,
+    responseReceived: response.responseReceived === true,
+    contentType: response.contentType,
+    responseKind: responseKindFromBody(response.contentType, response.body),
+    candidateCount: candidateCount,
+    elapsedMs: 0
+  });
+  traceDetailed("LOCAL_RESOLVER_DETAIL_START", { options: 1, streams: 0 }, null, {
+    hostUrl: familyUrl,
+    httpStatus: Number(response.httpStatus) || null,
+    responseReceived: response.responseReceived === true,
+    contentType: response.contentType,
+    responseKind: responseKindFromBody(response.contentType, response.body),
+    candidateCount: candidateCount,
+    elapsedMs: 0
+  });
+  var result;
+  var caughtErrorCode = null;
+  try {
+    var resolverHeaders = safeSourceHeaders(source || {});
+    // The local engine generates a referer from the embed origin. Ignore API
+    // supplied cross-origin Referer/Origin values so its scoped playback
+    // headers remain stable and cannot leak to a media host.
+    delete resolverHeaders.Referer;
+    delete resolverHeaders.Origin;
+    var resolverSource = {
+      url: resolverUrl,
+      family: family || undefined,
+      headers: resolverHeaders,
+      quality: text(directCandidate && directCandidate.quality) || text(source && source.quality) || undefined
+    };
+    var resolverContext = {
+      fetch: diagnosticsEnabled() ? diagnosticFetch(fetch, mediaDiagnostics) : fetch,
+      timeoutMs: EMBED_RESOLVE_TIMEOUT_MS,
+      userAgent: EMBED_USER_AGENT,
+      acceptLanguage: EMBED_ACCEPT_LANGUAGE,
+      playbackHeaders: { Referer: (urlOrigin(familyUrl) || "") + "/" },
+      allowExternalResolver: false
+    };
+    if (hasEmbedBody) resolverContext.embedBody = response.body;
+    result = await resolver.resolve(resolverSource, resolverContext);
+  } catch (error) {
+    if (isCancellation(error)) throw error;
+    caughtErrorCode = error && error.code || "DRAMAWORLD_LOCAL_RESOLVER_EXCEPTION";
+    result = null;
+  }
+  var mediaRows = result && Array.isArray(result.streams) ? result.streams : [];
+  var verifiedCount = mediaDiagnostics.filter(function (item) {
+    return item.httpStatus >= 200 && item.httpStatus < 300 &&
+      !item.failureCode && (item.responseKind === "hls" || item.responseKind === "mp4");
+  }).length;
+  var lastProbe = mediaDiagnostics.length ? mediaDiagnostics[mediaDiagnostics.length - 1] : null;
+  mediaDiagnostics.forEach(function (item) {
+    traceDetailed("MEDIA_CANDIDATE_RESULT", { options: 1, streams: 0 }, item.failureCode, {
+      host: item.host,
+      httpStatus: item.httpStatus,
+      contentType: item.contentType,
+      responseKind: item.responseKind,
+      candidateIndex: item.candidateIndex,
+      candidateCount: candidateCount,
+      verifiedCount: verifiedCount,
+      elapsedMs: item.elapsedMs,
+      candidateFailureCode: item.failureCode
+    });
+  });
+  var output = [];
+  mediaRows.forEach(function (media) {
+    if (!isObject(media) || media.verified !== true ||
+        (media.type !== "hls" && media.type !== "mp4") ||
+        !publicHttpUrl(media.url) || !/^https:\/\//i.test(media.url)) return;
+    if (output.some(function (existing) { return existing.url === media.url; })) return;
+    var quality = text(media.quality);
+    var label = "سيرفر " + (Number(sourceIndex) + 1);
+    var playbackHeaders = localResolverPlaybackHeaders(familyUrl, media.playbackHeaders);
+    var stream = {
+      url: media.url,
+      type: media.type,
+      title: label,
+      name: label,
+      provider: "DramaWorld",
+      headers: Object.assign({}, playbackHeaders)
+    };
+    if (quality) stream.quality = quality;
+    output.push(stream);
+  });
+  var errorCode = output.length ? null : caughtErrorCode || result && result.errorCode || "DRAMAWORLD_LOCAL_RESOLVER_NO_STREAMS";
+  traceStreams("LOCAL_RESOLVER_RESULT", { options: 1, streams: output.length }, errorCode, {
+    hostUrl: familyUrl,
+    httpStatus: Number(response.httpStatus) || null,
+    responseReceived: response.responseReceived === true || mediaRows.length > 0,
+    videoExtracted: output.length > 0,
+    contentType: response.contentType,
+    responseKind: responseKindFromBody(response.contentType, response.body),
+    candidateCount: candidateCount,
+    verifiedCount: verifiedCount,
+    elapsedMs: Date.now() - resolverStartedAt,
+    mediaHost: lastProbe && lastProbe.host,
+    mediaHttpStatus: lastProbe && lastProbe.httpStatus,
+    mediaContentType: lastProbe && lastProbe.contentType,
+    mediaResponseKind: lastProbe && lastProbe.responseKind,
+    mediaElapsedMs: lastProbe && lastProbe.elapsedMs,
+    candidateFailureCode: lastProbe && lastProbe.failureCode
+  });
+  return { streams: output, family: family || null, errorCode: errorCode,
+    candidateCount: candidateCount, verifiedCount: verifiedCount, elapsedMs: Date.now() - resolverStartedAt,
+    mediaDiagnostic: lastProbe };
 }
 
 async function resolveStreamOption(args) {
@@ -1448,15 +2034,25 @@ async function resolveStreamOption(args) {
     throw identityError;
   }
 
+  var configStartedAt = Date.now();
   var config = await readConfig();
+  traceDetailed("CONFIG_RESULT", { sourceRows: 0, options: 1, streams: 0 }, null,
+    { elapsedMs: Date.now() - configStartedAt });
   var route = identity.kind === "movie" ? "movie/source/by/" : "episode/source/by/";
   var sourceRows;
+  var subtitlePromise = fetchSubtitlesForIdentity(config, identity);
+  var sourceStartedAt = Date.now();
   try {
     sourceRows = await requestDecodedSources(config, endpointPath(config, route + identity.id));
   } catch (sourceError) {
     traceStreams("RESOLVE_API_FAILURE", {}, sourceError && sourceError.code || "DRAMAWORLD_NETWORK_ERROR");
     throw sourceError;
   }
+  var sourceElapsedMs = Date.now() - sourceStartedAt;
+  var subtitleResult = await subtitlePromise;
+  traceDetailed("RESOLVE_INPUTS_READY", { sourceRows: sourceRows.length, options: 1, streams: 0 },
+    subtitleResult.available ? null : "DRAMAWORLD_SUBTITLES_UNAVAILABLE",
+    { elapsedMs: Math.max(sourceElapsedMs, subtitleResult.elapsedMs) });
   var source = sourceRows[selection.index];
   if (!isObject(source) || source.external === true ||
       stableSourceFingerprint(source, identity, selection.index) !== selection.fingerprint) {
@@ -1476,6 +2072,30 @@ async function resolveStreamOption(args) {
     throw embedUrlError;
   }
 
+  // Production contract: Universal First is the default. Disabling the setting
+  // selects Legacy Only immediately; otherwise the legacy path is entered at
+  // most once, only after an empty/failed universal result.
+  var universalAttempt = await resolveWithUniversalExtractor(embedUrl, selection.index, source);
+  if (universalAttempt.streams && universalAttempt.streams.length) {
+    traceStreams("RESOLVE_READY", { sourceRows: sourceRows.length, options: 1, streams: universalAttempt.streams.length }, null, {
+      hostUrl: embedUrl, responseReceived: true, videoExtracted: true
+    });
+    return { streams: attachSubtitles(universalAttempt.streams, subtitleResult.subtitles) };
+  }
+  if (universalAttempt.errorCode === "HTTP_REFUSED") {
+    var refusedError;
+    try { fail("DRAMAWORLD_MEDIA_HTTP_REFUSED", "selected server refused media access"); }
+    catch (error) { refusedError = error; }
+    traceStreamFailure(refusedError, "HTTP_REFUSED",
+      { sourceRows: sourceRows.length, options: 1, streams: 0 }, embedUrl);
+    throw refusedError;
+  }
+  if (universalAttempt.attempted) {
+    traceDetailed("LEGACY_FALLBACK", { sourceRows: sourceRows.length, options: 1, streams: 0 },
+      "UNIVERSAL_UNRESOLVED", { candidateCount: 0, verifiedCount: 0 });
+  }
+
+  var legacyStartedAt = Date.now();
   var candidates;
   try {
     candidates = parseDirectMediaCandidates(JSON.stringify(source));
@@ -1495,6 +2115,22 @@ async function resolveStreamOption(args) {
       throw embedError;
     }
     playbackUrl = embedResponse.finalUrl;
+    if (isHlsPlaylist(embedResponse.body, embedResponse.contentType)) {
+      var playlistStreams = streamsFromHlsPlaylist(embedResponse.body, embedResponse.finalUrl,
+        playbackUrl, playbackHeadersForEmbed(playbackUrl, source), selection.index, source.quality);
+      if (playlistStreams.length) {
+        traceStreams("RESOLVE_READY", { sourceRows: sourceRows.length, options: 1, streams: playlistStreams.length }, null, {
+          hostUrl: embedResponse.finalUrl, httpStatus: embedResponse.httpStatus,
+          responseReceived: embedResponse.responseReceived, videoExtracted: true
+        });
+        return legacySuccess(playlistStreams, subtitleResult.subtitles, {
+          hostUrl: embedResponse.finalUrl, httpStatus: embedResponse.httpStatus,
+          responseReceived: embedResponse.responseReceived,
+          elapsedMs: Date.now() - legacyStartedAt
+        });
+      }
+    }
+    var embedParseStartedAt = Date.now();
     try {
       candidates = parseDirectMediaCandidates(embedResponse.body);
     } catch (parseEmbedError) {
@@ -1509,8 +2145,32 @@ async function resolveStreamOption(args) {
         { sourceRows: sourceRows.length, options: 1, streams: 0 }, embedResponse.finalUrl);
       throw parseEmbedError;
     }
+    traceDetailed("EMBED_PARSE_RESULT", { sourceRows: sourceRows.length, options: 1, streams: 0 }, null, {
+      hostUrl: embedResponse.finalUrl, httpStatus: embedResponse.httpStatus,
+      responseReceived: embedResponse.responseReceived, contentType: embedResponse.contentType,
+      responseKind: responseKindFromBody(embedResponse.contentType, embedResponse.body),
+      candidateCount: candidates.length, verifiedCount: 0, elapsedMs: Date.now() - embedParseStartedAt
+    });
   }
+
   if (!candidates.length) {
+    var localResult = null;
+    if (localResolverEnabled()) {
+      localResult = await resolveEmbedLocally(embedResponse, selection.index, source, null);
+      if (localResult && localResult.streams.length) {
+        traceStreams("RESOLVE_READY", { sourceRows: sourceRows.length, options: 1, streams: localResult.streams.length }, null, {
+          hostUrl: embedResponse && embedResponse.finalUrl || embedUrl,
+          httpStatus: embedResponse && embedResponse.httpStatus || null,
+          responseReceived: !!(embedResponse && embedResponse.responseReceived), videoExtracted: true
+        });
+        return legacySuccess(localResult.streams, subtitleResult.subtitles, {
+          hostUrl: embedResponse && embedResponse.finalUrl || embedUrl,
+          httpStatus: embedResponse && embedResponse.httpStatus || null,
+          responseReceived: !!(embedResponse && embedResponse.responseReceived),
+          elapsedMs: Date.now() - legacyStartedAt
+        });
+      }
+    }
     var unresolvedError;
     var unresolvedContext = {
       hostUrl: embedResponse && embedResponse.finalUrl || embedUrl,
@@ -1522,6 +2182,19 @@ async function resolveStreamOption(args) {
     } catch (error) { unresolvedError = error; }
     traceStreamFailure(unresolvedError, "EMBED_UNRESOLVED",
       { sourceRows: sourceRows.length, options: 1, streams: 0 }, embedUrl);
+    if (localResult && localResult.errorCode) {
+      traceStreams("LOCAL_RESOLVER_FALLBACK_FAILED", { options: 1, streams: 0 }, localResult.errorCode, Object.assign({}, unresolvedContext, {
+        candidateCount: localResult.candidateCount,
+        verifiedCount: localResult.verifiedCount,
+        elapsedMs: localResult.elapsedMs,
+        mediaHost: localResult.mediaDiagnostic && localResult.mediaDiagnostic.host,
+        mediaHttpStatus: localResult.mediaDiagnostic && localResult.mediaDiagnostic.httpStatus,
+        mediaContentType: localResult.mediaDiagnostic && localResult.mediaDiagnostic.contentType,
+        mediaResponseKind: localResult.mediaDiagnostic && localResult.mediaDiagnostic.responseKind,
+        mediaElapsedMs: localResult.mediaDiagnostic && localResult.mediaDiagnostic.elapsedMs,
+        candidateFailureCode: localResult.mediaDiagnostic && localResult.mediaDiagnostic.failureCode
+      }));
+    }
     throw unresolvedError;
   }
 
@@ -1530,7 +2203,8 @@ async function resolveStreamOption(args) {
   var lastValidationError = null;
   for (var candidateIndex = 0; candidateIndex < candidates.length; candidateIndex += 1) {
     try {
-      verifiedMedia = await verifyMediaCandidate(candidates[candidateIndex], playbackUrl, source);
+      verifiedMedia = await verifyMediaCandidate(candidates[candidateIndex], playbackUrl, source,
+        candidateIndex, candidates.length);
       selected = candidates[candidateIndex];
       break;
     } catch (validationError) {
@@ -1541,8 +2215,61 @@ async function resolveStreamOption(args) {
     }
   }
   if (!selected || !verifiedMedia) {
+    // The legacy parser may identify a URL that fails signature validation while
+    // the structural local parser can still find a different, valid rendition
+    // in the already-fetched embed page. Reuse that page and preserve the old
+    // validation error if the fallback also fails.
+    var fallbackResult = null;
+    if (localResolverEnabled() && embedResponse) {
+      fallbackResult = await resolveEmbedLocally(embedResponse, selection.index, source, candidates[0]);
+      if (fallbackResult && fallbackResult.streams.length) {
+        traceStreams("RESOLVE_READY", { sourceRows: sourceRows.length, options: 1, streams: fallbackResult.streams.length }, null, {
+          hostUrl: embedResponse && embedResponse.finalUrl || candidates[0].url,
+          httpStatus: embedResponse && embedResponse.httpStatus || null,
+          responseReceived: !!(embedResponse && embedResponse.responseReceived), videoExtracted: true
+        });
+        return legacySuccess(fallbackResult.streams, subtitleResult.subtitles, {
+          hostUrl: embedResponse && embedResponse.finalUrl || candidates[0].url,
+          httpStatus: embedResponse && embedResponse.httpStatus || null,
+          responseReceived: !!(embedResponse && embedResponse.responseReceived),
+          elapsedMs: Date.now() - legacyStartedAt
+        });
+      }
+      if (fallbackResult && fallbackResult.errorCode) {
+        traceStreams("LOCAL_RESOLVER_FALLBACK_FAILED", { options: 1, streams: 0 }, fallbackResult.errorCode, {
+          hostUrl: embedResponse && embedResponse.finalUrl || candidates[0].url,
+          httpStatus: embedResponse && embedResponse.httpStatus || null,
+          responseReceived: !!(embedResponse && embedResponse.responseReceived),
+          candidateCount: fallbackResult.candidateCount,
+          verifiedCount: fallbackResult.verifiedCount,
+          elapsedMs: fallbackResult.elapsedMs,
+          mediaHost: fallbackResult.mediaDiagnostic && fallbackResult.mediaDiagnostic.host,
+          mediaHttpStatus: fallbackResult.mediaDiagnostic && fallbackResult.mediaDiagnostic.httpStatus,
+          mediaContentType: fallbackResult.mediaDiagnostic && fallbackResult.mediaDiagnostic.contentType,
+          mediaResponseKind: fallbackResult.mediaDiagnostic && fallbackResult.mediaDiagnostic.responseKind,
+          mediaElapsedMs: fallbackResult.mediaDiagnostic && fallbackResult.mediaDiagnostic.elapsedMs,
+          candidateFailureCode: fallbackResult.mediaDiagnostic && fallbackResult.mediaDiagnostic.failureCode
+        });
+      }
+    }
     if (lastValidationError) throw lastValidationError;
     fail("DRAMAWORLD_MEDIA_RESPONSE_INVALID", "selected server did not return a valid video source");
+  }
+
+  if (selected.type === "hls") {
+    var hlsStreams = streamsFromHlsPlaylist(verifiedMedia.body, verifiedMedia.url,
+      playbackUrl, verifiedMedia.playbackHeaders, selection.index, selected.quality);
+    if (hlsStreams.length) {
+      traceStreams("RESOLVE_READY", { sourceRows: sourceRows.length, options: 1, streams: hlsStreams.length }, null, {
+        hostUrl: verifiedMedia.hostUrl, httpStatus: verifiedMedia.httpStatus,
+        responseReceived: verifiedMedia.responseReceived, videoExtracted: true
+      });
+      return legacySuccess(hlsStreams, subtitleResult.subtitles, {
+        hostUrl: verifiedMedia.hostUrl, httpStatus: verifiedMedia.httpStatus,
+        responseReceived: verifiedMedia.responseReceived,
+        elapsedMs: Date.now() - legacyStartedAt
+      });
+    }
   }
 
   var streamName = "سيرفر " + (selection.index + 1);
@@ -1552,7 +2279,9 @@ async function resolveStreamOption(args) {
     title: streamName,
     name: streamName,
     provider: "DramaWorld",
-    headers: playbackHeadersForEmbed(playbackUrl, source)
+    headers: selected.type === "mp4"
+      ? playbackHeadersForEmbed(playbackUrl, source)
+      : verifiedMedia.playbackHeaders || playbackHeadersForEmbed(playbackUrl, source)
   };
   traceStreams("RESOLVE_READY", { sourceRows: sourceRows.length, options: 1, streams: 1 }, null, {
     hostUrl: verifiedMedia.hostUrl,
@@ -1561,7 +2290,11 @@ async function resolveStreamOption(args) {
     videoExtracted: true
   });
   if (selected.quality) stream.quality = selected.quality;
-  return { streams: [stream] };
+  return legacySuccess([stream], subtitleResult.subtitles, {
+    hostUrl: verifiedMedia.hostUrl, httpStatus: verifiedMedia.httpStatus,
+    responseReceived: verifiedMedia.responseReceived,
+    elapsedMs: Date.now() - legacyStartedAt
+  });
 }
 
 module.exports = {
@@ -1600,3 +2333,764 @@ module.exports = {
     isHtmlOrChallengeBody: isHtmlOrChallengeBody
   }
 };
+
+
+// Bundled local DramaWorld resolver. Kept in a private scope so its optional CommonJS export cannot replace the plugin API.
+var YUME_DRAMAWORLD_LOCAL_RESOLVER = (function () {
+  var module;
+/*
+ * DramaWorld Resolver Lab
+ * Standalone ES2019/QuickJS-oriented resolver. No eval, DOM, Node APIs, Android
+ * APIs, or network access are used unless a caller injects a fetch function.
+ */
+(function (root) {
+  "use strict";
+
+  var VERSION = "0.1.0-lab";
+  var DEFAULT_TIMEOUT_MS = 10000;
+  var MAX_BODY_CHARS = 512 * 1024;
+  var MAX_PROBE_BYTES = 64 * 1024;
+  var MAX_CANDIDATES = 48;
+  var MAX_REDIRECTS = 4;
+  var USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36";
+  var ACCEPT_LANGUAGE = "en-US,en;q=0.9";
+  var FAMILIES = {
+    anafast: { resolver: "dramaworld.anafast.local", external: null },
+    okhd: { resolver: "dramaworld.okhd.local+optional-external", external: { method: "GET", path: "scrapefinal/turki.php", queryKey: "api", forwardsHtml: false } },
+    vidspeed: { resolver: "dramaworld.vidspeed.local+optional-external", external: { method: "POST", path: "scrapefinal/earnvids.php", fallback: { method: "GET", path: "scrapefinal/earnvids.php", queryKey: "api" }, forwardsHtml: true } },
+    upzur: { resolver: "dramaworld.upzur.local+optional-external", external: { method: "POST", path: "scrapefinal/upzur.php", fallback: { method: "GET", path: "scrapefinal/upzur.php", queryKey: "api" }, forwardsHtml: true } },
+    luluvdo: { resolver: "dramaworld.luluvdo.local+optional-external", external: { method: "POST", path: "scrapefinal/extractm3u8.php", fallback: { method: "GET", path: "scrapefinal/extractm3u8.php", queryKey: "api" }, forwardsHtml: true } }
+  };
+
+  function result(streams, type, quality, headers, resolverId, errorCode, extra) {
+    return Object.assign({
+      streams: streams || [], type: type || null, quality: quality || null,
+      playbackHeaders: headers || {}, resolverId: resolverId || "dramaworld.unknown",
+      errorCode: errorCode || null
+    }, extra || {});
+  }
+
+  function parseHttpUrl(value) {
+    if (typeof value !== "string" || value.length > 8192 || /[\u0000-\u0020\\\u007f]/.test(value)) return null;
+    var match = /^(https?):\/\/([^/?#]+)([^?#]*)(?:\?([^#]*))?(?:#(.*))?$/i.exec(value);
+    if (!match) return null;
+    var authority = match[2];
+    if (authority.indexOf("@") >= 0 || authority.charAt(0) === "[" || authority.indexOf("]") >= 0) return null;
+    var hostPort = /^([a-z0-9.-]+)(?::([0-9]{1,5}))?$/i.exec(authority);
+    if (!hostPort) return null;
+    var host = hostPort[1].toLowerCase();
+    var port = hostPort[2] ? Number(hostPort[2]) : null;
+    if (!host || host.length > 253 || host.charAt(0) === "." || host.charAt(host.length - 1) === "." || host.indexOf("..") >= 0) return null;
+    if (port !== null && (port < 1 || port > 65535)) return null;
+    if (!host.split(".").every(function (part) { return part.length <= 63 && /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/i.test(part); })) return null;
+    return {
+      protocol: match[1].toLowerCase(), host: host, port: port,
+      origin: match[1].toLowerCase() + "://" + host + (port === null ? "" : ":" + port),
+      path: match[3] || "/", query: match[4] || "", fragment: match[5] || ""
+    };
+  }
+
+  function isPrivateIpv4(host) {
+    if (!/^[0-9.]+$/.test(host)) return false;
+    var p = host.split(".").map(Number);
+    if (p.length !== 4 || p.some(function (n) { return n < 0 || n > 255; })) return true;
+    return p[0] === 0 || p[0] === 10 || p[0] === 127 ||
+      (p[0] === 169 && p[1] === 254) || (p[0] === 172 && p[1] >= 16 && p[1] <= 31) ||
+      (p[0] === 192 && p[1] === 168) || (p[0] === 100 && p[1] >= 64 && p[1] <= 127) ||
+      (p[0] === 198 && (p[1] === 18 || p[1] === 19)) || p[0] >= 224;
+  }
+
+  function isAllowedUrl(value, context) {
+    var parsed = parseHttpUrl(value);
+    if (!parsed) return false;
+    if (context && context.testOnlyAllowPrivateHosts === true && parsed.protocol === "http") {
+      return parsed.host === "127.0.0.1" || parsed.host === "localhost";
+    }
+    if (parsed.protocol !== "https") return false;
+    return parsed.host !== "localhost" && parsed.host !== "localhost.localdomain" &&
+      !/\.(?:localhost|local|internal|test)$/.test(parsed.host) && !isPrivateIpv4(parsed.host);
+  }
+
+  function normalizePath(path) {
+    var absolute = path.charAt(0) === "/";
+    var trailing = path.length > 1 && path.charAt(path.length - 1) === "/";
+    var stack = [];
+    path.split("/").forEach(function (part) {
+      if (!part || part === ".") return;
+      if (part === "..") stack.pop(); else stack.push(part);
+    });
+    var resultPath = (absolute ? "/" : "") + stack.join("/");
+    if (!resultPath) resultPath = "/";
+    if (trailing && resultPath.charAt(resultPath.length - 1) !== "/") resultPath += "/";
+    return resultPath;
+  }
+
+  function resolveUrl(reference, baseUrl) {
+    if (typeof reference !== "string" || !baseUrl) return null;
+    var ref = reference.trim().replace(/&amp;/gi, "&").replace(/\\\//g, "/");
+    if (!ref) return null;
+    if (/^https?:\/\//i.test(ref)) return ref;
+    var base = parseHttpUrl(baseUrl);
+    if (!base) return null;
+    if (ref.slice(0, 2) === "//") return base.protocol + ":" + ref;
+    if (ref.charAt(0) === "#") return base.origin + base.path + (base.query ? "?" + base.query : "") + ref;
+    if (ref.charAt(0) === "?") return base.origin + base.path + ref;
+    var refMatch = /^([^?#]*)(?:\?([^#]*))?(?:#(.*))?$/.exec(ref);
+    if (!refMatch) return null;
+    var path = refMatch[1];
+    var nextPath;
+    if (!path) nextPath = base.path;
+    else if (path.charAt(0) === "/") nextPath = normalizePath(path);
+    else nextPath = normalizePath(base.path.substring(0, base.path.lastIndexOf("/") + 1) + path);
+    var query = refMatch[2] !== undefined ? "?" + refMatch[2] : (!path && base.query ? "?" + base.query : "");
+    var fragment = refMatch[3] !== undefined ? "#" + refMatch[3] : "";
+    return base.origin + nextPath + query + fragment;
+  }
+
+  function familyFromUrl(url, hint) {
+    var normalizedHint = typeof hint === "string" ? hint.toLowerCase().trim() : "";
+    if (FAMILIES[normalizedHint]) return normalizedHint;
+    var parsed = parseHttpUrl(url);
+    if (!parsed) return null;
+    var labels = parsed.host.split(".");
+    for (var i = labels.length - 1; i >= 0; i -= 1) if (FAMILIES[labels[i]]) return labels[i];
+    return null;
+  }
+
+  function qualityNumber(value) {
+    var match = /(?:^|[^0-9])([0-9]{3,4})\s*p?(?:$|[^0-9])/i.exec(String(value || ""));
+    return match ? Number(match[1]) : 0;
+  }
+
+  function pathType(url) {
+    var parsed = parseHttpUrl(url);
+    if (!parsed) return null;
+    if (/\.m3u8$/i.test(parsed.path)) return "hls";
+    if (/\.mp4$/i.test(parsed.path)) return "mp4";
+    return null;
+  }
+
+  function addCandidate(output, rawUrl, quality, baseUrl, declaredType, context) {
+    if (output.length >= MAX_CANDIDATES || typeof rawUrl !== "string") return;
+    var url = resolveUrl(rawUrl, baseUrl);
+    if (!url || !isAllowedUrl(url, context)) return;
+    var type = pathType(url);
+    if (!type && (declaredType === "hls" || declaredType === "mp4")) type = declaredType;
+    if (type !== "hls" && type !== "mp4") type = null;
+    if (output.some(function (item) { return item.url === url; })) return;
+    output.push({ url: url, type: type, quality: typeof quality === "string" && quality.trim() ? quality.trim() : null });
+  }
+
+  function walkJson(value, baseUrl, output, context, depth) {
+    if (depth > 8 || !value || typeof value !== "object") return;
+    if (Array.isArray(value)) { value.forEach(function (item) { walkJson(item, baseUrl, output, context, depth + 1); }); return; }
+    ["sources", "links", "availableQualities"].forEach(function (key) {
+      var rows = value[key];
+      if (!Array.isArray(rows)) return;
+      rows.forEach(function (row) {
+        var url = typeof row === "string" ? row : row && (row.file || row.url || row.src);
+        var quality = row && typeof row === "object" ? row.quality || row.label || row.name : null;
+        addCandidate(output, url, quality, baseUrl, row && row.type, context);
+      });
+    });
+    if (Array.isArray(value.filtered_content)) {
+      value.filtered_content.forEach(function (row, index) {
+        var labels = value.Quality || value.qualities || [];
+        addCandidate(output, typeof row === "string" ? row : row && (row.file || row.url),
+          labels[index] || (row && (row.quality || row.label)), baseUrl, row && row.type, context);
+      });
+    }
+    if (value.file || value.url || value.src) {
+      addCandidate(output, value.file || value.url || value.src, value.quality || value.label,
+        baseUrl, value.type, context);
+    }
+    if (value.data && typeof value.data === "object") walkJson(value.data, baseUrl, output, context, depth + 1);
+  }
+
+  function findBalancedObject(text, start) {
+    var depth = 0, quote = "", escape = false;
+    for (var i = start; i < text.length; i += 1) {
+      var ch = text.charAt(i);
+      if (quote) {
+        if (escape) escape = false;
+        else if (ch === "\\") escape = true;
+        else if (ch === quote) quote = "";
+      } else if (ch === "\"" || ch === "'") quote = ch;
+      else if (ch === "{") depth += 1;
+      else if (ch === "}" && --depth === 0) return text.slice(start, i + 1);
+    }
+    return null;
+  }
+
+  function parseJwJson(text, baseUrl, output, context) {
+    var setup = /\.setup\s*\(/i.exec(text);
+    if (!setup) return;
+    var start = text.indexOf("{", setup.index + setup[0].length);
+    if (start < 0) return;
+    var balanced = findBalancedObject(text, start);
+    if (!balanced) return;
+    try { walkJson(JSON.parse(balanced), baseUrl, output, context, 0); } catch (_) { /* JSON-only: never evaluate JS. */ }
+  }
+
+  function unpackPackerText(text) {
+    if (typeof text !== "string" || text.length > MAX_BODY_CHARS) return null;
+    function skipSpace(input, index) {
+      while (index < input.length && /\s/.test(input.charAt(index))) index += 1;
+      return index;
+    }
+    function readQuotedString(input, index) {
+      var quote = input.charAt(index);
+      if (quote !== "'" && quote !== '"') return null;
+      var value = "";
+      for (var cursor = index + 1; cursor < input.length; cursor += 1) {
+        var ch = input.charAt(cursor);
+        if (ch === quote) return { value: value, next: cursor + 1 };
+        if (ch !== "\\") { value += ch; continue; }
+        cursor += 1;
+        if (cursor >= input.length) return null;
+        var escaped = input.charAt(cursor);
+        if (escaped === "n") value += "\n";
+        else if (escaped === "r") value += "\r";
+        else if (escaped === "t") value += "\t";
+        else if (escaped === "b") value += "\b";
+        else if (escaped === "f") value += "\f";
+        else if (escaped === "v") value += "\v";
+        else if (escaped === "x" || escaped === "u") {
+          var digits = escaped === "x" ? 2 : 4;
+          var hex = input.slice(cursor + 1, cursor + 1 + digits);
+          if (hex.length !== digits || !/^[0-9a-f]+$/i.test(hex)) return null;
+          value += String.fromCharCode(parseInt(hex, 16));
+          cursor += digits;
+        } else if (escaped === "\n") {
+          // JavaScript line continuation contributes no character.
+        } else if (escaped === "\r") {
+          if (input.charAt(cursor + 1) === "\n") cursor += 1;
+        } else {
+          // Quoted literals in packed payloads commonly escape quotes, slashes,
+          // or backslashes. Treat other identity escapes as their literal char.
+          value += escaped;
+        }
+        if (value.length > MAX_BODY_CHARS) return null;
+      }
+      return null;
+    }
+    function readInteger(input, index) {
+      var match = /^[0-9]{1,5}/.exec(input.slice(index));
+      return match ? { value: Number(match[0]), next: index + match[0].length } : null;
+    }
+    function readPackerArguments(input, index) {
+      var payload = readQuotedString(input, skipSpace(input, index));
+      if (!payload) return null;
+      index = skipSpace(input, payload.next);
+      if (input.charAt(index++) !== ",") return null;
+      var radix = readInteger(input, skipSpace(input, index));
+      if (!radix) return null;
+      index = skipSpace(input, radix.next);
+      if (input.charAt(index++) !== ",") return null;
+      var count = readInteger(input, skipSpace(input, index));
+      if (!count) return null;
+      index = skipSpace(input, count.next);
+      if (input.charAt(index++) !== ",") return null;
+      var dictionary = readQuotedString(input, skipSpace(input, index));
+      if (!dictionary) return null;
+      index = skipSpace(input, dictionary.next);
+      if (!/^\.\s*split\s*\(/i.test(input.slice(index))) return null;
+      index += /^\.\s*split\s*\(/i.exec(input.slice(index))[0].length;
+      var separator = readQuotedString(input, skipSpace(input, index));
+      if (!separator || separator.value !== "|") return null;
+      index = skipSpace(input, separator.next);
+      if (input.charAt(index) !== ")") return null;
+      return { payload: payload.value, radix: radix.value, count: count.value, words: dictionary.value.split("|") };
+    }
+    function toBase(value, radix) {
+      var alphabet = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+      if (value === 0) return "0";
+      var result = "";
+      while (value > 0) {
+        result = alphabet.charAt(value % radix) + result;
+        value = Math.floor(value / radix);
+      }
+      return result;
+    }
+
+    // Parse the wrapper and string arguments only. The packed function is never
+    // evaluated, so this remains safe for untrusted embed HTML.
+    var wrapper = /eval\s*\(\s*function\s*\([^)]*\)\s*\{[\s\S]*?\}\s*\(/ig;
+    var match, args = null;
+    while ((match = wrapper.exec(text)) !== null) {
+      args = readPackerArguments(text, wrapper.lastIndex);
+      if (args) break;
+      wrapper.lastIndex = match.index + match[0].length;
+    }
+    if (!args || args.radix < 2 || args.radix > 62 || args.count < 1 || args.count > 4096 || args.words.length > 4096) return null;
+
+    var replacements = Object.create(null);
+    for (var i = 0; i < args.count; i += 1) {
+      if (args.words[i]) replacements[toBase(i, args.radix)] = args.words[i];
+    }
+    var decoded = args.payload.replace(/\b\w+\b/g, function (token) {
+      return replacements[token] || token;
+    });
+    return decoded.length <= MAX_BODY_CHARS ? decoded : null;
+  }
+
+  function parseCandidates(body, baseUrl, context) {
+    var output = [];
+    if (typeof body !== "string" || !body.trim() || body.length > MAX_BODY_CHARS) return output;
+    var text = body.replace(/\\\//g, "/").replace(/&amp;/gi, "&");
+    var unpacked = unpackPackerText(text);
+    if (unpacked) text += "\n" + unpacked;
+    var trimmed = text.trim();
+    if (trimmed.charAt(0) === "{" || trimmed.charAt(0) === "[") {
+      try { walkJson(JSON.parse(trimmed), baseUrl, output, context, 0); } catch (_) { /* HTML/raw parser below. */ }
+    }
+    parseJwJson(text, baseUrl, output, context);
+    var fileRegex = /\bfile\s*:\s*(["'])(https?:\/\/[^"']+)\1/gi;
+    var fileMatch;
+    while ((fileMatch = fileRegex.exec(text)) && output.length < MAX_CANDIDATES) {
+      var tail = text.slice(fileMatch.index + fileMatch[0].length, fileMatch.index + fileMatch[0].length + 180);
+      var label = /\blabel\s*:\s*(["'])(.*?)\1/i.exec(tail);
+      addCandidate(output, fileMatch[2], label && label[2], baseUrl, null, context);
+    }
+    // Uqload's core extractor also accepts a literal `sources: ["<url>"]`
+    // entry. The endpoint may be extensionless, so let media-signature
+    // verification determine HLS vs MP4 instead of guessing from its path.
+    var sourceArrayRegex = /\bsources\s*:\s*\[\s*(["'])(https?:\/\/[^"']+)\1/gi;
+    var sourceArrayMatch;
+    while ((sourceArrayMatch = sourceArrayRegex.exec(text)) && output.length < MAX_CANDIDATES) {
+      addCandidate(output, sourceArrayMatch[2], null, baseUrl, null, context);
+    }
+    var urlRegex = /https?:\/\/[^\s"'<>\\]+/gi;
+    var urlMatch;
+    while ((urlMatch = urlRegex.exec(text)) && output.length < MAX_CANDIDATES) {
+      var candidateUrl = urlMatch[0].replace(/[),;]+$/, "");
+      if (/\.(?:m3u8|mp4)(?:[?#]|$)/i.test(candidateUrl)) addCandidate(output, candidateUrl, null, baseUrl, null, context);
+    }
+    return output.sort(function (a, b) { return qualityNumber(b.quality) - qualityNumber(a.quality); });
+  }
+
+  function parseHlsMaster(text, masterUrl, context) {
+    if (typeof text !== "string" || !/^\s*#EXTM3U(?:\s|$)/i.test(text) || /<\s*html/i.test(text)) return [];
+    var lines = text.split(/\r?\n/), variants = [], master = parseHttpUrl(masterUrl);
+    for (var i = 0; i < lines.length; i += 1) {
+      var line = lines[i].trim();
+      if (line.indexOf("#EXT-X-STREAM-INF:") !== 0) continue;
+      var attrs = line.substring(line.indexOf(":") + 1);
+      var resolution = /(?:^|,)RESOLUTION=(\d+)x(\d+)/i.exec(attrs);
+      var name = /(?:^|,)NAME="([^"]+)"/i.exec(attrs);
+      var bandwidth = /(?:^|,)BANDWIDTH=(\d+)/i.exec(attrs);
+      var next = i + 1;
+      while (next < lines.length && (!lines[next].trim() || lines[next].trim().charAt(0) === "#")) next += 1;
+      if (next >= lines.length) continue;
+      var reference = lines[next].trim();
+      var url = resolveUrl(reference, masterUrl);
+      if (!url || !isAllowedUrl(url, context)) continue;
+      var parsedVariant = parseHttpUrl(url);
+      // Signed master URLs often authorize sibling playlists. Preserve that
+      // query only for a relative same-origin child without its own query;
+      // never copy credentials onto absolute or cross-origin URLs.
+      if (master && master.query && parsedVariant && parsedVariant.origin === master.origin &&
+          !/[?]/.test(reference) && !/^(?:https?:)?\/\//i.test(reference)) {
+        var fragmentAt = url.indexOf("#");
+        url = (fragmentAt < 0 ? url : url.slice(0, fragmentAt)) + "?" + master.query +
+          (fragmentAt < 0 ? "" : url.slice(fragmentAt));
+      }
+      if (variants.some(function (item) { return item.url === url; })) continue;
+      var height = resolution ? Number(resolution[2]) : 0;
+      variants.push({ url: url, height: height, bandwidth: bandwidth ? Number(bandwidth[1]) : 0,
+        quality: name ? name[1] : height ? height + "p" : null, type: "hls" });
+    }
+    variants.sort(function (a, b) { return b.height - a.height || b.bandwidth - a.bandwidth; });
+    return variants;
+  }
+
+  function headerValue(response, name) {
+    if (!response || !response.headers) return "";
+    if (typeof response.headers.get === "function") return response.headers.get(name) || "";
+    var key = Object.keys(response.headers).filter(function (item) { return item.toLowerCase() === name.toLowerCase(); })[0];
+    return key ? response.headers[key] : "";
+  }
+
+  function playbackHeadersFor(embedUrl, source, context) {
+    var parsed = parseHttpUrl(embedUrl);
+    var headers = {
+      "User-Agent": (context && context.userAgent) || USER_AGENT,
+      "Accept-Language": (context && context.acceptLanguage) || ACCEPT_LANGUAGE,
+      "Referer": parsed ? parsed.origin + "/" : ""
+    };
+    var supplied = Object.assign({}, source && source.headers || {}, context && context.playbackHeaders || {});
+    Object.keys(supplied).forEach(function (key) {
+      var lower = key.toLowerCase();
+      if (["user-agent", "accept-language", "referer", "origin"].indexOf(lower) < 0) return;
+      var value = supplied[key];
+      if (typeof value !== "string" || !value.trim() || value.length > 2048) return;
+      if (lower === "referer" || lower === "origin") {
+        var suppliedUrl = parseHttpUrl(value);
+        if (!suppliedUrl || suppliedUrl.protocol !== "https") return;
+      }
+      var canonical = lower === "user-agent" ? "User-Agent" : lower === "accept-language" ? "Accept-Language" : lower === "referer" ? "Referer" : "Origin";
+      headers[canonical] = value.trim();
+    });
+    if (!headers.Referer) delete headers.Referer;
+    return headers;
+  }
+
+  function sanitizeHeaders(headers) {
+    var output = {};
+    Object.keys(headers || {}).forEach(function (key) {
+      var lower = key.toLowerCase();
+      if (["user-agent", "accept-language", "referer", "origin", "accept", "range"].indexOf(lower) < 0) return;
+      var value = headers[key];
+      if (typeof value === "string" && value.length <= 4096) output[key] = value;
+    });
+    return output;
+  }
+
+  function playbackOnlyHeaders(headers) {
+    var output = {};
+    Object.keys(headers || {}).forEach(function (key) {
+      var lower = key.toLowerCase();
+      if (["user-agent", "accept-language", "referer", "origin"].indexOf(lower) < 0) return;
+      var value = headers[key];
+      if (typeof value === "string" && value.length <= 4096) output[key] = value;
+    });
+    return output;
+  }
+
+  function headersForSubresource(playbackHeaders, mediaUrl, targetUrl) {
+    var media = parseHttpUrl(mediaUrl), target = parseHttpUrl(targetUrl);
+    var output = sanitizeHeaders(playbackHeaders);
+    if (!media || !target || media.origin !== target.origin) {
+      Object.keys(output).forEach(function (key) {
+        if (key.toLowerCase() === "referer" || key.toLowerCase() === "origin") delete output[key];
+      });
+    }
+    return output;
+  }
+
+  function isCancelled(context) {
+    return !!(context && context.signal && context.signal.aborted === true);
+  }
+
+  function responseStatus(response) { return Number(response && (response.status || response.statusCode)) || 0; }
+
+  function waitForTransport(promise, timeoutMs, signal) {
+    if (signal && signal.aborted === true) return Promise.reject(Object.assign(new Error("cancelled"), { name: "AbortError" }));
+    if (typeof setTimeout !== "function" || typeof clearTimeout !== "function") return promise;
+    return new Promise(function (resolve, reject) {
+      var settled = false;
+      var timer = setTimeout(function () {
+        finish(Object.assign(new Error("request timed out"), { name: "TimeoutError" }));
+      }, timeoutMs);
+      function cleanup() {
+        clearTimeout(timer);
+        if (signal && typeof signal.removeEventListener === "function") signal.removeEventListener("abort", onAbort);
+      }
+      function finish(error, value) {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        if (error) reject(error); else resolve(value);
+      }
+      function onAbort() { finish(Object.assign(new Error("cancelled"), { name: "AbortError" })); }
+      if (signal && typeof signal.addEventListener === "function") signal.addEventListener("abort", onAbort);
+      Promise.resolve(promise).then(function (value) { finish(null, value); }, function (error) { finish(error || new Error("request failed")); });
+    });
+  }
+
+  async function fetchFollowingRedirects(url, headers, context) {
+    var fetcher = context && context.fetch;
+    if (typeof fetcher !== "function") return { errorCode: "FETCH_UNAVAILABLE" };
+    var current = url;
+    var sentHeaders = sanitizeHeaders(headers);
+    var timeout = Number(context.timeoutMs || DEFAULT_TIMEOUT_MS);
+    if (!isFinite(timeout) || timeout < 1 || timeout > 60000) timeout = DEFAULT_TIMEOUT_MS;
+    for (var redirects = 0; redirects <= MAX_REDIRECTS; redirects += 1) {
+      if (isCancelled(context)) return { errorCode: "CANCELLED" };
+      var response;
+      try {
+        response = await waitForTransport(
+          fetcher(current, { method: "GET", headers: sentHeaders, redirect: "manual", timeoutMs: timeout, signal: context.signal }),
+          timeout, context.signal
+        );
+      } catch (error) {
+        if (error && /abort|cancel/i.test(String(error.name || error.message))) return { errorCode: "CANCELLED" };
+        return { errorCode: error && /timed\s*out|timeout/i.test(String(error.name || error.message)) ? "NETWORK_TIMEOUT" : "NETWORK_ERROR" };
+      }
+      if (isCancelled(context)) return { errorCode: "CANCELLED" };
+      var status = responseStatus(response);
+      if ([301, 302, 303, 307, 308].indexOf(status) >= 0) {
+        if (redirects === MAX_REDIRECTS) return { errorCode: "REDIRECT_LIMIT", httpStatus: status };
+        var location = headerValue(response, "location");
+        var next = resolveUrl(location, current);
+        if (!next || !isAllowedUrl(next, context)) return { errorCode: "REDIRECT_REJECTED", httpStatus: status };
+        var before = parseHttpUrl(current), after = parseHttpUrl(next);
+        if (before && after && before.origin !== after.origin && context.forwardRefererAcrossRedirects !== true) {
+          Object.keys(sentHeaders).forEach(function (key) {
+            if (["referer", "origin"].indexOf(key.toLowerCase()) >= 0) delete sentHeaders[key];
+          });
+        }
+        current = next;
+        continue;
+      }
+      return { response: response, status: status, url: current, headers: sanitizeHeaders(sentHeaders) };
+    }
+    return { errorCode: "REDIRECT_LIMIT" };
+  }
+
+  async function readText(response) {
+    if (response && typeof response.text === "function") return response.text();
+    if (response && typeof response.body === "string") return response.body;
+    return "";
+  }
+
+  async function readBytes(response) {
+    if (response && typeof response.arrayBuffer === "function") {
+      var buffer = await response.arrayBuffer();
+      if (typeof Uint8Array !== "undefined") return new Uint8Array(buffer);
+    }
+    var text = await readText(response), bytes = [];
+    for (var i = 0; i < text.length && i < 64; i += 1) bytes.push(text.charCodeAt(i) & 255);
+    return bytes;
+  }
+
+  function bytesToText(bytes) {
+    var text = "";
+    var limit = Math.min(bytes ? bytes.length : 0, MAX_BODY_CHARS);
+    for (var i = 0; i < limit; i += 1) text += String.fromCharCode(bytes[i] & 255);
+    return text;
+  }
+
+  function isMp4Ftyp(bytes) {
+    return bytes && bytes.length >= 8 && bytes[4] === 0x66 && bytes[5] === 0x74 && bytes[6] === 0x79 && bytes[7] === 0x70;
+  }
+
+  function isHtmlMime(mime) { return /(?:text\/html|application\/xhtml\+xml)/i.test(mime || ""); }
+
+  async function verifyCandidate(candidate, embedUrl, source, context) {
+    var playbackHeaders = playbackHeadersFor(embedUrl, source, context);
+    var probeHeaders = Object.assign({}, playbackHeaders);
+    probeHeaders.Accept = candidate.type === "mp4" ? "video/mp4, application/octet-stream, */*;q=0.5" : "application/vnd.apple.mpegurl, application/x-mpegURL, */*;q=0.5";
+    probeHeaders.Range = "bytes=0-8191";
+    var fetched = await fetchFollowingRedirects(candidate.url, probeHeaders, context);
+    if (fetched.errorCode) return { errorCode: fetched.errorCode, httpStatus: fetched.httpStatus || null };
+    var response = fetched.response, status = fetched.status;
+    if (status < 200 || status > 299) return { errorCode: status === 401 || status === 403 ? "HTTP_STATUS_DENIED" : "MEDIA_HTTP_ERROR", httpStatus: status };
+    var mime = headerValue(response, "content-type");
+    if (isHtmlMime(mime)) return { errorCode: "HTML_RESPONSE", httpStatus: status };
+    var bytes = await readBytes(response);
+    if (bytes && bytes.length > MAX_PROBE_BYTES) return { errorCode: "MEDIA_PROBE_LIMIT", httpStatus: status };
+    var body = bytesToText(bytes);
+    if (isHtmlMime(mime) || /<\s*(?:!doctype\s+html|html|body)\b/i.test(body.slice(0, 1024))) {
+      return { errorCode: "HTML_RESPONSE", httpStatus: status };
+    }
+    var mediaType = null;
+    if (/^\s*#EXTM3U(?:\s|$)/i.test(body)) mediaType = "hls";
+    else if (isMp4Ftyp(bytes)) mediaType = "mp4";
+    else return { errorCode: "MEDIA_SIGNATURE_INVALID", httpStatus: status };
+    if (mediaType === "hls" && !/^\s*#EXTM3U(?:\s|$)/i.test(body)) return { errorCode: "MEDIA_SIGNATURE_INVALID", httpStatus: status };
+    if (mediaType === "mp4" && !isMp4Ftyp(bytes)) return { errorCode: "MEDIA_SIGNATURE_INVALID", httpStatus: status };
+    return {
+      url: fetched.url, type: mediaType, quality: candidate.quality || null,
+      httpStatus: status, contentType: mime || null,
+      playbackHeaders: playbackOnlyHeaders(headersForSubresource(playbackHeaders, candidate.url, fetched.url)),
+      structure: mediaType === "hls" ? "m3u8-signature" : "iso-bmff-ftyp",
+      hlsBody: mediaType === "hls" ? body : null
+    };
+  }
+
+  async function fetchEmbed(url, context, headers) {
+    var requestHeaders = Object.assign({
+      "User-Agent": (context && context.userAgent) || USER_AGENT,
+      "Accept-Language": (context && context.acceptLanguage) || ACCEPT_LANGUAGE,
+      "Accept": "text/html,application/json;q=0.9,*/*;q=0.5"
+    }, headers || {});
+    var fetched = await fetchFollowingRedirects(url, requestHeaders, context);
+    if (fetched.errorCode) return fetched;
+    if (fetched.status < 200 || fetched.status > 299) return { errorCode: fetched.status === 401 || fetched.status === 403 ? "HTTP_STATUS_DENIED" : "EMBED_HTTP_ERROR", httpStatus: fetched.status };
+    var body = await readText(fetched.response);
+    if (typeof body !== "string" || body.length > MAX_BODY_CHARS) return { errorCode: "EMBED_BODY_LIMIT", httpStatus: fetched.status };
+    return { body: body, url: fetched.url, httpStatus: fetched.status };
+  }
+
+  function externalRequestSpec(family, embedUrl, embedBody) {
+    var rule = FAMILIES[family] && FAMILIES[family].external;
+    if (!rule) return null;
+    var rootUrl = "https://mawdhou3.com/";
+    var encode = encodeURIComponent(embedUrl);
+    var primary = rule.method === "GET" ? {
+      method: "GET", url: rootUrl + rule.path + "?" + (rule.queryKey || "api") + "=" + encode,
+      referer: rootUrl, forwardsEmbedHtml: false
+    } : {
+      method: "POST", url: rootUrl + rule.path,
+      referer: rootUrl, form: { content: rule.forwardsHtml ? String(embedBody || "") : "", url: embedUrl },
+      forwardsEmbedHtml: rule.forwardsHtml
+    };
+    return { family: family, primary: primary, fallback: rule.fallback ? {
+      method: "GET", url: rootUrl + rule.fallback.path + "?" + (rule.fallback.queryKey || "api") + "=" + encode,
+      referer: rootUrl, forwardsEmbedHtml: false
+    } : null };
+  }
+
+  async function parseExternalOutput(externalResult, baseUrl, context) {
+    if (typeof externalResult === "string") {
+      var direct = [];
+      if (/^https?:\/\//i.test(externalResult.trim())) {
+        addCandidate(direct, externalResult.trim(), null, baseUrl, null, context);
+        return direct;
+      }
+      return parseCandidates(externalResult, baseUrl, context);
+    }
+    var output = [];
+    walkJson(externalResult, baseUrl, output, context, 0);
+    return output;
+  }
+
+  async function resolveInternal(source, context) {
+    context = context || {};
+    source = typeof source === "string" ? { url: source } : (source || {});
+    var embedUrl = typeof source.url === "string" ? source.url.trim() : "";
+    var family = familyFromUrl(embedUrl, context.family || source.family);
+    var rule = family && FAMILIES[family];
+    var resolverId = rule ? rule.resolver : "dramaworld.generic.local";
+    if (!embedUrl || !isAllowedUrl(embedUrl, context)) return result([], null, null, {}, resolverId, "INVALID_SOURCE_URL", { family: family, verified: false });
+    if (isCancelled(context)) return result([], null, null, {}, resolverId, "CANCELLED", { family: family, verified: false });
+
+    var directType = pathType(embedUrl);
+    var body = typeof context.embedBody === "string" ? context.embedBody :
+      (typeof source.embedBody === "string" ? source.embedBody : null);
+    var playbackHeaders = playbackHeadersFor(embedUrl, source, context);
+    if (!directType && body === null) {
+      var embedRequestHeaders = Object.assign({}, playbackHeaders);
+      delete embedRequestHeaders.Referer;
+      var embed = await fetchEmbed(embedUrl, context, embedRequestHeaders);
+      if (embed.errorCode) return result([], null, null, {}, resolverId, embed.errorCode, { family: family, httpStatus: embed.httpStatus || null, verified: false });
+      body = embed.body;
+      embedUrl = embed.url;
+      playbackHeaders = playbackHeadersFor(embedUrl, source, context);
+    }
+
+    var candidates = directType ? [{ url: embedUrl, type: directType, quality: source.quality || source.label || null }] : parseCandidates(body, embedUrl, context);
+    var externalUsed = false;
+    if (!candidates.length && rule && rule.external && typeof context.externalResolverAdapter === "function") {
+      if (context.allowExternalResolver !== true || context.externalDataApproved !== true) {
+        return result([], null, null, playbackHeaders, resolverId, "EXTERNAL_ADAPTER_DISABLED", { family: family, verified: false });
+      }
+      if (rule.external.forwardsHtml && (!body || context.allowEmbedHtmlForwarding !== true)) {
+        return result([], null, null, playbackHeaders, resolverId, "EXTERNAL_HTML_FORWARDING_NOT_APPROVED", { family: family, verified: false });
+      }
+      var requestSpec = externalRequestSpec(family, embedUrl, body);
+      try {
+        var adapterTimeout = Number(context.timeoutMs || DEFAULT_TIMEOUT_MS);
+        if (!isFinite(adapterTimeout) || adapterTimeout < 1 || adapterTimeout > 60000) adapterTimeout = DEFAULT_TIMEOUT_MS;
+        var externalResult = await waitForTransport(
+          context.externalResolverAdapter(requestSpec, { timeoutMs: adapterTimeout, signal: context.signal }),
+          adapterTimeout, context.signal
+        );
+        candidates = await parseExternalOutput(externalResult, embedUrl, context);
+        externalUsed = true;
+      } catch (error) {
+        if (error && /abort|cancel/i.test(String(error.name || error.message))) {
+          return result([], null, null, playbackHeaders, resolverId, "CANCELLED", { family: family, verified: false });
+        }
+        if (error && /timed\s*out|timeout/i.test(String(error.name || error.message))) {
+          return result([], null, null, playbackHeaders, resolverId, "NETWORK_TIMEOUT", { family: family, verified: false });
+        }
+        return result([], null, null, playbackHeaders, resolverId, "EXTERNAL_ADAPTER_FAILED", { family: family, verified: false });
+      }
+    }
+    if (!candidates.length) {
+      var missingCode = rule && rule.external ? "UNSUPPORTED_HOST" : "NO_MEDIA_CANDIDATE";
+      return result([], null, null, playbackHeaders, resolverId, missingCode, { family: family, externalRequired: !!(rule && rule.external), verified: false });
+    }
+    if (typeof context.fetch !== "function") return result([], null, null, playbackHeaders, resolverId, "FETCH_UNAVAILABLE", { family: family, externalUsed: externalUsed, verified: false });
+
+    var streams = [], lastError = "MEDIA_SIGNATURE_INVALID", lastStatus = null;
+    for (var i = 0; i < candidates.length && streams.length < MAX_CANDIDATES; i += 1) {
+      if (isCancelled(context)) return result(streams, streams.length ? "mixed" : null, null, playbackHeaders, resolverId, "CANCELLED", { family: family, externalUsed: externalUsed, verified: streams.length > 0 });
+      var checked;
+      try { checked = await verifyCandidate(candidates[i], embedUrl, source, context); }
+      catch (verifyError) {
+        if (verifyError && /abort|cancel/i.test(String(verifyError.name || verifyError.message))) {
+          return result(streams, streams.length ? "mixed" : null, null, playbackHeaders, resolverId, "CANCELLED", { family: family, externalUsed: externalUsed, verified: streams.length > 0 });
+        }
+        lastError = verifyError && /timed\s*out|timeout/i.test(String(verifyError.name || verifyError.message)) ? "NETWORK_TIMEOUT" : "MEDIA_VERIFY_FAILED";
+        continue;
+      }
+      if (!checked.url) { lastError = checked.errorCode || lastError; lastStatus = checked.httpStatus || lastStatus; continue; }
+      var hlsVariants = checked.type === "hls" ? parseHlsMaster(checked.hlsBody, checked.url, context) : [];
+      var items = hlsVariants.length ? hlsVariants : [checked];
+      items.forEach(function (item) {
+        if (streams.some(function (existing) { return existing.url === item.url; })) return;
+        var streamHeaders = checked.playbackHeaders || playbackHeaders;
+        if (hlsVariants.length) streamHeaders = headersForSubresource(streamHeaders, checked.url, item.url);
+        streams.push({
+          url: item.url, type: checked.type,
+          quality: item.quality || (hlsVariants.length ? null : checked.quality) || null,
+          playbackHeaders: Object.assign({}, streamHeaders), verified: true,
+          verification: hlsVariants.length ? "master-playlist-reference" : checked.structure,
+          variantFetched: !hlsVariants.length, httpStatus: checked.httpStatus,
+          contentType: checked.contentType, sourceFamily: family
+        });
+      });
+    }
+    if (!streams.length) return result([], null, null, playbackHeaders, resolverId, lastError, { family: family, externalUsed: externalUsed, httpStatus: lastStatus, verified: false });
+    var types = {};
+    streams.forEach(function (stream) { types[stream.type] = true; });
+    var onlyTypes = Object.keys(types);
+    return result(streams, onlyTypes.length === 1 ? onlyTypes[0] : "mixed",
+      streams.length === 1 ? streams[0].quality : null, playbackHeaders, resolverId, null,
+      { family: family, externalUsed: externalUsed, verified: true, extractedOnly: true, playbackTested: false });
+  }
+
+  async function resolve(source, context) {
+    try { return await resolveInternal(source, context); }
+    catch (error) {
+      var item = typeof source === "string" ? { url: source } : (source || {});
+      var family = familyFromUrl(item.url, context && (context.family || item.family));
+      var resolverId = family && FAMILIES[family] ? FAMILIES[family].resolver : "dramaworld.generic.local";
+      var message = error && String(error.name || error.message);
+      var code = /abort|cancel/i.test(message) ? "CANCELLED" : /timed\s*out|timeout/i.test(message) ? "NETWORK_TIMEOUT" : "RESOLVER_EXCEPTION";
+      return result([], null, null, {}, resolverId, code, { family: family, verified: false });
+    }
+  }
+
+  async function resolveMany(sources, context) {
+    var list = Array.isArray(sources) ? sources : [];
+    var settled = await Promise.all(list.map(async function (source, index) {
+      var childContext = Object.assign({}, context || {});
+      var sourceBody = source && typeof source === "object" && typeof source.embedBody === "string";
+      if (sourceBody) childContext.embedBody = source.embedBody;
+      else if (list.length > 1) delete childContext.embedBody;
+      if (typeof childContext.contextForSource === "function") {
+        try { childContext = Object.assign(childContext, childContext.contextForSource(source, index) || {}); }
+        catch (_) { return result([], null, null, {}, "dramaworld.generic.local", "RESOLVER_EXCEPTION", { verified: false }); }
+      }
+      delete childContext.contextForSource;
+      try { return await resolve(source, childContext); }
+      catch (_) { return result([], null, null, {}, "dramaworld.generic.local", "RESOLVER_EXCEPTION", { verified: false }); }
+    }));
+    return settled;
+  }
+
+  var api = {
+    version: VERSION,
+    resolve: resolve,
+    resolveMany: resolveMany,
+    familyFromUrl: familyFromUrl,
+    parseCandidates: parseCandidates,
+    parseHlsMaster: parseHlsMaster,
+    unpackPackerText: unpackPackerText,
+    externalRequestSpec: externalRequestSpec,
+    playbackHeadersFor: playbackHeadersFor,
+    headersForSubresource: headersForSubresource,
+    mediaSignature: { isMp4Ftyp: isMp4Ftyp }
+  };
+  root.DramaWorldResolver = api;
+  if (typeof module !== "undefined" && module.exports) module.exports = api;
+})(typeof globalThis !== "undefined" ? globalThis : this);
+
+  var api = globalThis.DramaWorldResolver;
+  try { delete globalThis.DramaWorldResolver; } catch (_) {}
+  return api;
+})();

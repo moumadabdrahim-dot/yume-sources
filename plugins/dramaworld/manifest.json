@@ -1,14 +1,14 @@
 {
   "name": "DramaWorld",
-  "version": "0.3.6-rc.1",
-  "description": "إضافة DramaWorld بتكامل Universal First مع رجوع Legacy آمن وخيار رجوع فوري.",
+  "version": "0.3.6",
+  "description": "إضافة DramaWorld للأفلام والمسلسلات مع جودات متعددة واستخراج آمن.",
   "apiVersion": 2,
   "scrapers": [
     {
       "id": "dramaworld",
       "name": "DramaWorld",
-      "description": "Universal First with one Legacy fallback and an immediate Legacy Only rollback setting.",
-      "version": "0.3.6-rc.1",
+      "description": "أفلام ومسلسلات DramaWorld مع استخراج آمن ودعم الجودات المتعددة.",
+      "version": "0.3.6",
       "filename": "dramaworld.js",
       "supportedTypes": [
         "movie",

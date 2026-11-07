@@ -4,7 +4,7 @@
 // CloudStream DramaWorld client. They are API route identifiers, not session
 // credentials. Firebase remains optional and only updates the content hosts.
 var PLUGIN_ID = "dramaworld";
-var PLUGIN_VERSION = "0.3.6-rc.1";
+var PLUGIN_VERSION = "0.3.6";
 var FIREBASE_PROJECT_ID = "alamaldrama2022v2";
 var API_ROUTE_KEY = "4F5A9C3D9A86FA54EACEDDD635185";
 var API_ROUTE_ID = "d506abfd-9fe2-4b71-b979-feff21bcad13";
@@ -26,6 +26,10 @@ var KNOWN_FALLBACK_APIS = [
   "https://dr.arabypros.com/api"
 ];
 var REMOTE_CONFIG_KEYS = ["API_URL", "API_URL2"];
+// This display-only tier prioritizes hosts with verified resolver support. It
+// never removes a source or changes the source-array index encoded in the
+// option token. Hosts within the tier retain the API's original order.
+var PROVEN_SERVER_PRIORITY_LABELS = ["71stream", "hanerix", "ult4vid", "okstream", "vidmoly"];
 
 function fail(code, message) {
   var error = new Error(code + ": " + message);
@@ -685,6 +689,21 @@ function sourceHost(url) {
   return match ? match[1].toLowerCase() : "";
 }
 
+function serverPriorityEnabled() {
+  var settings = typeof SCRAPER_SETTINGS !== "undefined" && isObject(SCRAPER_SETTINGS)
+    ? SCRAPER_SETTINGS : {};
+  return settings.prioritizeVerifiedServers !== false;
+}
+
+function isProvenPriorityHost(url) {
+  var host = sourceHost(url);
+  if (!host) return false;
+  var labels = host.split(".");
+  return PROVEN_SERVER_PRIORITY_LABELS.some(function (label) {
+    return labels.indexOf(label) >= 0;
+  });
+}
+
 function stableSourceFingerprint(source, identity, index) {
   var material = [
     identity.kind,
@@ -719,23 +738,31 @@ function parseSourceOptionToken(value) {
 function mapStreamOptions(sourceRows, identity) {
   var sources = decodeSourceBody(sourceRows);
   var seen = Object.create(null);
-  var options = [];
+  var entries = [];
   sources.forEach(function (source, index) {
-    if (!isObject(source) || source.external === true || options.length >= MAX_SOURCES) return;
+    if (!isObject(source) || source.external === true || entries.length >= MAX_SOURCES) return;
     var url = publicHttpUrl(source.url);
     if (!url || !/^https:\/\//i.test(url) || seen[url]) return;
     seen[url] = true;
     var direct = classifySource(source);
-    var ordinal = options.length + 1;
-    options.push({
-      token: sourceOptionToken(source, identity, index),
-      title: "سيرفر " + ordinal,
-      name: "سيرفر " + ordinal,
-      type: direct ? direct.type : "embed",
-      quality: direct ? direct.quality : null
+    // Keep the original server number and token index even when its card is
+    // promoted. resolveStreamOption therefore still resolves the exact row the
+    // user selected after the source list is fetched again.
+    entries.push({
+      priority: isProvenPriorityHost(url),
+      option: {
+        token: sourceOptionToken(source, identity, index),
+        title: "سيرفر " + (index + 1),
+        name: "سيرفر " + (index + 1),
+        type: direct ? direct.type : "embed",
+        quality: direct ? direct.quality : null
+      }
     });
   });
-  return options;
+  if (!serverPriorityEnabled()) return entries.map(function (entry) { return entry.option; });
+  return entries.filter(function (entry) { return entry.priority; })
+    .concat(entries.filter(function (entry) { return !entry.priority; }))
+    .map(function (entry) { return entry.option; });
 }
 
 function qualityRank(value) {
@@ -912,8 +939,17 @@ function playbackHeadersForEmbed(embedUrl, source) {
     "Accept-Language": EMBED_ACCEPT_LANGUAGE,
     "Referer": origin + "/"
   };
+  // Odnoklassniki's documented extractor contract requests its signed media
+  // candidates with the embed origin. This is non-secret request context, and
+  // Yume's header policy forwards it only while it matches the sanitized
+  // Referer origin; no Cookie or Authorization value is synthesized.
   var trustedHeaders = safeSourceHeaders(source);
   Object.keys(trustedHeaders).forEach(function (key) { headers[key] = trustedHeaders[key]; });
+  var embedHost = sourceHost(embedUrl);
+  if (embedHost === "ok.ru" || embedHost === "m.ok.ru" ||
+      embedHost === "odnoklassniki.ru" || embedHost === "m.odnoklassniki.ru") {
+    headers.Origin = origin;
+  }
   return headers;
 }
 
@@ -1449,11 +1485,12 @@ function homeCatalogItems(home, catalogId) {
 
 function onSettings() {
   return [
-    { type: "header", label: "DramaWorld Resolver Lab Phase 5 · 0.3.5-lab.4-phase5.1" },
-    { type: "toggle", key: "localPackedResolver", label: "تجربة المحلّل المحلي لصفحات Embed", defaultValue: true, description: "يعمل بعد فشل المسار المباشر القديم. يفك Packer نصياً ولا ينفّذ JavaScript، ولا يستخدم WebView أو خدمة استخراج خارجية." },
+    { type: "header", label: "DramaWorld · 0.3.6" },
+    { type: "toggle", key: "localPackedResolver", label: "المحلّل المحلي الاحتياطي", defaultValue: true, description: "يعمل عند الحاجة بعد المسار المباشر، ويفك Packer نصياً دون WebView أو خدمات استخراج خارجية." },
     { type: "toggle", key: "universalExtractorEnabled", label: "محرك Yume المركزي", defaultValue: true, description: "يجرب المحرك المركزي أولاً ثم يعود مرة واحدة إلى المحلّل المحلي عند الفشل. عطّل هذا الخيار للرجوع الفوري إلى Legacy Only." },
-    { type: "toggle", key: "debugResolverDiagnostics", label: "تشخيص Debug منقّح", defaultValue: false, description: "سجلات اختيارية لاسم المضيف والمرحلة والحالة ونوع الاستجابة والزمن والعدادات فقط؛ لا تسجل الروابط أو Query Parameters أو Cookies أو محتوى الصفحة. فعّلها يدوياً أثناء اختبار نسخة Debug فقط." },
-    { type: "info", label: "هذه نسخة مستقلة بمعرّف تجريبي. تستخدم مضيف API المعروف فقط؛ تحديث Remote Config الأصلي يتطلب موصل Yume الموثوق الخاص بإصدار DramaWorld المنشور." }
+    { type: "toggle", key: "prioritizeVerifiedServers", label: "ترتيب السيرفرات المدعومة أولاً", defaultValue: true, description: "يعرض السيرفرات ذات الدعم المثبت أولاً مع الاحتفاظ بجميع السيرفرات وفهارسها الأصلية. عطّله لاستعادة ترتيب المصدر الأصلي." },
+    { type: "toggle", key: "debugResolverDiagnostics", label: "تشخيص تقني منقّح", defaultValue: false, description: "سجلات اختيارية للمضيف والمرحلة والحالة ونوع الاستجابة والزمن والعدادات فقط؛ لا تسجل الروابط أو معاملات الاستعلام أو بيانات الاعتماد أو محتوى الصفحة." },
+    { type: "info", label: "Universal First هو المسار الافتراضي مع رجوع Legacy واحد. يمكن الرجوع فوراً إلى Legacy Only من الإعدادات." }
   ];
 }
 
@@ -2305,48 +2342,23 @@ module.exports = {
   getDetails: getDetails,
   getStreams: getStreams,
   resolveStreamOption: resolveStreamOption,
-  onSettings: onSettings,
-  __test: {
-    mediaItem: mediaItem,
-    mapHome: mapHome,
-    mapCatalog: mapCatalog,
-    catalogGenres: catalogGenres,
-    mapCatalogByGenre: mapCatalogByGenre,
-    mapSearch: mapSearch,
-    mapDetails: mapDetails,
-    decodeSourceBody: decodeSourceBody,
-    classifySource: classifySource,
-    mapStreams: mapStreams,
-    mapStreamOptions: mapStreamOptions,
-    sourceOptionToken: sourceOptionToken,
-    parseSourceOptionToken: parseSourceOptionToken,
-    stableSourceFingerprint: stableSourceFingerprint,
-    parseDirectMediaCandidates: parseDirectMediaCandidates,
-    mapSubtitles: mapSubtitles,
-    parseExplicitNumber: parseExplicitNumber,
-    publicHttpUrl: publicHttpUrl,
-    approvedBaseUrl: approvedBaseUrl,
-    endpointPath: endpointPath,
-    readConfig: readConfig,
-    decodeRemoteHostValue: decodeRemoteHostValue,
-    homeSchemaIsValid: homeSchemaIsValid,
-    isHtmlOrChallengeBody: isHtmlOrChallengeBody
-  }
+  onSettings: onSettings
 };
 
 
-// Bundled local DramaWorld resolver. Kept in a private scope so its optional CommonJS export cannot replace the plugin API.
+// Bundled local DramaWorld resolver. It stays in a private scope so its
+// CommonJS export cannot replace the plugin API.
 var YUME_DRAMAWORLD_LOCAL_RESOLVER = (function () {
   var module;
 /*
- * DramaWorld Resolver Lab
+ * DramaWorld local resolver
  * Standalone ES2019/QuickJS-oriented resolver. No eval, DOM, Node APIs, Android
  * APIs, or network access are used unless a caller injects a fetch function.
  */
 (function (root) {
   "use strict";
 
-  var VERSION = "0.1.0-lab";
+  var VERSION = "0.3.6";
   var DEFAULT_TIMEOUT_MS = 10000;
   var MAX_BODY_CHARS = 512 * 1024;
   var MAX_PROBE_BYTES = 64 * 1024;
@@ -2355,11 +2367,11 @@ var YUME_DRAMAWORLD_LOCAL_RESOLVER = (function () {
   var USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36";
   var ACCEPT_LANGUAGE = "en-US,en;q=0.9";
   var FAMILIES = {
-    anafast: { resolver: "dramaworld.anafast.local", external: null },
-    okhd: { resolver: "dramaworld.okhd.local+optional-external", external: { method: "GET", path: "scrapefinal/turki.php", queryKey: "api", forwardsHtml: false } },
-    vidspeed: { resolver: "dramaworld.vidspeed.local+optional-external", external: { method: "POST", path: "scrapefinal/earnvids.php", fallback: { method: "GET", path: "scrapefinal/earnvids.php", queryKey: "api" }, forwardsHtml: true } },
-    upzur: { resolver: "dramaworld.upzur.local+optional-external", external: { method: "POST", path: "scrapefinal/upzur.php", fallback: { method: "GET", path: "scrapefinal/upzur.php", queryKey: "api" }, forwardsHtml: true } },
-    luluvdo: { resolver: "dramaworld.luluvdo.local+optional-external", external: { method: "POST", path: "scrapefinal/extractm3u8.php", fallback: { method: "GET", path: "scrapefinal/extractm3u8.php", queryKey: "api" }, forwardsHtml: true } }
+    anafast: { resolver: "dramaworld.anafast.local" },
+    okhd: { resolver: "dramaworld.okhd.local" },
+    vidspeed: { resolver: "dramaworld.vidspeed.local" },
+    upzur: { resolver: "dramaworld.upzur.local" },
+    luluvdo: { resolver: "dramaworld.luluvdo.local" }
   };
 
   function result(streams, type, quality, headers, resolverId, errorCode, extra) {
@@ -2403,9 +2415,6 @@ var YUME_DRAMAWORLD_LOCAL_RESOLVER = (function () {
   function isAllowedUrl(value, context) {
     var parsed = parseHttpUrl(value);
     if (!parsed) return false;
-    if (context && context.testOnlyAllowPrivateHosts === true && parsed.protocol === "http") {
-      return parsed.host === "127.0.0.1" || parsed.host === "localhost";
-    }
     if (parsed.protocol !== "https") return false;
     return parsed.host !== "localhost" && parsed.host !== "localhost.localdomain" &&
       !/\.(?:localhost|local|internal|test)$/.test(parsed.host) && !isPrivateIpv4(parsed.host);
@@ -2913,39 +2922,6 @@ var YUME_DRAMAWORLD_LOCAL_RESOLVER = (function () {
     return { body: body, url: fetched.url, httpStatus: fetched.status };
   }
 
-  function externalRequestSpec(family, embedUrl, embedBody) {
-    var rule = FAMILIES[family] && FAMILIES[family].external;
-    if (!rule) return null;
-    var rootUrl = "https://mawdhou3.com/";
-    var encode = encodeURIComponent(embedUrl);
-    var primary = rule.method === "GET" ? {
-      method: "GET", url: rootUrl + rule.path + "?" + (rule.queryKey || "api") + "=" + encode,
-      referer: rootUrl, forwardsEmbedHtml: false
-    } : {
-      method: "POST", url: rootUrl + rule.path,
-      referer: rootUrl, form: { content: rule.forwardsHtml ? String(embedBody || "") : "", url: embedUrl },
-      forwardsEmbedHtml: rule.forwardsHtml
-    };
-    return { family: family, primary: primary, fallback: rule.fallback ? {
-      method: "GET", url: rootUrl + rule.fallback.path + "?" + (rule.fallback.queryKey || "api") + "=" + encode,
-      referer: rootUrl, forwardsEmbedHtml: false
-    } : null };
-  }
-
-  async function parseExternalOutput(externalResult, baseUrl, context) {
-    if (typeof externalResult === "string") {
-      var direct = [];
-      if (/^https?:\/\//i.test(externalResult.trim())) {
-        addCandidate(direct, externalResult.trim(), null, baseUrl, null, context);
-        return direct;
-      }
-      return parseCandidates(externalResult, baseUrl, context);
-    }
-    var output = [];
-    walkJson(externalResult, baseUrl, output, context, 0);
-    return output;
-  }
-
   async function resolveInternal(source, context) {
     context = context || {};
     source = typeof source === "string" ? { url: source } : (source || {});
@@ -2971,48 +2947,19 @@ var YUME_DRAMAWORLD_LOCAL_RESOLVER = (function () {
     }
 
     var candidates = directType ? [{ url: embedUrl, type: directType, quality: source.quality || source.label || null }] : parseCandidates(body, embedUrl, context);
-    var externalUsed = false;
-    if (!candidates.length && rule && rule.external && typeof context.externalResolverAdapter === "function") {
-      if (context.allowExternalResolver !== true || context.externalDataApproved !== true) {
-        return result([], null, null, playbackHeaders, resolverId, "EXTERNAL_ADAPTER_DISABLED", { family: family, verified: false });
-      }
-      if (rule.external.forwardsHtml && (!body || context.allowEmbedHtmlForwarding !== true)) {
-        return result([], null, null, playbackHeaders, resolverId, "EXTERNAL_HTML_FORWARDING_NOT_APPROVED", { family: family, verified: false });
-      }
-      var requestSpec = externalRequestSpec(family, embedUrl, body);
-      try {
-        var adapterTimeout = Number(context.timeoutMs || DEFAULT_TIMEOUT_MS);
-        if (!isFinite(adapterTimeout) || adapterTimeout < 1 || adapterTimeout > 60000) adapterTimeout = DEFAULT_TIMEOUT_MS;
-        var externalResult = await waitForTransport(
-          context.externalResolverAdapter(requestSpec, { timeoutMs: adapterTimeout, signal: context.signal }),
-          adapterTimeout, context.signal
-        );
-        candidates = await parseExternalOutput(externalResult, embedUrl, context);
-        externalUsed = true;
-      } catch (error) {
-        if (error && /abort|cancel/i.test(String(error.name || error.message))) {
-          return result([], null, null, playbackHeaders, resolverId, "CANCELLED", { family: family, verified: false });
-        }
-        if (error && /timed\s*out|timeout/i.test(String(error.name || error.message))) {
-          return result([], null, null, playbackHeaders, resolverId, "NETWORK_TIMEOUT", { family: family, verified: false });
-        }
-        return result([], null, null, playbackHeaders, resolverId, "EXTERNAL_ADAPTER_FAILED", { family: family, verified: false });
-      }
-    }
     if (!candidates.length) {
-      var missingCode = rule && rule.external ? "UNSUPPORTED_HOST" : "NO_MEDIA_CANDIDATE";
-      return result([], null, null, playbackHeaders, resolverId, missingCode, { family: family, externalRequired: !!(rule && rule.external), verified: false });
+      return result([], null, null, playbackHeaders, resolverId, "NO_MEDIA_CANDIDATE", { family: family, verified: false });
     }
-    if (typeof context.fetch !== "function") return result([], null, null, playbackHeaders, resolverId, "FETCH_UNAVAILABLE", { family: family, externalUsed: externalUsed, verified: false });
+    if (typeof context.fetch !== "function") return result([], null, null, playbackHeaders, resolverId, "FETCH_UNAVAILABLE", { family: family, verified: false });
 
     var streams = [], lastError = "MEDIA_SIGNATURE_INVALID", lastStatus = null;
     for (var i = 0; i < candidates.length && streams.length < MAX_CANDIDATES; i += 1) {
-      if (isCancelled(context)) return result(streams, streams.length ? "mixed" : null, null, playbackHeaders, resolverId, "CANCELLED", { family: family, externalUsed: externalUsed, verified: streams.length > 0 });
+      if (isCancelled(context)) return result(streams, streams.length ? "mixed" : null, null, playbackHeaders, resolverId, "CANCELLED", { family: family, verified: streams.length > 0 });
       var checked;
       try { checked = await verifyCandidate(candidates[i], embedUrl, source, context); }
       catch (verifyError) {
         if (verifyError && /abort|cancel/i.test(String(verifyError.name || verifyError.message))) {
-          return result(streams, streams.length ? "mixed" : null, null, playbackHeaders, resolverId, "CANCELLED", { family: family, externalUsed: externalUsed, verified: streams.length > 0 });
+          return result(streams, streams.length ? "mixed" : null, null, playbackHeaders, resolverId, "CANCELLED", { family: family, verified: streams.length > 0 });
         }
         lastError = verifyError && /timed\s*out|timeout/i.test(String(verifyError.name || verifyError.message)) ? "NETWORK_TIMEOUT" : "MEDIA_VERIFY_FAILED";
         continue;
@@ -3034,13 +2981,13 @@ var YUME_DRAMAWORLD_LOCAL_RESOLVER = (function () {
         });
       });
     }
-    if (!streams.length) return result([], null, null, playbackHeaders, resolverId, lastError, { family: family, externalUsed: externalUsed, httpStatus: lastStatus, verified: false });
+    if (!streams.length) return result([], null, null, playbackHeaders, resolverId, lastError, { family: family, httpStatus: lastStatus, verified: false });
     var types = {};
     streams.forEach(function (stream) { types[stream.type] = true; });
     var onlyTypes = Object.keys(types);
     return result(streams, onlyTypes.length === 1 ? onlyTypes[0] : "mixed",
       streams.length === 1 ? streams[0].quality : null, playbackHeaders, resolverId, null,
-      { family: family, externalUsed: externalUsed, verified: true, extractedOnly: true, playbackTested: false });
+      { family: family, verified: true, extractedOnly: true, playbackTested: false });
   }
 
   async function resolve(source, context) {
@@ -3081,7 +3028,6 @@ var YUME_DRAMAWORLD_LOCAL_RESOLVER = (function () {
     parseCandidates: parseCandidates,
     parseHlsMaster: parseHlsMaster,
     unpackPackerText: unpackPackerText,
-    externalRequestSpec: externalRequestSpec,
     playbackHeadersFor: playbackHeadersFor,
     headersForSubresource: headersForSubresource,
     mediaSignature: { isMp4Ftyp: isMp4Ftyp }

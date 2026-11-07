@@ -1,6 +1,6 @@
 {
   "name": "DramaWorld",
-  "version": "0.3.6",
+  "version": "0.3.7",
   "description": "إضافة DramaWorld للأفلام والمسلسلات مع جودات متعددة واستخراج آمن.",
   "apiVersion": 2,
   "scrapers": [
@@ -8,7 +8,7 @@
       "id": "dramaworld",
       "name": "DramaWorld",
       "description": "أفلام ومسلسلات DramaWorld مع استخراج آمن ودعم الجودات المتعددة.",
-      "version": "0.3.6",
+      "version": "0.3.7",
       "filename": "dramaworld.js",
       "supportedTypes": [
         "movie",
@@ -28,80 +28,12 @@
         "streams"
       ],
       "catalogs": [
-        {
-          "id": "featured-movies",
-          "type": "movie",
-          "title": "أفلام DramaWorld المميزة",
-          "capabilities": [
-            "home"
-          ],
-          "filters": [],
-          "homeOrder": 5,
-          "homeFallback": false,
-          "presentation": {
-            "posterShape": "portrait"
-          }
-        },
-        {
-          "id": "featured-series",
-          "type": "series",
-          "title": "مسلسلات DramaWorld المميزة",
-          "capabilities": [
-            "home"
-          ],
-          "filters": [],
-          "homeOrder": 6,
-          "homeFallback": false,
-          "presentation": {
-            "posterShape": "portrait"
-          }
-        },
-        {
-          "id": "movies",
-          "type": "movie",
-          "title": "أفلام DramaWorld",
-          "capabilities": [
-            "home",
-            "browse"
-          ],
-          "filters": [
-            {
-              "key": "genre",
-              "kind": "select",
-              "label": "التصنيف",
-              "options": [],
-              "dynamic": true
-            }
-          ],
-          "homeOrder": 10,
-          "homeFallback": false,
-          "presentation": {
-            "posterShape": "portrait"
-          }
-        },
-        {
-          "id": "series",
-          "type": "series",
-          "title": "مسلسلات DramaWorld",
-          "capabilities": [
-            "home",
-            "browse"
-          ],
-          "filters": [
-            {
-              "key": "genre",
-              "kind": "select",
-              "label": "التصنيف",
-              "options": [],
-              "dynamic": true
-            }
-          ],
-          "homeOrder": 20,
-          "homeFallback": false,
-          "presentation": {
-            "posterShape": "portrait"
-          }
-        }
+        { "id": "latest-movies", "type": "movie", "title": "وصلت للتو", "capabilities": ["home", "browse", "pagination"], "filters": [], "homeOrder": 10, "homeFallback": true, "presentation": { "posterShape": "portrait" } },
+        { "id": "latest-series", "type": "series", "title": "جديد الدراما", "capabilities": ["home", "browse", "pagination"], "filters": [], "homeOrder": 20, "homeFallback": true, "presentation": { "posterShape": "portrait" } },
+        { "id": "top-imdb-movies", "type": "movie", "title": "روائع السينما", "capabilities": ["home", "browse", "pagination"], "filters": [], "homeOrder": 30, "homeFallback": true, "presentation": { "posterShape": "portrait" } },
+        { "id": "top-imdb-series", "type": "series", "title": "دراما في القمة", "capabilities": ["home", "browse", "pagination"], "filters": [], "homeOrder": 40, "homeFallback": true, "presentation": { "posterShape": "portrait" } },
+        { "id": "most-viewed-movies", "type": "movie", "title": "الأكثر مشاهدة", "capabilities": ["home", "browse", "pagination"], "filters": [], "homeOrder": 50, "homeFallback": true, "presentation": { "posterShape": "portrait" } },
+        { "id": "current-year-movies", "type": "movie", "title": "سينما هذا العام", "capabilities": ["home", "browse", "pagination"], "filters": [], "homeOrder": 60, "homeFallback": true, "presentation": { "posterShape": "portrait" } }
       ],
       "searchGroups": [
         {

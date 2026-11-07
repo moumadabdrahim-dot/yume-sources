@@ -4,7 +4,7 @@
 // CloudStream DramaWorld client. They are API route identifiers, not session
 // credentials. Firebase remains optional and only updates the content hosts.
 var PLUGIN_ID = "dramaworld";
-var PLUGIN_VERSION = "0.3.6";
+var PLUGIN_VERSION = "0.3.7";
 var FIREBASE_PROJECT_ID = "alamaldrama2022v2";
 var API_ROUTE_KEY = "4F5A9C3D9A86FA54EACEDDD635185";
 var API_ROUTE_ID = "d506abfd-9fe2-4b71-b979-feff21bcad13";
@@ -26,6 +26,17 @@ var KNOWN_FALLBACK_APIS = [
   "https://dr.arabypros.com/api"
 ];
 var REMOTE_CONFIG_KEYS = ["API_URL", "API_URL2"];
+var CATALOG_HOME_PREVIEW_LIMIT = 18;
+var CATALOG_HOME_CONCURRENCY = 2;
+var MAX_CATALOG_PAGE = 10000;
+var CATALOG_DEFINITIONS = [
+  { id: "latest-movies", title: "وصلت للتو", type: "movie", routeKind: "filter", sourceKind: "movie", order: "created", home: true },
+  { id: "latest-series", title: "جديد الدراما", type: "series", routeKind: "filter", sourceKind: "serie", order: "created", home: true },
+  { id: "top-imdb-movies", title: "روائع السينما", type: "movie", routeKind: "filter", sourceKind: "movie", order: "imdb", home: true },
+  { id: "top-imdb-series", title: "دراما في القمة", type: "series", routeKind: "filter", sourceKind: "serie", order: "imdb", home: true },
+  { id: "most-viewed-movies", title: "الأكثر مشاهدة", type: "movie", routeKind: "filter", sourceKind: "movie", order: "views", home: true },
+  { id: "current-year-movies", title: "سينما هذا العام", type: "movie", routeKind: "year", sourceKind: "movie", order: "year", home: true }
+];
 // This display-only tier prioritizes hosts with verified resolver support. It
 // never removes a source or changes the source-array index encoded in the
 // option token. Hosts within the tier retain the API's original order.
@@ -416,6 +427,134 @@ function mapCatalogByGenre(value, catalogId, genreName) {
     if (Array.isArray(genre.posters)) posters = posters.concat(genre.posters);
   });
   return { catalogId: catalogId, items: uniqueItems(posters, type), page: { hasMore: false } };
+}
+
+function catalogDefinition(catalogId) {
+  for (var index = 0; index < CATALOG_DEFINITIONS.length; index += 1) {
+    if (CATALOG_DEFINITIONS[index].id === catalogId) return CATALOG_DEFINITIONS[index];
+  }
+  return null;
+}
+
+function catalogRows(value) {
+  var data = unwrapData(value);
+  if (Array.isArray(data)) return data;
+  if (isObject(data) && Array.isArray(data.posters)) return data.posters;
+  return null;
+}
+
+function catalogItemsFingerprint(items) {
+  var material = items.map(function (item) { return item.nativeId; }).sort().join("|");
+  var hash = 2166136261;
+  for (var index = 0; index < material.length; index += 1) {
+    hash = Math.imul(hash ^ material.charCodeAt(index), 16777619) >>> 0;
+  }
+  return ("00000000" + hash.toString(16)).slice(-8);
+}
+
+function parseCatalogCursor(value) {
+  var cursor = text(value);
+  if (!cursor) return { page: 0, previousFingerprint: null };
+  var match = /^p:([0-9]{1,5}):([0-9a-f]{8})$/i.exec(cursor);
+  if (!match || Number(match[1]) > MAX_CATALOG_PAGE) {
+    fail("DRAMAWORLD_INVALID_CURSOR", "catalog cursor is invalid or outside the supported range");
+  }
+  return { page: Number(match[1]), previousFingerprint: match[2].toLowerCase() };
+}
+
+function catalogRoute(definition, page) {
+  if (definition.routeKind === "filter") {
+    return definition.sourceKind + "/by/filtres/0/" + definition.order + "/" + page;
+  }
+  if (definition.routeKind === "year") {
+    var currentYear = new Date().getUTCFullYear();
+    if (currentYear < 1900 || currentYear > 2100) {
+      fail("DRAMAWORLD_YEAR_INVALID", "current year is outside the supported range");
+    }
+    return "poster/by/year/" + currentYear + "/" + definition.sourceKind + "/" + page;
+  }
+  fail("DRAMAWORLD_INVALID_CATALOG", "catalog route is not supported");
+}
+
+function traceCatalogPage(catalogId, page, itemCount, hasMore, elapsedMs, failureCode) {
+  if (!diagnosticsEnabled() || typeof console === "undefined" || !console.log) return;
+  var event = {
+    pluginId: PLUGIN_ID,
+    version: PLUGIN_VERSION,
+    catalogId: catalogId,
+    page: page,
+    itemCount: itemCount,
+    hasMore: hasMore === true,
+    elapsedMs: Math.max(0, Math.floor(Number(elapsedMs) || 0))
+  };
+  if (failureCode) event.failureCode = String(failureCode).replace(/[^A-Z0-9_]/g, "").slice(0, 64);
+  console.log("DRAMAWORLD_CATALOG_TRACE " + JSON.stringify(event));
+}
+
+async function requestCatalogPage(config, definition, cursorValue) {
+  var cursor = parseCatalogCursor(cursorValue);
+  var path = catalogRoute(definition, cursor.page);
+  var startedAt = Date.now();
+  try {
+    var raw = await requestValidatedJson(config, endpointPath(config, path), function (value) {
+      return catalogRows(value) !== null;
+    }, "DRAMAWORLD_CATALOG_INVALID", "DramaWorld catalog JSON did not match the expected list contract");
+    var rows = catalogRows(raw);
+    var items = uniqueItems(rows, definition.type);
+    if (rows.length && !items.length) {
+      fail("DRAMAWORLD_CATALOG_INVALID", "DramaWorld catalog rows contained no valid items of the declared type");
+    }
+    var fingerprint = catalogItemsFingerprint(items);
+    if (items.length && cursor.previousFingerprint === fingerprint) {
+      traceCatalogPage(definition.id, cursor.page, 0, false, Date.now() - startedAt, "DRAMAWORLD_REPEATED_PAGE");
+      return { catalogId: definition.id, items: [], page: { hasMore: false } };
+    }
+    var hasMore = items.length > 0;
+    var page = { hasMore: hasMore };
+    if (hasMore) page.nextCursor = "p:" + (cursor.page + 1) + ":" + fingerprint;
+    traceCatalogPage(definition.id, cursor.page, items.length, hasMore, Date.now() - startedAt, null);
+    return { catalogId: definition.id, items: items, page: page };
+  } catch (error) {
+    traceCatalogPage(definition.id, cursor.page, 0, false, Date.now() - startedAt,
+      error && error.code || "DRAMAWORLD_CATALOG_FAILED");
+    throw error;
+  }
+}
+
+async function catalogHomeSections(config) {
+  var definitions = CATALOG_DEFINITIONS.filter(function (definition) { return definition.home === true; });
+  var sections = new Array(definitions.length);
+  var failures = [];
+  var nextIndex = 0;
+  async function worker() {
+    while (nextIndex < definitions.length) {
+      var index = nextIndex++;
+      var definition = definitions[index];
+      try {
+        var result = await requestCatalogPage(config, definition, null);
+        if (result.items.length) {
+          sections[index] = {
+            id: definition.id,
+            title: definition.title,
+            items: result.items.slice(0, CATALOG_HOME_PREVIEW_LIMIT),
+            hasMore: result.page.hasMore,
+            nextPage: result.page.nextCursor
+          };
+        }
+      } catch (_) {
+        failures.push(definition.id);
+      }
+    }
+  }
+  var workers = [];
+  for (var workerIndex = 0; workerIndex < Math.min(CATALOG_HOME_CONCURRENCY, definitions.length); workerIndex += 1) {
+    workers.push(worker());
+  }
+  await Promise.all(workers);
+  if (failures.length) {
+    fail("DRAMAWORLD_HOME_CATALOG_FAILED", "one or more DramaWorld Home catalogs could not be loaded");
+  }
+  return sections.filter(Boolean);
 }
 
 function mapSearch(value, groupId) {
@@ -1485,7 +1624,7 @@ function homeCatalogItems(home, catalogId) {
 
 function onSettings() {
   return [
-    { type: "header", label: "DramaWorld · 0.3.6" },
+    { type: "header", label: "DramaWorld · 0.3.7" },
     { type: "toggle", key: "localPackedResolver", label: "المحلّل المحلي الاحتياطي", defaultValue: true, description: "يعمل عند الحاجة بعد المسار المباشر، ويفك Packer نصياً دون WebView أو خدمات استخراج خارجية." },
     { type: "toggle", key: "universalExtractorEnabled", label: "محرك Yume المركزي", defaultValue: true, description: "يجرب المحرك المركزي أولاً ثم يعود مرة واحدة إلى المحلّل المحلي عند الفشل. عطّل هذا الخيار للرجوع الفوري إلى Legacy Only." },
     { type: "toggle", key: "prioritizeVerifiedServers", label: "ترتيب السيرفرات المدعومة أولاً", defaultValue: true, description: "يعرض السيرفرات ذات الدعم المثبت أولاً مع الاحتفاظ بجميع السيرفرات وفهارسها الأصلية. عطّله لاستعادة ترتيب المصدر الأصلي." },
@@ -1516,38 +1655,31 @@ function requestHomeData(config) {
 
 async function getHome() {
   var config = await readConfig();
-  var raw = await requestHomeData(config);
-  return mapHome(raw);
+  return { sections: await catalogHomeSections(config) };
 }
 
 async function getCatalog(args) {
   args = isObject(args) ? args : {};
   var catalogId = text(args.catalogId);
-  if (catalogId !== "movies" && catalogId !== "series") {
-    fail("DRAMAWORLD_INVALID_CATALOG", "unknown DramaWorld catalog");
+  var definition = catalogDefinition(catalogId);
+  if (!definition) fail("DRAMAWORLD_INVALID_CATALOG", "unknown DramaWorld catalog");
+  var requestedType = normalizeType(args.type);
+  if (requestedType && requestedType !== definition.type) {
+    fail("DRAMAWORLD_INVALID_CATALOG", "catalog type does not match the declared DramaWorld catalog");
   }
-  var config = await readConfig();
-  var raw = await requestHomeData(config);
   var filters = isObject(args.filters) ? args.filters : {};
   Object.keys(filters).forEach(function (key) {
-    if (key !== "genre") fail("DRAMAWORLD_INVALID_FILTER", "unknown DramaWorld catalog filter");
+    fail("DRAMAWORLD_INVALID_FILTER", "this DramaWorld catalog does not accept filters");
   });
-  return mapCatalogByGenre(raw, catalogId, filters.genre);
+  var config = await readConfig();
+  return requestCatalogPage(config, definition, args.cursor);
 }
 
 async function getCatalogFilters(args) {
   args = isObject(args) ? args : {};
   var catalogId = text(args.catalogId);
-  if (catalogId !== "movies" && catalogId !== "series") {
-    fail("DRAMAWORLD_INVALID_CATALOG", "unknown DramaWorld catalog");
-  }
-  var config = await readConfig();
-  var raw = await requestHomeData(config);
-  var options = catalogGenres(raw, catalogId);
-  return {
-    catalogId: catalogId,
-    filters: options.length ? [{ key: "genre", label: "التصنيف", options: options }] : []
-  };
+  if (!catalogDefinition(catalogId)) fail("DRAMAWORLD_INVALID_CATALOG", "unknown DramaWorld catalog");
+  return { catalogId: catalogId, filters: [] };
 }
 
 async function search(args) {
@@ -2358,7 +2490,7 @@ var YUME_DRAMAWORLD_LOCAL_RESOLVER = (function () {
 (function (root) {
   "use strict";
 
-  var VERSION = "0.3.6";
+  var VERSION = "0.3.7";
   var DEFAULT_TIMEOUT_MS = 10000;
   var MAX_BODY_CHARS = 512 * 1024;
   var MAX_PROBE_BYTES = 64 * 1024;

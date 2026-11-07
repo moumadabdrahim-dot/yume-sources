@@ -1,6 +1,6 @@
 {
   "name": "DramaWorld",
-  "version": "0.3.7",
+  "version": "0.3.8",
   "description": "إضافة DramaWorld للأفلام والمسلسلات مع جودات متعددة واستخراج آمن.",
   "apiVersion": 2,
   "scrapers": [
@@ -8,7 +8,7 @@
       "id": "dramaworld",
       "name": "DramaWorld",
       "description": "أفلام ومسلسلات DramaWorld مع استخراج آمن ودعم الجودات المتعددة.",
-      "version": "0.3.7",
+      "version": "0.3.8",
       "filename": "dramaworld.js",
       "supportedTypes": [
         "movie",
@@ -33,7 +33,35 @@
         { "id": "top-imdb-movies", "type": "movie", "title": "روائع السينما", "capabilities": ["home", "browse", "pagination"], "filters": [], "homeOrder": 30, "homeFallback": true, "presentation": { "posterShape": "portrait" } },
         { "id": "top-imdb-series", "type": "series", "title": "دراما في القمة", "capabilities": ["home", "browse", "pagination"], "filters": [], "homeOrder": 40, "homeFallback": true, "presentation": { "posterShape": "portrait" } },
         { "id": "most-viewed-movies", "type": "movie", "title": "الأكثر مشاهدة", "capabilities": ["home", "browse", "pagination"], "filters": [], "homeOrder": 50, "homeFallback": true, "presentation": { "posterShape": "portrait" } },
-        { "id": "current-year-movies", "type": "movie", "title": "سينما هذا العام", "capabilities": ["home", "browse", "pagination"], "filters": [], "homeOrder": 60, "homeFallback": true, "presentation": { "posterShape": "portrait" } }
+        { "id": "current-year-movies", "type": "movie", "title": "سينما هذا العام", "capabilities": ["home", "browse", "pagination"], "filters": [], "homeOrder": 60, "homeFallback": true, "presentation": { "posterShape": "portrait" } },
+        {
+          "id": "discover-movies",
+          "type": "movie",
+          "title": "استكشاف الأفلام",
+          "capabilities": ["browse", "pagination"],
+          "discoverType": "movie",
+          "filters": [
+            { "key": "genre", "kind": "select", "label": "التصنيف", "dynamic": true, "dependsOn": ["year"], "discoverPresentation": { "priority": 10, "role": "genre" } },
+            { "key": "order", "kind": "select", "label": "الترتيب", "dynamic": true, "dependsOn": ["year"], "discoverPresentation": { "priority": 20 } },
+            { "key": "year", "kind": "select", "label": "السنة", "dynamic": true, "discoverPresentation": { "priority": 30 } }
+          ],
+          "homeFallback": false,
+          "presentation": { "posterShape": "portrait" }
+        },
+        {
+          "id": "discover-series",
+          "type": "series",
+          "title": "استكشاف المسلسلات",
+          "capabilities": ["browse", "pagination"],
+          "discoverType": "series",
+          "filters": [
+            { "key": "genre", "kind": "select", "label": "التصنيف", "dynamic": true, "dependsOn": ["year"], "discoverPresentation": { "priority": 10, "role": "genre" } },
+            { "key": "order", "kind": "select", "label": "الترتيب", "dynamic": true, "dependsOn": ["year"], "discoverPresentation": { "priority": 20 } },
+            { "key": "year", "kind": "select", "label": "السنة", "dynamic": true, "discoverPresentation": { "priority": 30 } }
+          ],
+          "homeFallback": false,
+          "presentation": { "posterShape": "portrait" }
+        }
       ],
       "searchGroups": [
         {

@@ -4,7 +4,7 @@
 // CloudStream DramaWorld client. They are API route identifiers, not session
 // credentials. Firebase remains optional and only updates the content hosts.
 var PLUGIN_ID = "dramaworld";
-var PLUGIN_VERSION = "0.3.7";
+var PLUGIN_VERSION = "0.3.8";
 var FIREBASE_PROJECT_ID = "alamaldrama2022v2";
 var API_ROUTE_KEY = "4F5A9C3D9A86FA54EACEDDD635185";
 var API_ROUTE_ID = "d506abfd-9fe2-4b71-b979-feff21bcad13";
@@ -35,7 +35,17 @@ var CATALOG_DEFINITIONS = [
   { id: "top-imdb-movies", title: "روائع السينما", type: "movie", routeKind: "filter", sourceKind: "movie", order: "imdb", home: true },
   { id: "top-imdb-series", title: "دراما في القمة", type: "series", routeKind: "filter", sourceKind: "serie", order: "imdb", home: true },
   { id: "most-viewed-movies", title: "الأكثر مشاهدة", type: "movie", routeKind: "filter", sourceKind: "movie", order: "views", home: true },
-  { id: "current-year-movies", title: "سينما هذا العام", type: "movie", routeKind: "year", sourceKind: "movie", order: "year", home: true }
+  { id: "current-year-movies", title: "سينما هذا العام", type: "movie", routeKind: "year", sourceKind: "movie", order: "year", home: true },
+  { id: "discover-movies", title: "استكشاف الأفلام", type: "movie", routeKind: "discover", sourceKind: "movie", home: false },
+  { id: "discover-series", title: "استكشاف المسلسلات", type: "series", routeKind: "discover", sourceKind: "serie", home: false }
+];
+var CATALOG_ORDER_OPTIONS = [
+  { value: "created", label: "المضافة حديثًا" },
+  { value: "rating", label: "الأعلى تقييمًا" },
+  { value: "imdb", label: "تقييم IMDb" },
+  { value: "title", label: "حسب الاسم" },
+  { value: "year", label: "حسب السنة" },
+  { value: "views", label: "الأكثر مشاهدة" }
 ];
 // This display-only tier prioritizes hosts with verified resolver support. It
 // never removes a source or changes the source-array index encoded in the
@@ -443,6 +453,91 @@ function catalogRows(value) {
   return null;
 }
 
+function genreRows(value) {
+  var data = unwrapData(value);
+  return Array.isArray(data) ? data : null;
+}
+
+function yearRows(value) {
+  var data = unwrapData(value);
+  return Array.isArray(data) ? data : null;
+}
+
+function genreOptions(rows, requiredType) {
+  var seen = Object.create(null);
+  return (Array.isArray(rows) ? rows : []).map(function (row) {
+    if (!isObject(row)) return null;
+    var id = Number(row.id);
+    var label = text(row.title);
+    if (!isFinite(id) || Math.floor(id) !== id || id <= 0 || id > 1000000 || !label) return null;
+    // The source exposes movie-only and series-only buckets in the shared genre
+    // list. Generic genres remain valid because the selected movie/serie route
+    // itself guarantees the returned content type.
+    var movieOnly = /(?:أفلام|الأفلام|فيلم)/.test(label);
+    var seriesOnly = /(?:مسلسلات|المسلسلات|مسلسل|برامج تلفزيونية)/.test(label);
+    if ((requiredType === "movie" && seriesOnly) || (requiredType === "series" && movieOnly)) return null;
+    var value = String(id);
+    if (seen[value]) return null;
+    seen[value] = true;
+    return { value: value, label: label };
+  }).filter(Boolean);
+}
+
+function yearOptions(rows) {
+  var seen = Object.create(null);
+  return (Array.isArray(rows) ? rows : []).map(function (row) {
+    var value = typeof row === "number" && isFinite(row) && Math.floor(row) === row ? String(row) : text(row);
+    if (!value || !/^(?:19|20)[0-9]{2}$/.test(value) || seen[value]) return null;
+    seen[value] = true;
+    return { value: value, label: value };
+  }).filter(Boolean);
+}
+
+function catalogFilterDefinition(key, label, options, dependsOn, role, priority) {
+  var definition = {
+    key: key,
+    kind: "select",
+    label: label,
+    required: false,
+    dynamic: true,
+    dependsOn: dependsOn || [],
+    options: options || [],
+    discoverPresentation: { priority: priority }
+  };
+  if (role) definition.discoverPresentation.role = role;
+  return definition;
+}
+
+function selectedCatalogFilters(value) {
+  if (!isObject(value)) return {};
+  var filters = {};
+  Object.keys(value).forEach(function (key) {
+    if (["genre", "order", "year"].indexOf(key) < 0) {
+      fail("DRAMAWORLD_INVALID_FILTER", "unknown DramaWorld Discover filter");
+    }
+    var selected = text(value[key]);
+    if (selected) filters[key] = selected;
+  });
+  return filters;
+}
+
+function validatedDiscoverFilters(value) {
+  var filters = selectedCatalogFilters(value);
+  if (filters.genre && !/^[1-9][0-9]{0,6}$/.test(filters.genre)) {
+    fail("DRAMAWORLD_INVALID_FILTER", "genre must be a numeric source identifier");
+  }
+  if (filters.order && !CATALOG_ORDER_OPTIONS.some(function (option) { return option.value === filters.order; })) {
+    fail("DRAMAWORLD_INVALID_FILTER", "order is not supported by DramaWorld");
+  }
+  if (filters.year && !/^(?:19|20)[0-9]{2}$/.test(filters.year)) {
+    fail("DRAMAWORLD_INVALID_FILTER", "year is outside the supported source format");
+  }
+  if (filters.year && (filters.genre || filters.order)) {
+    fail("DRAMAWORLD_FILTER_CONFLICT", "year cannot be combined with genre or order");
+  }
+  return filters;
+}
+
 function catalogItemsFingerprint(items) {
   var material = items.map(function (item) { return item.nativeId; }).sort().join("|");
   var hash = 2166136261;
@@ -462,7 +557,8 @@ function parseCatalogCursor(value) {
   return { page: Number(match[1]), previousFingerprint: match[2].toLowerCase() };
 }
 
-function catalogRoute(definition, page) {
+function catalogRoute(definition, page, selectedFilters) {
+  selectedFilters = selectedFilters || {};
   if (definition.routeKind === "filter") {
     return definition.sourceKind + "/by/filtres/0/" + definition.order + "/" + page;
   }
@@ -473,7 +569,27 @@ function catalogRoute(definition, page) {
     }
     return "poster/by/year/" + currentYear + "/" + definition.sourceKind + "/" + page;
   }
+  if (definition.routeKind === "discover") {
+    var filters = validatedDiscoverFilters(selectedFilters);
+    if (filters.year) {
+      return "poster/by/year/" + filters.year + "/" + definition.sourceKind + "/" + page;
+    }
+    return definition.sourceKind + "/by/filtres/" + (filters.genre || "0") + "/" +
+      (filters.order || "created") + "/" + page;
+  }
   fail("DRAMAWORLD_INVALID_CATALOG", "catalog route is not supported");
+}
+
+async function requestGenreList(config) {
+  return requestValidatedJson(config, endpointPath(config, "genre/all"), function (value) {
+    return genreRows(value) !== null;
+  }, "DRAMAWORLD_GENRES_INVALID", "DramaWorld genre list did not match the expected array contract");
+}
+
+async function requestYearsList(config) {
+  return requestValidatedJson(config, endpointPath(config, "years/all"), function (value) {
+    return yearRows(value) !== null;
+  }, "DRAMAWORLD_YEARS_INVALID", "DramaWorld year list did not match the expected array contract");
 }
 
 function traceCatalogPage(catalogId, page, itemCount, hasMore, elapsedMs, failureCode) {
@@ -491,9 +607,9 @@ function traceCatalogPage(catalogId, page, itemCount, hasMore, elapsedMs, failur
   console.log("DRAMAWORLD_CATALOG_TRACE " + JSON.stringify(event));
 }
 
-async function requestCatalogPage(config, definition, cursorValue) {
+async function requestCatalogPage(config, definition, cursorValue, selectedFilters) {
   var cursor = parseCatalogCursor(cursorValue);
-  var path = catalogRoute(definition, cursor.page);
+  var path = catalogRoute(definition, cursor.page, selectedFilters);
   var startedAt = Date.now();
   try {
     var raw = await requestValidatedJson(config, endpointPath(config, path), function (value) {
@@ -1624,7 +1740,7 @@ function homeCatalogItems(home, catalogId) {
 
 function onSettings() {
   return [
-    { type: "header", label: "DramaWorld · 0.3.7" },
+    { type: "header", label: "DramaWorld · 0.3.8" },
     { type: "toggle", key: "localPackedResolver", label: "المحلّل المحلي الاحتياطي", defaultValue: true, description: "يعمل عند الحاجة بعد المسار المباشر، ويفك Packer نصياً دون WebView أو خدمات استخراج خارجية." },
     { type: "toggle", key: "universalExtractorEnabled", label: "محرك Yume المركزي", defaultValue: true, description: "يجرب المحرك المركزي أولاً ثم يعود مرة واحدة إلى المحلّل المحلي عند الفشل. عطّل هذا الخيار للرجوع الفوري إلى Legacy Only." },
     { type: "toggle", key: "prioritizeVerifiedServers", label: "ترتيب السيرفرات المدعومة أولاً", defaultValue: true, description: "يعرض السيرفرات ذات الدعم المثبت أولاً مع الاحتفاظ بجميع السيرفرات وفهارسها الأصلية. عطّله لاستعادة ترتيب المصدر الأصلي." },
@@ -1668,18 +1784,44 @@ async function getCatalog(args) {
     fail("DRAMAWORLD_INVALID_CATALOG", "catalog type does not match the declared DramaWorld catalog");
   }
   var filters = isObject(args.filters) ? args.filters : {};
-  Object.keys(filters).forEach(function (key) {
-    fail("DRAMAWORLD_INVALID_FILTER", "this DramaWorld catalog does not accept filters");
-  });
+  if (definition.routeKind === "discover") {
+    filters = validatedDiscoverFilters(filters);
+  } else {
+    Object.keys(filters).forEach(function () {
+      fail("DRAMAWORLD_INVALID_FILTER", "this DramaWorld catalog does not accept filters");
+    });
+  }
   var config = await readConfig();
-  return requestCatalogPage(config, definition, args.cursor);
+  return requestCatalogPage(config, definition, args.cursor, filters);
 }
 
 async function getCatalogFilters(args) {
   args = isObject(args) ? args : {};
   var catalogId = text(args.catalogId);
-  if (!catalogDefinition(catalogId)) fail("DRAMAWORLD_INVALID_CATALOG", "unknown DramaWorld catalog");
-  return { catalogId: catalogId, filters: [] };
+  var definition = catalogDefinition(catalogId);
+  if (!definition) fail("DRAMAWORLD_INVALID_CATALOG", "unknown DramaWorld catalog");
+  var requestedType = normalizeType(args.contentType);
+  if (requestedType && requestedType !== definition.type) {
+    fail("DRAMAWORLD_INVALID_CATALOG", "catalog filter type does not match the declared DramaWorld catalog");
+  }
+  if (definition.routeKind !== "discover") return { catalogId: catalogId, filters: [] };
+
+  var selected = validatedDiscoverFilters(args.selectedFilters);
+  var config = await readConfig();
+  var requests = [requestYearsList(config)];
+  if (!selected.year) requests.push(requestGenreList(config));
+  var responses = await Promise.all(requests);
+  var years = yearOptions(yearRows(responses[0]));
+  var genres = selected.year ? [] : genreOptions(genreRows(responses[1]), definition.type);
+  var orders = selected.year ? [] : CATALOG_ORDER_OPTIONS.slice();
+  return {
+    catalogId: catalogId,
+    filters: [
+      catalogFilterDefinition("genre", "التصنيف", genres, ["year"], "genre", 10),
+      catalogFilterDefinition("order", "الترتيب", orders, ["year"], null, 20),
+      catalogFilterDefinition("year", "السنة", years, [], null, 30)
+    ]
+  };
 }
 
 async function search(args) {

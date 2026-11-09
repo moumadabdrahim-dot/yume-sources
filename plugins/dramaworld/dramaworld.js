@@ -4,7 +4,7 @@
 // CloudStream DramaWorld client. They are API route identifiers, not session
 // credentials. Firebase remains optional and only updates the content hosts.
 var PLUGIN_ID = "dramaworld";
-var PLUGIN_VERSION = "0.3.8";
+var PLUGIN_VERSION = "0.3.9-rc.1";
 var FIREBASE_PROJECT_ID = "alamaldrama2022v2";
 var API_ROUTE_KEY = "4F5A9C3D9A86FA54EACEDDD635185";
 var API_ROUTE_ID = "d506abfd-9fe2-4b71-b979-feff21bcad13";
@@ -51,6 +51,10 @@ var CATALOG_ORDER_OPTIONS = [
 // never removes a source or changes the source-array index encoded in the
 // option token. Hosts within the tier retain the API's original order.
 var PROVEN_SERVER_PRIORITY_LABELS = ["71stream", "hanerix", "ult4vid", "okstream", "vidmoly"];
+// Closed, display-only capability evidence from repeated Samsung resolver runs:
+// each listed family returned more than one distinct verified media quality.
+// Match DNS labels exactly; never expose the matched family in public output.
+var VERIFIED_MULTI_QUALITY_LABELS = ["71stream", "vidtube", "vidspeed", "vidoba"];
 
 function fail(code, message) {
   var error = new Error(code + ": " + message);
@@ -959,6 +963,13 @@ function isProvenPriorityHost(url) {
   });
 }
 
+function sourceHasVerifiedLabel(url, labels) {
+  var host = sourceHost(url);
+  if (!host) return false;
+  var hostLabels = host.split(".");
+  return labels.some(function (label) { return hostLabels.indexOf(label) >= 0; });
+}
+
 function stableSourceFingerprint(source, identity, index) {
   var material = [
     identity.kind,
@@ -981,6 +992,28 @@ function sourceOptionToken(source, identity, index) {
     stableSourceFingerprint(source, identity, index);
 }
 
+function safeOptionQuality(value) {
+  var quality = text(value);
+  if (!quality || quality.length > 12) return null;
+  return /^[0-9]{3,4}p$/i.test(quality) || /^(?:sd|hd|fhd|uhd|4k|8k)$/i.test(quality)
+    ? quality
+    : null;
+}
+
+function safeOptionDisplayHint(source, direct, quality) {
+  // The upstream source row has no verified host-family/category mapping.
+  // Honor only an explicit closed-vocabulary hint, or evidence already present
+  // in the source contract: a validated quality value or a direct media URL.
+  var explicit = (text(source && source.displayHint) || "").toLowerCase();
+  if (["multi_quality", "fast_playback", "hd_quality", "direct_playback"].indexOf(explicit) >= 0) {
+    return explicit;
+  }
+  if (sourceHasVerifiedLabel(source && source.url, VERIFIED_MULTI_QUALITY_LABELS)) return "multi_quality";
+  if (quality && /^(?:[7-9][0-9]{2}|[1-9][0-9]{3})p$/i.test(quality)) return "hd_quality";
+  if (direct && (direct.type === "mp4" || direct.type === "hls")) return "direct_playback";
+  return null;
+}
+
 function parseSourceOptionToken(value) {
   var token = text(value);
   var match = token && /^dwopt1:(movie|episode):([1-9][0-9]*):([0-9]{1,3}):([0-9a-f]{8})$/i.exec(token);
@@ -1000,6 +1033,7 @@ function mapStreamOptions(sourceRows, identity) {
     if (!url || !/^https:\/\//i.test(url) || seen[url]) return;
     seen[url] = true;
     var direct = classifySource(source);
+    var quality = safeOptionQuality(source.quality);
     // Keep the original server number and token index even when its card is
     // promoted. resolveStreamOption therefore still resolves the exact row the
     // user selected after the source list is fetched again.
@@ -1010,7 +1044,8 @@ function mapStreamOptions(sourceRows, identity) {
         title: "سيرفر " + (index + 1),
         name: "سيرفر " + (index + 1),
         type: direct ? direct.type : "embed",
-        quality: direct ? direct.quality : null
+        quality: quality,
+        displayHint: safeOptionDisplayHint(source, direct, quality) || undefined
       }
     });
   });

@@ -4,7 +4,7 @@
 // CloudStream DramaWorld client. They are API route identifiers, not session
 // credentials. Firebase remains optional and only updates the content hosts.
 var PLUGIN_ID = "dramaworld";
-var PLUGIN_VERSION = "0.3.9-rc.2";
+var PLUGIN_VERSION = "0.3.9-rc.3";
 var FIREBASE_PROJECT_ID = "alamaldrama2022v2";
 var API_ROUTE_KEY = "4F5A9C3D9A86FA54EACEDDD635185";
 var API_ROUTE_ID = "d506abfd-9fe2-4b71-b979-feff21bcad13";
@@ -947,7 +947,10 @@ function sourceHost(url) {
 function serverPriorityEnabled() {
   var settings = typeof SCRAPER_SETTINGS !== "undefined" && isObject(SCRAPER_SETTINGS)
     ? SCRAPER_SETTINGS : {};
-  return settings.prioritizeVerifiedServers !== false;
+  // Preserve the source API order by default. Priority ordering is an explicit
+  // user preference because reordering also changes the neutral server number
+  // assigned by the Host, even though the opaque option token remains stable.
+  return settings.prioritizeVerifiedServers === true;
 }
 
 function isProvenPriorityHost(url) {
@@ -1784,10 +1787,10 @@ function homeCatalogItems(home, catalogId) {
 
 function onSettings() {
   return [
-    { type: "header", label: "DramaWorld · 0.3.8" },
+    { type: "header", label: "DramaWorld · " + PLUGIN_VERSION },
     { type: "toggle", key: "localPackedResolver", label: "المحلّل المحلي الاحتياطي", defaultValue: true, description: "يعمل عند الحاجة بعد المسار المباشر، ويفك Packer نصياً دون WebView أو خدمات استخراج خارجية." },
     { type: "toggle", key: "universalExtractorEnabled", label: "محرك Yume المركزي", defaultValue: true, description: "يجرب المحرك المركزي أولاً ثم يعود مرة واحدة إلى المحلّل المحلي عند الفشل. عطّل هذا الخيار للرجوع الفوري إلى Legacy Only." },
-    { type: "toggle", key: "prioritizeVerifiedServers", label: "ترتيب السيرفرات المدعومة أولاً", defaultValue: true, description: "يعرض السيرفرات ذات الدعم المثبت أولاً مع الاحتفاظ بجميع السيرفرات وفهارسها الأصلية. عطّله لاستعادة ترتيب المصدر الأصلي." },
+    { type: "toggle", key: "prioritizeVerifiedServers", label: "ترتيب السيرفرات المدعومة أولاً", defaultValue: false, description: "يحافظ افتراضيًا على ترتيب DramaWorld الأصلي. فعّل هذا الخيار لعرض السيرفرات ذات الدعم المثبت أولاً مع الاحتفاظ بهوية كل خيار." },
     { type: "toggle", key: "debugResolverDiagnostics", label: "تشخيص تقني منقّح", defaultValue: false, description: "سجلات اختيارية للمضيف والمرحلة والحالة ونوع الاستجابة والزمن والعدادات فقط؛ لا تسجل الروابط أو معاملات الاستعلام أو بيانات الاعتماد أو محتوى الصفحة." },
     { type: "info", label: "Universal First هو المسار الافتراضي مع رجوع Legacy واحد. يمكن الرجوع فوراً إلى Legacy Only من الإعدادات." }
   ];

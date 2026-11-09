@@ -4,7 +4,7 @@
 // CloudStream DramaWorld client. They are API route identifiers, not session
 // credentials. Firebase remains optional and only updates the content hosts.
 var PLUGIN_ID = "dramaworld";
-var PLUGIN_VERSION = "0.3.9-rc.1";
+var PLUGIN_VERSION = "0.3.9-rc.2";
 var FIREBASE_PROJECT_ID = "alamaldrama2022v2";
 var API_ROUTE_KEY = "4F5A9C3D9A86FA54EACEDDD635185";
 var API_ROUTE_ID = "d506abfd-9fe2-4b71-b979-feff21bcad13";
@@ -51,10 +51,6 @@ var CATALOG_ORDER_OPTIONS = [
 // never removes a source or changes the source-array index encoded in the
 // option token. Hosts within the tier retain the API's original order.
 var PROVEN_SERVER_PRIORITY_LABELS = ["71stream", "hanerix", "ult4vid", "okstream", "vidmoly"];
-// Closed, display-only capability evidence from repeated Samsung resolver runs:
-// each listed family returned more than one distinct verified media quality.
-// Match DNS labels exactly; never expose the matched family in public output.
-var VERIFIED_MULTI_QUALITY_LABELS = ["71stream", "vidtube", "vidspeed", "vidoba"];
 
 function fail(code, message) {
   var error = new Error(code + ": " + message);
@@ -1000,15 +996,28 @@ function safeOptionQuality(value) {
     : null;
 }
 
+// Reproduces the display taxonomy used by DramaWorld V4.2a for both movies and
+// episodes. These are presentation labels only: they do not assert the actual
+// media container, number of qualities, resolution, or measured startup speed.
+function originalDramaWorldDisplayHint(source) {
+  var type = text(source && source.type);
+  if (!type || type.length > 16) return null;
+  type = type.trim().toLowerCase();
+  if (type === "webm") return "multi_quality";
+  if (type === "m3u8") return "fast_playback";
+  if (type === "mov") return "hd_quality";
+  return null;
+}
+
 function safeOptionDisplayHint(source, direct, quality) {
-  // The upstream source row has no verified host-family/category mapping.
-  // Honor only an explicit closed-vocabulary hint, or evidence already present
-  // in the source contract: a validated quality value or a direct media URL.
+  // The APK's Source.type taxonomy is the primary display contract. It remains
+  // separate from classifySource(), which alone decides whether a URL is direct.
+  var original = originalDramaWorldDisplayHint(source);
+  if (original) return original;
   var explicit = (text(source && source.displayHint) || "").toLowerCase();
   if (["multi_quality", "fast_playback", "hd_quality", "direct_playback"].indexOf(explicit) >= 0) {
     return explicit;
   }
-  if (sourceHasVerifiedLabel(source && source.url, VERIFIED_MULTI_QUALITY_LABELS)) return "multi_quality";
   if (quality && /^(?:[7-9][0-9]{2}|[1-9][0-9]{3})p$/i.test(quality)) return "hd_quality";
   if (direct && (direct.type === "mp4" || direct.type === "hls")) return "direct_playback";
   return null;

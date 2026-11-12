@@ -1,6 +1,6 @@
 {
   "name": "DramaWorld",
-  "version": "0.3.9-rc.3",
+  "version": "0.3.9-rc.4",
   "description": "إضافة DramaWorld للأفلام والمسلسلات مع جودات متعددة واستخراج آمن.",
   "apiVersion": 2,
   "scrapers": [
@@ -8,7 +8,7 @@
       "id": "dramaworld",
       "name": "DramaWorld",
       "description": "أفلام ومسلسلات DramaWorld مع استخراج آمن ودعم الجودات المتعددة.",
-      "version": "0.3.9-rc.3",
+      "version": "0.3.9-rc.4",
       "filename": "dramaworld.js",
       "supportedTypes": [
         "movie",

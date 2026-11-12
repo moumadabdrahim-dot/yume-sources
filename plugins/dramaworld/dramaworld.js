@@ -4,7 +4,7 @@
 // CloudStream DramaWorld client. They are API route identifiers, not session
 // credentials. Firebase remains optional and only updates the content hosts.
 var PLUGIN_ID = "dramaworld";
-var PLUGIN_VERSION = "0.3.9-rc.3";
+var PLUGIN_VERSION = "0.3.9-rc.4";
 var FIREBASE_PROJECT_ID = "alamaldrama2022v2";
 var API_ROUTE_KEY = "4F5A9C3D9A86FA54EACEDDD635185";
 var API_ROUTE_ID = "d506abfd-9fe2-4b71-b979-feff21bcad13";
@@ -1145,11 +1145,17 @@ function safeEmbedRedirect(location, currentUrl) {
   return target;
 }
 
-async function fetchEmbedBody(url) {
+async function fetchEmbedBody(url, deadline) {
   var stageStartedAt = Date.now();
   var currentUrl = url;
   traceDetailed("EMBED_FETCH_START", { options: 1, streams: 0 }, null, { hostUrl: currentUrl, elapsedMs: 0 });
   for (var redirectCount = 0; redirectCount <= MAX_REDIRECTS; redirectCount += 1) {
+    checkResolveCancellation(deadline);
+    var remainingMs = remainingResolveMs(deadline);
+    if (remainingMs <= 0) {
+      failStream("DRAMAWORLD_RESOLVE_BUDGET_EXHAUSTED", "shared stream resolution time budget expired during embed fetch",
+        { hostUrl: currentUrl, httpStatus: 0, responseReceived: false, elapsedMs: Date.now() - stageStartedAt });
+    }
     var response;
     try {
       response = await fetch(currentUrl, {
@@ -1160,7 +1166,8 @@ async function fetchEmbedBody(url) {
           "Accept-Language": EMBED_ACCEPT_LANGUAGE
         },
         redirect: "manual",
-        timeoutMs: EMBED_RESOLVE_TIMEOUT_MS
+        timeoutMs: Math.min(EMBED_RESOLVE_TIMEOUT_MS, remainingMs),
+        signal: deadline && deadline.signal
       });
     } catch (error) {
       if (isCancellation(error)) throw error;
@@ -1255,7 +1262,7 @@ function playbackHeadersForEmbed(embedUrl, source) {
   return headers;
 }
 
-async function verifyMediaCandidate(candidate, embedUrl, source, candidateIndex, candidateCount) {
+async function verifyMediaCandidate(candidate, embedUrl, source, candidateIndex, candidateCount, deadline) {
   var stageStartedAt = Date.now();
   var currentUrl = candidate.url;
   var headers = playbackHeadersForEmbed(embedUrl, source);
@@ -1265,13 +1272,21 @@ async function verifyMediaCandidate(candidate, embedUrl, source, candidateIndex,
   headers.Range = "bytes=0-1023";
 
   for (var redirectCount = 0; redirectCount <= MAX_REDIRECTS; redirectCount += 1) {
+    checkResolveCancellation(deadline);
+    var remainingMs = remainingResolveMs(deadline);
+    if (remainingMs <= 0) {
+      failStream("DRAMAWORLD_RESOLVE_BUDGET_EXHAUSTED", "shared stream resolution time budget expired during media validation",
+        { hostUrl: currentUrl, httpStatus: 0, responseReceived: false, candidateIndex: candidateIndex,
+          candidateCount: candidateCount, elapsedMs: Date.now() - stageStartedAt, responseKind: "unknown" });
+    }
     var response;
     try {
       response = await fetch(currentUrl, {
         method: "GET",
         headers: headers,
         redirect: "manual",
-        timeoutMs: EMBED_RESOLVE_TIMEOUT_MS
+        timeoutMs: Math.min(EMBED_RESOLVE_TIMEOUT_MS, remainingMs),
+        signal: deadline && deadline.signal
       });
     } catch (error) {
       if (isCancellation(error)) throw error;
@@ -2065,8 +2080,36 @@ function universalDiagnosticSummary(diagnostics, streamCount, elapsedMs, errorCo
   };
 }
 
-async function resolveWithUniversalExtractor(embedUrl, sourceIndex, source) {
+var DRAMAWORLD_RESOLVE_BUDGET_MS = 12000;
+
+function createResolveDeadline(timeoutMs) {
+  var limit = Number(timeoutMs);
+  if (!isFinite(limit) || limit < 1) limit = DRAMAWORLD_RESOLVE_BUDGET_MS;
+  return { startedAt: Date.now(), expiresAt: Date.now() + limit };
+}
+
+function remainingResolveMs(deadline) {
+  if (!deadline || !isFinite(Number(deadline.expiresAt))) return DRAMAWORLD_RESOLVE_BUDGET_MS;
+  return Math.max(0, Math.floor(Number(deadline.expiresAt) - Date.now()));
+}
+
+function checkResolveCancellation(deadline) {
+  if (deadline && deadline.signal && deadline.signal.aborted === true) {
+    throw Object.assign(new Error("cancelled"), { name: "AbortError" });
+  }
+}
+
+function requireResolveBudget(deadline, stage) {
+  checkResolveCancellation(deadline);
+  if (remainingResolveMs(deadline) > 0) return;
+  fail("DRAMAWORLD_RESOLVE_BUDGET_EXHAUSTED", "shared stream resolution time budget expired" +
+    (stage ? " during " + String(stage).replace(/[^A-Za-z0-9_-]/g, "").slice(0, 32) : ""));
+}
+
+async function resolveWithUniversalExtractor(embedUrl, sourceIndex, source, deadline) {
   if (!universalExtractorEnabled()) return { attempted: false, streams: null };
+  var remainingMs = remainingResolveMs(deadline);
+  if (remainingMs <= 0) return { attempted: false, streams: null, budgetExhausted: true };
   var startedAt = Date.now();
   traceDetailed("UNIVERSAL_ATTEMPT", { options: 1, streams: 0 }, null,
     { elapsedMs: 0, candidateCount: 0, verifiedCount: 0 });
@@ -2075,8 +2118,8 @@ async function resolveWithUniversalExtractor(embedUrl, sourceIndex, source) {
       url: embedUrl,
       referrer: embedUrl,
       headers: playbackHeadersForEmbed(embedUrl, source),
-      timeoutMs: 12000,
-      perAttemptTimeoutMs: 5000
+      timeoutMs: remainingMs,
+      perAttemptTimeoutMs: Math.min(5000, remainingMs)
     }));
     var payload = typeof raw === "string" ? JSON.parse(raw) : raw;
     var rows = payload && Array.isArray(payload.streams) ? payload.streams : [];
@@ -2105,7 +2148,8 @@ async function resolveWithUniversalExtractor(embedUrl, sourceIndex, source) {
   }
 }
 
-function legacySuccess(streams, subtitles, diagnostic) {
+function legacySuccess(streams, subtitles, diagnostic, deadline) {
+  if (deadline) requireResolveBudget(deadline, "legacy-completion");
   traceDetailed("LEGACY_SUCCESS", { options: 1, streams: streams.length }, null, diagnostic || {});
   return { streams: attachSubtitles(streams, subtitles) };
 }
@@ -2238,7 +2282,7 @@ function diagnosticFetch(transport, records) {
   };
 }
 
-async function resolveEmbedLocally(embedResponse, sourceIndex, source, directCandidate) {
+async function resolveEmbedLocally(embedResponse, sourceIndex, source, directCandidate, deadline) {
   var resolver = YUME_DRAMAWORLD_LOCAL_RESOLVER;
   var response = isObject(embedResponse) ? embedResponse : {};
   var hasEmbedBody = typeof response.body === "string";
@@ -2296,9 +2340,15 @@ async function resolveEmbedLocally(embedResponse, sourceIndex, source, directCan
       headers: resolverHeaders,
       quality: text(directCandidate && directCandidate.quality) || text(source && source.quality) || undefined
     };
+    var remainingMs = remainingResolveMs(deadline);
+    if (remainingMs <= 0) return { streams: [], family: family || null,
+      errorCode: "DRAMAWORLD_RESOLVE_BUDGET_EXHAUSTED", candidateCount: candidateCount,
+      verifiedCount: 0, elapsedMs: Date.now() - resolverStartedAt };
     var resolverContext = {
       fetch: diagnosticsEnabled() ? diagnosticFetch(fetch, mediaDiagnostics) : fetch,
-      timeoutMs: EMBED_RESOLVE_TIMEOUT_MS,
+      timeoutMs: Math.min(EMBED_RESOLVE_TIMEOUT_MS, remainingMs),
+      deadlineAt: deadline && deadline.expiresAt,
+      signal: deadline && deadline.signal,
       userAgent: EMBED_USER_AGENT,
       acceptLanguage: EMBED_ACCEPT_LANGUAGE,
       playbackHeaders: { Referer: (urlOrigin(familyUrl) || "") + "/" },
@@ -2433,7 +2483,13 @@ async function resolveStreamOption(args) {
   // Production contract: Universal First is the default. Disabling the setting
   // selects Legacy Only immediately; otherwise the legacy path is entered at
   // most once, only after an empty/failed universal result.
-  var universalAttempt = await resolveWithUniversalExtractor(embedUrl, selection.index, source);
+  var resolveDeadline = createResolveDeadline(DRAMAWORLD_RESOLVE_BUDGET_MS);
+  resolveDeadline.signal = args.signal || null;
+  var universalAttempt = await resolveWithUniversalExtractor(embedUrl, selection.index, source, resolveDeadline);
+  checkResolveCancellation(resolveDeadline);
+  if (remainingResolveMs(resolveDeadline) <= 0 || universalAttempt.budgetExhausted) {
+    fail("DRAMAWORLD_RESOLVE_BUDGET_EXHAUSTED", "shared stream resolution time budget expired after Universal attempt");
+  }
   if (universalAttempt.streams && universalAttempt.streams.length) {
     traceStreams("RESOLVE_READY", { sourceRows: sourceRows.length, options: 1, streams: universalAttempt.streams.length }, null, {
       hostUrl: embedUrl, responseReceived: true, videoExtracted: true
@@ -2466,7 +2522,7 @@ async function resolveStreamOption(args) {
   var embedResponse = null;
   if (!candidates.length) {
     try {
-      embedResponse = await fetchEmbedBody(embedUrl);
+      embedResponse = await fetchEmbedBody(embedUrl, resolveDeadline);
     } catch (embedError) {
       traceStreamFailure(embedError, "EMBED_FETCH_FAILURE",
         { sourceRows: sourceRows.length, options: 1, streams: 0 }, embedUrl);
@@ -2485,7 +2541,7 @@ async function resolveStreamOption(args) {
           hostUrl: embedResponse.finalUrl, httpStatus: embedResponse.httpStatus,
           responseReceived: embedResponse.responseReceived,
           elapsedMs: Date.now() - legacyStartedAt
-        });
+        }, resolveDeadline);
       }
     }
     var embedParseStartedAt = Date.now();
@@ -2514,7 +2570,7 @@ async function resolveStreamOption(args) {
   if (!candidates.length) {
     var localResult = null;
     if (localResolverEnabled()) {
-      localResult = await resolveEmbedLocally(embedResponse, selection.index, source, null);
+      localResult = await resolveEmbedLocally(embedResponse, selection.index, source, null, resolveDeadline);
       if (localResult && localResult.streams.length) {
         traceStreams("RESOLVE_READY", { sourceRows: sourceRows.length, options: 1, streams: localResult.streams.length }, null, {
           hostUrl: embedResponse && embedResponse.finalUrl || embedUrl,
@@ -2526,7 +2582,7 @@ async function resolveStreamOption(args) {
           httpStatus: embedResponse && embedResponse.httpStatus || null,
           responseReceived: !!(embedResponse && embedResponse.responseReceived),
           elapsedMs: Date.now() - legacyStartedAt
-        });
+        }, resolveDeadline);
       }
     }
     var unresolvedError;
@@ -2560,9 +2616,10 @@ async function resolveStreamOption(args) {
   var verifiedMedia = null;
   var lastValidationError = null;
   for (var candidateIndex = 0; candidateIndex < candidates.length; candidateIndex += 1) {
+    requireResolveBudget(resolveDeadline, "media-validation");
     try {
       verifiedMedia = await verifyMediaCandidate(candidates[candidateIndex], playbackUrl, source,
-        candidateIndex, candidates.length);
+        candidateIndex, candidates.length, resolveDeadline);
       selected = candidates[candidateIndex];
       break;
     } catch (validationError) {
@@ -2570,6 +2627,7 @@ async function resolveStreamOption(args) {
       lastValidationError = validationError;
       traceStreamFailure(validationError, "MEDIA_CANDIDATE_FAILURE",
         { sourceRows: sourceRows.length, options: 1, streams: 0 }, candidates[candidateIndex].url);
+      if (remainingResolveMs(resolveDeadline) <= 0) break;
     }
   }
   if (!selected || !verifiedMedia) {
@@ -2579,7 +2637,7 @@ async function resolveStreamOption(args) {
     // validation error if the fallback also fails.
     var fallbackResult = null;
     if (localResolverEnabled() && embedResponse) {
-      fallbackResult = await resolveEmbedLocally(embedResponse, selection.index, source, candidates[0]);
+      fallbackResult = await resolveEmbedLocally(embedResponse, selection.index, source, candidates[0], resolveDeadline);
       if (fallbackResult && fallbackResult.streams.length) {
         traceStreams("RESOLVE_READY", { sourceRows: sourceRows.length, options: 1, streams: fallbackResult.streams.length }, null, {
           hostUrl: embedResponse && embedResponse.finalUrl || candidates[0].url,
@@ -2591,7 +2649,7 @@ async function resolveStreamOption(args) {
           httpStatus: embedResponse && embedResponse.httpStatus || null,
           responseReceived: !!(embedResponse && embedResponse.responseReceived),
           elapsedMs: Date.now() - legacyStartedAt
-        });
+        }, resolveDeadline);
       }
       if (fallbackResult && fallbackResult.errorCode) {
         traceStreams("LOCAL_RESOLVER_FALLBACK_FAILED", { options: 1, streams: 0 }, fallbackResult.errorCode, {
@@ -2626,7 +2684,7 @@ async function resolveStreamOption(args) {
         hostUrl: verifiedMedia.hostUrl, httpStatus: verifiedMedia.httpStatus,
         responseReceived: verifiedMedia.responseReceived,
         elapsedMs: Date.now() - legacyStartedAt
-      });
+      }, resolveDeadline);
     }
   }
 
@@ -2652,7 +2710,7 @@ async function resolveStreamOption(args) {
     hostUrl: verifiedMedia.hostUrl, httpStatus: verifiedMedia.httpStatus,
     responseReceived: verifiedMedia.responseReceived,
     elapsedMs: Date.now() - legacyStartedAt
-  });
+  }, resolveDeadline);
 }
 
 module.exports = {
@@ -3102,6 +3160,15 @@ var YUME_DRAMAWORLD_LOCAL_RESOLVER = (function () {
     return !!(context && context.signal && context.signal.aborted === true);
   }
 
+  function remainingTimeoutMs(context) {
+    var configured = Number(context && context.timeoutMs || DEFAULT_TIMEOUT_MS);
+    if (!isFinite(configured) || configured < 1) configured = DEFAULT_TIMEOUT_MS;
+    if (context && isFinite(Number(context.deadlineAt))) {
+      configured = Math.min(configured, Math.floor(Number(context.deadlineAt) - Date.now()));
+    }
+    return Math.max(0, configured);
+  }
+
   function responseStatus(response) { return Number(response && (response.status || response.statusCode)) || 0; }
 
   function waitForTransport(promise, timeoutMs, signal) {
@@ -3133,10 +3200,13 @@ var YUME_DRAMAWORLD_LOCAL_RESOLVER = (function () {
     if (typeof fetcher !== "function") return { errorCode: "FETCH_UNAVAILABLE" };
     var current = url;
     var sentHeaders = sanitizeHeaders(headers);
-    var timeout = Number(context.timeoutMs || DEFAULT_TIMEOUT_MS);
-    if (!isFinite(timeout) || timeout < 1 || timeout > 60000) timeout = DEFAULT_TIMEOUT_MS;
+    var configuredTimeout = Number(context.timeoutMs || DEFAULT_TIMEOUT_MS);
+    if (!isFinite(configuredTimeout) || configuredTimeout < 1 || configuredTimeout > 60000) configuredTimeout = DEFAULT_TIMEOUT_MS;
     for (var redirects = 0; redirects <= MAX_REDIRECTS; redirects += 1) {
       if (isCancelled(context)) return { errorCode: "CANCELLED" };
+      var timeout = remainingTimeoutMs(context);
+      if (timeout <= 0) return { errorCode: "RESOLVE_BUDGET_EXHAUSTED" };
+      timeout = Math.min(timeout, configuredTimeout);
       var response;
       try {
         response = await waitForTransport(
@@ -3276,6 +3346,7 @@ var YUME_DRAMAWORLD_LOCAL_RESOLVER = (function () {
     var streams = [], lastError = "MEDIA_SIGNATURE_INVALID", lastStatus = null;
     for (var i = 0; i < candidates.length && streams.length < MAX_CANDIDATES; i += 1) {
       if (isCancelled(context)) return result(streams, streams.length ? "mixed" : null, null, playbackHeaders, resolverId, "CANCELLED", { family: family, verified: streams.length > 0 });
+      if (remainingTimeoutMs(context) <= 0) return result(streams, streams.length ? "mixed" : null, null, playbackHeaders, resolverId, "RESOLVE_BUDGET_EXHAUSTED", { family: family, verified: streams.length > 0 });
       var checked;
       try { checked = await verifyCandidate(candidates[i], embedUrl, source, context); }
       catch (verifyError) {

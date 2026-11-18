@@ -99,6 +99,12 @@
     if (/^http:\/\/image\.tmdb\.org\//i.test(url)) url = "https" + url.slice(4);
     return /^https:\/\/[^\s]+$/i.test(url) && hostFromUrl(url) ? url : undefined;
   }
+  function publicMediaUrl(value) {
+    var url = text(value);
+    if (!/^https?:\/\/[^\s]+$/i.test(url) || /https?:\/\/[^\/?#]*@/i.test(url)) return "";
+    var safeForHostCheck = url.replace(/^http:/i, "https:");
+    return hostFromUrl(safeForHostCheck) ? url : "";
+  }
   function diagnostic(stage, data) {
     if (typeof root.__yume_diagnostic !== "function") return;
     var safe = { pluginId: PLUGIN_ID, stage: stage };
@@ -366,24 +372,113 @@
     return { item: item, episodes: item.episodes };
   }
 
+  function nativeServerCapabilityReady() {
+    if (typeof root.__native_plugin_status !== "function" || typeof root.__native_plugin_request !== "function") return false;
+    try { return root.__native_plugin_status() === "READY"; } catch (_) { return false; }
+  }
+  async function authorizedServers(parsed) {
+    if (!nativeServerCapabilityReady()) fail("CIMACLOUD_AUTHORIZED_SERVER_ACCESS_REQUIRED");
+    var raw;
+    try {
+      raw = await root.__native_plugin_request("CIMACLOUD_SERVER_LIST", JSON.stringify({ kind: parsed.kind, id: parsed.id }));
+    } catch (_) {
+      fail("CIMACLOUD_AUTHORIZED_SERVER_ACCESS_FAILED");
+    }
+    var payload;
+    try { payload = typeof raw === "string" ? JSON.parse(raw) : raw; } catch (_) { fail("CIMACLOUD_INVALID_SERVER_RESPONSE"); }
+    var rows = payload && Array.isArray(payload.servers) ? payload.servers : null;
+    if (!rows || !rows.length || rows.length > 64) fail("CIMACLOUD_INVALID_SERVER_RESPONSE");
+    var seenLinks = Object.create(null);
+    var seenKeys = Object.create(null);
+    var servers = rows.map(function (row, index) {
+      if (!row || typeof row !== "object") return null;
+      var ordinal = Number(row.ordinal);
+      var key = boundedString(row.key, 80);
+      var link = publicMediaUrl(row.link);
+      if (!isFinite(ordinal) || Math.floor(ordinal) !== ordinal || ordinal < 0 || ordinal >= 64 ||
+          !key || !/^(?:id|ordinal):[A-Za-z0-9._:-]{1,70}$/.test(key) || !link ||
+          seenLinks[link] || seenKeys[key]) return null;
+      seenLinks[link] = true;
+      seenKeys[key] = true;
+      return { ordinal: ordinal, key: key, link: link };
+    }).filter(Boolean);
+    if (!servers.length) fail("CIMACLOUD_NO_VALID_SERVERS");
+    var referrer = publicMediaUrl(payload.referrer) || undefined;
+    diagnostic("streams", { sourceCount: servers.length, streamCount: 0 });
+    return { servers: servers, referrer: referrer };
+  }
+  function streamOption(parsed, server, index) {
+    var sourceId = nativeId(parsed.kind, parsed.id);
+    return {
+      token: JSON.stringify({ version: 1, nativeId: sourceId, key: server.key, ordinal: server.ordinal }),
+      title: "سيرفر " + (index + 1),
+      provider: "CimaCloud"
+    };
+  }
+  function parseStreamToken(raw, parsed) {
+    var token;
+    try { token = JSON.parse(text(raw)); } catch (_) { token = null; }
+    var ordinal = token && Number(token.ordinal);
+    if (!token || token.version !== 1 || token.nativeId !== nativeId(parsed.kind, parsed.id) ||
+        !/^(?:id|ordinal):[A-Za-z0-9._:-]{1,70}$/.test(text(token.key)) ||
+        !isFinite(ordinal) || Math.floor(ordinal) !== ordinal || ordinal < 0 || ordinal >= 64) {
+      fail("CIMACLOUD_INVALID_STREAM_OPTION");
+    }
+    return { key: text(token.key), ordinal: ordinal };
+  }
+  function mapExtractedStreams(payload, title) {
+    var rows = payload && Array.isArray(payload.streams) ? payload.streams : [];
+    return rows.map(function (row) {
+      if (!row || typeof row !== "object") return null;
+      var url = publicMediaUrl(row.url);
+      var type = text(row.type).toLowerCase();
+      if (!url || (type !== "hls" && type !== "mp4" && type !== "dash")) return null;
+      var stream = {
+        url: url,
+        type: type,
+        title: title,
+        name: title,
+        provider: "CimaCloud",
+        headers: row.headers && typeof row.headers === "object" && !Array.isArray(row.headers) ? row.headers : {}
+      };
+      if (boundedString(row.quality, 80)) stream.quality = boundedString(row.quality, 80);
+      return stream;
+    }).filter(Boolean);
+  }
   async function getStreams(args) {
     var parsed = parseId(args && args.id);
     if (parsed.kind === "series") fail("CIMACLOUD_SERIES_HAS_NO_PARENT_STREAM");
-    var path = parsed.kind === "movie" ? "movie/" + parsed.id + "/servers" : "episode/" + parsed.id + "/servers";
-    try {
-      var payload = await api(path, null, "streams");
-      var servers = Array.isArray(payload.servers) ? payload.servers : [];
-      if (!servers.length) fail("CIMACLOUD_NO_AUTHORIZED_SERVERS");
-      // A readable server list is not accepted automatically. It must first be
-      // reviewed and represented by stable, source-bound option tokens.
-      diagnostic("streams", { sourceCount: servers.length, streamCount: 0, failureCode: "UNREVIEWED_SERVER_SCHEMA" });
-      fail("CIMACLOUD_UNREVIEWED_SERVER_SCHEMA");
-    } catch (error) {
-      if (error && error.message === "CIMACLOUD_ACCESS_BLOCKED") fail("CIMACLOUD_AUTHORIZED_SERVER_ACCESS_REQUIRED");
-      throw error;
-    }
+    var result = await authorizedServers(parsed);
+    return { options: result.servers.map(function (server, index) { return streamOption(parsed, server, index); }) };
   }
-  async function resolveStreamOption() { fail("CIMACLOUD_AUTHORIZED_SERVER_ACCESS_REQUIRED"); }
+  async function resolveStreamOption(args) {
+    var parsed = parseId(args && args.id);
+    if (parsed.kind === "series") fail("CIMACLOUD_SERIES_HAS_NO_PARENT_STREAM");
+    var token = parseStreamToken(args && args.token, parsed);
+    var result = await authorizedServers(parsed);
+    var matching = result.servers.filter(function (server) { return server.key === token.key; });
+    if (matching.length !== 1 || matching[0].ordinal !== token.ordinal) fail("CIMACLOUD_STALE_STREAM_OPTION");
+    if (typeof root.__yume_extract_v1 !== "function") fail("CIMACLOUD_EXTRACTOR_UNAVAILABLE");
+    var raw;
+    try {
+      raw = await root.__yume_extract_v1(JSON.stringify({
+        url: matching[0].link,
+        referrer: result.referrer || matching[0].link,
+        headers: { "User-Agent": USER_AGENT },
+        timeoutMs: 20000,
+        perAttemptTimeoutMs: 5000
+      }));
+    } catch (_) {
+      fail("CIMACLOUD_EXTRACTION_FAILED");
+    }
+    var payload;
+    try { payload = typeof raw === "string" ? JSON.parse(raw) : raw; } catch (_) { fail("CIMACLOUD_INVALID_EXTRACTOR_RESPONSE"); }
+    var title = "سيرفر " + (token.ordinal + 1);
+    var streams = mapExtractedStreams(payload, title);
+    if (!streams.length) fail("CIMACLOUD_NO_PLAYABLE_STREAM");
+    diagnostic("stream_resolved", { sourceCount: 1, streamCount: streams.length });
+    return { streams: streams };
+  }
 
   var plugin = { getHome: getHome, getCatalog: getCatalog, getCatalogFilters: getCatalogFilters, search: search,
     getDetails: getDetails, getStreams: getStreams, resolveStreamOption: resolveStreamOption };
@@ -391,6 +486,7 @@
   if (root && root.__YUME_CIMACLOUD_TESTING__ && root.module) {
     root.module.exports.__test = { hostFromUrl: hostFromUrl, publicHttpsBase: publicHttpsBase, imageUrl: imageUrl,
       parseId: parseId, nativeId: nativeId, mapMedia: mapMedia, mapHomeItem: mapHomeItem, mapEpisodes: mapEpisodes,
+      publicMediaUrl: publicMediaUrl, parseStreamToken: parseStreamToken, mapExtractedStreams: mapExtractedStreams,
       pageResult: pageResult, detailsItem: detailsItem, resetBase: function () { cachedBase = null; } };
   }
 })(typeof globalThis !== "undefined" ? globalThis : this);

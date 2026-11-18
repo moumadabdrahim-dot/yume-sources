@@ -30,7 +30,7 @@ function listPayload(rows, page = 1, totalPages = 1) {
   return { status: true, results: rows, page, total_pages: totalPages, total: rows.length, has_more: page < totalPages };
 }
 
-function loadPlugin(handler) {
+function loadPlugin(handler, capabilities = {}) {
   const diagnostics = [];
   const context = {
     module: { exports: {} }, exports: {}, console, URL, Date, Promise, JSON, Object, Array, Math,
@@ -38,6 +38,7 @@ function loadPlugin(handler) {
     __YUME_CIMACLOUD_TESTING__: true,
     __yume_diagnostic(value) { diagnostics.push(JSON.parse(value)); },
     fetch: handler,
+    ...capabilities,
   };
   context.globalThis = context;
   vm.runInNewContext(script, context, { filename: scriptPath });
@@ -65,6 +66,7 @@ test('manifest declares one stable API v2 source with independent identity', () 
   assert.equal(manifest.scrapers[0].id, 'cimacloud');
   assert.equal(manifest.scrapers[0].pluginId, 'cimacloud');
   assert.equal(manifest.scrapers[0].autoInstall, true);
+  assert.equal(manifest.scrapers[0].version, '0.1.1');
   assert.deepEqual(manifest.scrapers[0].capabilities, ['home', 'search', 'details', 'streams']);
   assert.ok(manifest.scrapers[0].catalogs.some((entry) => entry.id === 'discover-movies'));
   assert.ok(manifest.scrapers[0].catalogs.some((entry) => entry.id === 'discover-series'));
@@ -208,12 +210,78 @@ test('details reject a payload whose source identity does not match the requeste
   await assert.rejects(() => plugin.getDetails({ id: 'cc:movie:2937' }), /DETAILS_IDENTITY_MISMATCH/);
 });
 
-test('blocked server endpoint becomes a precise authorized-access failure', async () => {
-  const { plugin } = loadPlugin(routeHandler({
-    'GET /v1.3/api/episode/42498/servers': { status: false, blocked: true, data: [] },
-  }));
+test('missing native capability becomes a precise authorized-access failure', async () => {
+  const { plugin } = loadPlugin(async () => { throw new Error('unused'); });
   await assert.rejects(() => plugin.getStreams({ id: 'cc:episode:42498', mode: 'options' }), /AUTHORIZED_SERVER_ACCESS_REQUIRED/);
-  await assert.rejects(() => plugin.resolveStreamOption({ id: 'cc:episode:42498', token: 'anything' }), /AUTHORIZED_SERVER_ACCESS_REQUIRED/);
+  const token = JSON.stringify({ version: 1, nativeId: 'cc:episode:42498', key: 'ordinal:0', ordinal: 0 });
+  await assert.rejects(() => plugin.resolveStreamOption({ id: 'cc:episode:42498', token }), /AUTHORIZED_SERVER_ACCESS_REQUIRED/);
+});
+
+test('authorized server list becomes stable source-bound options without leaking links into tokens', async () => {
+  const links = ['https://video.example/embed/one', 'https://video.example/embed/two'];
+  const requests = [];
+  const { plugin } = loadPlugin(async () => { throw new Error('unused'); }, {
+    __native_plugin_status() { return 'READY'; },
+    async __native_plugin_request(operation, raw) {
+      requests.push({ operation, args: JSON.parse(raw) });
+      return JSON.stringify({ referrer: 'https://api.example/', servers: [
+        { ordinal: 0, key: 'id:a', link: links[0] },
+        { ordinal: 1, key: 'ordinal:1', link: links[1] },
+      ] });
+    },
+  });
+  const result = await plugin.getStreams({ id: 'cc:episode:42498', mode: 'options' });
+  assert.deepEqual(Array.from(result.options, (entry) => entry.title), ['سيرفر 1', 'سيرفر 2']);
+  assert.equal(result.options.every((entry) => !entry.token.includes('http')), true);
+  assert.deepEqual(requests[0], {
+    operation: 'CIMACLOUD_SERVER_LIST',
+    args: { kind: 'episode', id: '42498' },
+  });
+});
+
+test('resolve option refreshes identity and sends only the selected server to the central extractor', async () => {
+  const selected = 'https://video.example/embed/two';
+  const extractorRequests = [];
+  const capabilities = {
+    __native_plugin_status() { return 'READY'; },
+    async __native_plugin_request() {
+      return JSON.stringify({ referrer: 'https://api.example/', servers: [
+        { ordinal: 0, key: 'id:a', link: 'https://video.example/embed/one' },
+        { ordinal: 1, key: 'id:b', link: selected },
+      ] });
+    },
+    async __yume_extract_v1(raw) {
+      extractorRequests.push(JSON.parse(raw));
+      return JSON.stringify({ streams: [
+        { url: 'https://cdn.example/master.m3u8', type: 'HLS', quality: 'Auto', headers: { Referer: 'https://video.example/' } },
+        { url: 'https://cdn.example/video.mp4', type: 'MP4', quality: '720p', headers: {} },
+      ] });
+    },
+  };
+  const { plugin } = loadPlugin(async () => { throw new Error('unused'); }, capabilities);
+  const options = await plugin.getStreams({ id: 'cc:episode:42498', mode: 'options' });
+  const resolved = await plugin.resolveStreamOption({ id: 'cc:episode:42498', token: options.options[1].token });
+  assert.equal(extractorRequests.length, 1);
+  assert.equal(extractorRequests[0].url, selected);
+  assert.equal(extractorRequests[0].referrer, 'https://api.example/');
+  assert.deepEqual(Array.from(resolved.streams, (entry) => entry.type), ['hls', 'mp4']);
+  assert.deepEqual(Array.from(resolved.streams, (entry) => entry.title), ['سيرفر 2', 'سيرفر 2']);
+});
+
+test('stale, cross-content, and malformed server options are rejected before extraction', async () => {
+  let extracted = false;
+  const { plugin } = loadPlugin(async () => { throw new Error('unused'); }, {
+    __native_plugin_status() { return 'READY'; },
+    async __native_plugin_request() {
+      return JSON.stringify({ servers: [{ ordinal: 0, key: 'id:new', link: 'https://video.example/embed/new' }] });
+    },
+    async __yume_extract_v1() { extracted = true; return JSON.stringify({ streams: [] }); },
+  });
+  const stale = JSON.stringify({ version: 1, nativeId: 'cc:episode:42498', key: 'id:old', ordinal: 0 });
+  const wrong = JSON.stringify({ version: 1, nativeId: 'cc:movie:42498', key: 'id:new', ordinal: 0 });
+  await assert.rejects(() => plugin.resolveStreamOption({ id: 'cc:episode:42498', token: stale }), /STALE_STREAM_OPTION/);
+  await assert.rejects(() => plugin.resolveStreamOption({ id: 'cc:episode:42498', token: wrong }), /INVALID_STREAM_OPTION/);
+  assert.equal(extracted, false);
 });
 
 test('HTML, oversized, malformed, and rejected API responses never count as success', async () => {

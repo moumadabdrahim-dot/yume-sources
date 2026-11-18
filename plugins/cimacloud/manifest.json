@@ -1,0 +1,54 @@
+{
+  "name": "CimaCloud — سيما كلاود",
+  "version": "0.1.0",
+  "description": "مصدر CimaCloud للأفلام والمسلسلات عبر الواجهة العامة المصرح بها. التشغيل يبقى معطلاً عندما ترفض الواجهة العامة قائمة السيرفرات.",
+  "apiVersion": 2,
+  "scrapers": [
+    {
+      "id": "cimacloud",
+      "pluginId": "cimacloud",
+      "name": "CimaCloud — سيما كلاود",
+      "description": "أفلام ومسلسلات CimaCloud مع كتالوجات وبحث وتفاصيل وحلقات مستقلة.",
+      "version": "0.1.0",
+      "filename": "cimacloud.js",
+      "supportedTypes": ["movie", "tv"],
+      "enabled": true,
+      "autoInstall": true,
+      "hasSettings": false,
+      "contentLanguage": ["ar"],
+      "apiVersion": 2,
+      "capabilities": ["home", "search", "details", "streams"],
+      "catalogs": [
+        {"id":"latest-movies","type":"movie","title":"أحدث الأفلام","capabilities":["home","browse","pagination"],"filters":[],"homeOrder":10,"homeFallback":true,"presentation":{"posterShape":"portrait"}},
+        {"id":"latest-series","type":"series","title":"أحدث المسلسلات","capabilities":["home","browse","pagination"],"filters":[],"homeOrder":20,"homeFallback":true,"presentation":{"posterShape":"portrait"}},
+        {"id":"foreign-movies","type":"movie","title":"الأفلام الأجنبية","capabilities":["home","browse","pagination"],"filters":[],"homeOrder":30,"homeFallback":true,"presentation":{"posterShape":"portrait"}},
+        {"id":"foreign-series","type":"series","title":"المسلسلات الأجنبية","capabilities":["home","browse","pagination"],"filters":[],"homeOrder":40,"homeFallback":true,"presentation":{"posterShape":"portrait"}},
+        {"id":"turkish-series","type":"series","title":"الأعمال التركية","capabilities":["home","browse","pagination"],"filters":[],"homeOrder":50,"homeFallback":true,"presentation":{"posterShape":"portrait"}},
+        {"id":"korean-series","type":"series","title":"الأعمال الكورية","capabilities":["home","browse","pagination"],"filters":[],"homeOrder":60,"homeFallback":true,"presentation":{"posterShape":"portrait"}},
+        {"id":"anime-series","type":"series","title":"الأنمي والكرتون","capabilities":["home","browse","pagination"],"filters":[],"homeOrder":70,"homeFallback":true,"presentation":{"posterShape":"portrait"}},
+        {"id":"indian-series","type":"series","title":"الأعمال الهندية","capabilities":["home","browse","pagination"],"filters":[],"homeOrder":80,"homeFallback":true,"presentation":{"posterShape":"portrait"}},
+        {"id":"asian-series","type":"series","title":"الأعمال الآسيوية","capabilities":["home","browse","pagination"],"filters":[],"homeOrder":90,"homeFallback":true,"presentation":{"posterShape":"portrait"}},
+        {
+          "id":"discover-movies","type":"movie","title":"استكشاف الأفلام","capabilities":["browse","pagination"],"discoverType":"movie","homeFallback":false,"presentation":{"posterShape":"portrait"},
+          "filters":[
+            {"key":"category","kind":"select","label":"التصنيف","dynamic":true,"discoverPresentation":{"priority":10,"role":"category"}},
+            {"key":"order","kind":"select","label":"الترتيب","dynamic":true,"discoverPresentation":{"priority":20}},
+            {"key":"year","kind":"select","label":"السنة","dynamic":true,"discoverPresentation":{"priority":30}}
+          ]
+        },
+        {
+          "id":"discover-series","type":"series","title":"استكشاف المسلسلات","capabilities":["browse","pagination"],"discoverType":"series","homeFallback":false,"presentation":{"posterShape":"portrait"},
+          "filters":[
+            {"key":"category","kind":"select","label":"التصنيف","dynamic":true,"discoverPresentation":{"priority":10,"role":"category"}},
+            {"key":"order","kind":"select","label":"الترتيب","dynamic":true,"discoverPresentation":{"priority":20}},
+            {"key":"year","kind":"select","label":"السنة","dynamic":true,"discoverPresentation":{"priority":30}}
+          ]
+        }
+      ],
+      "searchGroups": [
+        {"id":"movies","title":"أفلام CimaCloud","types":["movie"],"pagination":true,"displayType":"movie","presentation":{"posterShape":"portrait"}},
+        {"id":"series","title":"مسلسلات CimaCloud","types":["series"],"pagination":true,"displayType":"series","presentation":{"posterShape":"portrait"}}
+      ]
+    }
+  ]
+}

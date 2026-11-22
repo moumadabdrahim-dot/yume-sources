@@ -361,10 +361,20 @@
   async function getDetails(args) {
     var parsed = parseId(args && args.id);
     if (parsed.kind === "episode") fail("CIMACLOUD_EPISODE_DETAILS_UNSUPPORTED");
-    var payload = await api(parsed.kind + "/" + parsed.id, null, "details");
-    var raw = payload[parsed.kind];
-    if (!raw || typeof raw !== "object") fail("CIMACLOUD_INVALID_DETAILS_SCHEMA");
-    var item = detailsItem(raw, parsed);
+    if (!nativeCapabilityReady()) fail("CIMACLOUD_AUTHORIZED_DETAILS_ACCESS_REQUIRED");
+    var nativePayload;
+    try {
+      var encodedResponse = await root.__native_plugin_request("CIMACLOUD_DETAILS_BY_ID", JSON.stringify({ kind: parsed.kind, id: parsed.id }));
+      nativePayload = JSON.parse(String(encodedResponse));
+    } catch (error) {
+      var code = /CIMACLOUD_[A-Z_]+/.exec(text(error && error.message));
+      var allowed = code && /^(CIMACLOUD_(?:ACCESS_BLOCKED|API_REJECTED|HTTP_REJECTED|INVALID_RESPONSE|HTML_RESPONSE|INVALID_JSON|INVALID_DETAILS_SCHEMA|DETAILS_IDENTITY_MISMATCH|AUTHORIZED_ACCESS_FAILED))$/.test(code[0]);
+      fail(allowed ? code[0] : "CIMACLOUD_AUTHORIZED_DETAILS_ACCESS_FAILED");
+    }
+    var payload = nativePayload;
+    var detailsRaw = payload[parsed.kind];
+    if (!detailsRaw || typeof detailsRaw !== "object") fail("CIMACLOUD_INVALID_DETAILS_SCHEMA");
+    var item = detailsItem(detailsRaw, parsed);
     if (parsed.kind === "series") {
       var episodesPayload = await api("series/" + parsed.id + "/episodes", null, "episodes");
       item.episodes = mapEpisodes(episodesPayload);
@@ -372,12 +382,12 @@
     return { item: item, episodes: item.episodes };
   }
 
-  function nativeServerCapabilityReady() {
+  function nativeCapabilityReady() {
     if (typeof root.__native_plugin_status !== "function" || typeof root.__native_plugin_request !== "function") return false;
     try { return root.__native_plugin_status() === "READY"; } catch (_) { return false; }
   }
   async function authorizedServers(parsed) {
-    if (!nativeServerCapabilityReady()) fail("CIMACLOUD_AUTHORIZED_SERVER_ACCESS_REQUIRED");
+    if (!nativeCapabilityReady()) fail("CIMACLOUD_AUTHORIZED_SERVER_ACCESS_REQUIRED");
     var raw;
     try {
       raw = await root.__native_plugin_request("CIMACLOUD_SERVER_LIST", JSON.stringify({ kind: parsed.kind, id: parsed.id }));

@@ -59,6 +59,26 @@ function routeHandler(routes, calls = []) {
   };
 }
 
+function nativeDetailsCapability(handler, calls = []) {
+  return {
+    __native_plugin_status() { return 'READY'; },
+    async __native_plugin_request(operation, raw) {
+      assert.equal(operation, 'CIMACLOUD_DETAILS_BY_ID');
+      const args = JSON.parse(raw);
+      const url = `https://api.cimacloud.example/v1.3/api/${args.kind}/${args.id}`;
+      calls.push({ operation, kind: args.kind, id: args.id });
+      const response = await handler(url, { method: 'GET' });
+      if (!response.ok) throw new Error('CIMACLOUD_HTTP_REJECTED');
+      const body = await response.text();
+      let payload;
+      try { payload = JSON.parse(body); } catch (_) { throw new Error('CIMACLOUD_INVALID_JSON'); }
+      if (payload.blocked === true) throw new Error('CIMACLOUD_ACCESS_BLOCKED');
+      if (payload.status === false) throw new Error('CIMACLOUD_API_REJECTED');
+      return body;
+    },
+  };
+}
+
 test('manifest declares one stable API v2 source with independent identity', () => {
   const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
   assert.equal(manifest.apiVersion, 2);
@@ -66,7 +86,7 @@ test('manifest declares one stable API v2 source with independent identity', () 
   assert.equal(manifest.scrapers[0].id, 'cimacloud');
   assert.equal(manifest.scrapers[0].pluginId, 'cimacloud');
   assert.equal(manifest.scrapers[0].autoInstall, true);
-  assert.equal(manifest.scrapers[0].version, '0.1.1');
+  assert.equal(manifest.scrapers[0].version, '0.1.2');
   assert.deepEqual(manifest.scrapers[0].capabilities, ['home', 'search', 'details', 'streams']);
   assert.ok(manifest.scrapers[0].catalogs.some((entry) => entry.id === 'discover-movies'));
   assert.ok(manifest.scrapers[0].catalogs.some((entry) => entry.id === 'discover-series'));
@@ -179,35 +199,51 @@ test('search separates movies and series and keeps pagination', async () => {
 });
 
 test('movie details preserve verified TMDB identity and do not invent IMDb', async () => {
-  const { plugin } = loadPlugin(routeHandler({
+  const calls = [];
+  const handler = routeHandler({
     'GET /v1.3/api/movie/2937': { status: true, movie: item(2937, 'movie', 'El Camino', { tmdb_id: 559969, imdb_id: '', runtime: 123 }) },
-  }));
+  });
+  const { plugin } = loadPlugin(handler, nativeDetailsCapability(handler, calls));
   const result = await plugin.getDetails({ id: 'cc:movie:2937' });
   assert.equal(result.item.nativeId, 'cc:movie:2937');
   assert.equal(result.item.externalIds.tmdb, '559969');
   assert.equal(result.item.externalIds.imdb, undefined);
   assert.equal(result.item.runtime, 123);
   assert.equal(result.item.hasParentStreams, true);
+  assert.deepEqual(calls, [{ operation: 'CIMACLOUD_DETAILS_BY_ID', kind: 'movie', id: '2937' }]);
 });
 
 test('series details return sorted, deduplicated episodes with stable source ids', async () => {
-  const { plugin } = loadPlugin(routeHandler({
+  const handler = routeHandler({
     'GET /v1.3/api/series/475': { status: true, series: item(475, 'series', 'Breaking Bad', { tmdb_id: 1396 }) },
     'GET /v1.3/api/series/475/episodes': { status: true, seasons: [
       { season_number: '2', episodes: [{ id: '500', title: 'الحلقة 2' }, { id: '499', title: 'الحلقة 1' }] },
       { season_number: '1', episodes: [{ id: '42498', title: 'الحلقة 1' }, { id: '42498', title: 'الحلقة 1' }] },
     ] },
-  }));
+  });
+  const { plugin } = loadPlugin(handler, nativeDetailsCapability(handler));
   const result = await plugin.getDetails({ id: 'cc:series:475' });
   assert.deepEqual(Array.from(result.item.episodes, (episode) => episode.nativeId), ['cc:episode:42498', 'cc:episode:499', 'cc:episode:500']);
   assert.deepEqual(Array.from(result.item.episodes, (episode) => `${episode.season}:${episode.episode}`), ['1:1', '2:1', '2:2']);
 });
 
 test('details reject a payload whose source identity does not match the requested item', async () => {
-  const { plugin } = loadPlugin(routeHandler({
+  const handler = routeHandler({
     'GET /v1.3/api/movie/2937': { status: true, movie: item(9999, 'movie', 'Wrong movie') },
-  }));
+  });
+  const { plugin } = loadPlugin(handler, nativeDetailsCapability(handler));
   await assert.rejects(() => plugin.getDetails({ id: 'cc:movie:2937' }), /DETAILS_IDENTITY_MISMATCH/);
+});
+
+test('details expose precise native blocked and HTTP failures without JavaScript API fallback', async () => {
+  for (const [body, expected] of [
+    [{ status: false, blocked: true }, /ACCESS_BLOCKED/],
+    [{ status: false }, /API_REJECTED/],
+  ]) {
+    const handler = routeHandler({ 'GET /v1.3/api/movie/2937': body });
+    const { plugin } = loadPlugin(handler, nativeDetailsCapability(handler));
+    await assert.rejects(() => plugin.getDetails({ id: 'cc:movie:2937' }), expected);
+  }
 });
 
 test('missing native capability becomes a precise authorized-access failure', async () => {

@@ -1,6 +1,6 @@
 {
   "name": "CimaCloud — سيما كلاود",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "مصدر CimaCloud للأفلام والمسلسلات مع وصول مصرح به إلى خيارات التشغيل عبر طبقة Android محكومة.",
   "apiVersion": 2,
   "scrapers": [
@@ -9,7 +9,7 @@
       "pluginId": "cimacloud",
       "name": "CimaCloud — سيما كلاود",
       "description": "أفلام ومسلسلات CimaCloud مع كتالوجات وبحث وتفاصيل وحلقات مستقلة.",
-      "version": "0.1.1",
+      "version": "0.1.2",
       "filename": "cimacloud.js",
       "supportedTypes": ["movie", "tv"],
       "enabled": true,

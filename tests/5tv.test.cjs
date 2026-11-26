@@ -63,8 +63,8 @@ function loadPlugin(routes = {}, extra = {}) {
 test('manifest declares an isolated API v2 release candidate with stable catalogs', () => {
   const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
   assert.equal(manifest.apiVersion, 2);
-  assert.equal(manifest.version, '0.2.0-rc.5');
-  assert.equal(manifest.scrapers[0].version, '0.2.0-rc.5');
+  assert.equal(manifest.version, '0.2.0-rc.6');
+  assert.equal(manifest.scrapers[0].version, '0.2.0-rc.6');
   assert.equal(manifest.scrapers.length, 1);
   const source = manifest.scrapers[0];
   assert.equal(source.id, '5tv');
@@ -354,6 +354,151 @@ test('selected Ultra4Vid uses its page server ID and validates the signed host a
   assert.throws(() => plugin.__test.signedAccessUrl(embed, 'https://ult4vid.one/embed/other?ftv_exp=4102444800&ftv_sig=x', 1), /HOST_OR_PATH_MISMATCH/);
 });
 
+test('71Stream and Ultra4Vid download options never request a signed watch URL', async () => {
+  const id = '5tv:movie:home-alone-1990';
+  const page = 'https://5tv.rest/movie/home-alone-1990/';
+  for (const host of ['71stream.one', 'ult4vid.one']) {
+    const downloadUrl = `https://${host}/download/file.mp4`;
+    const html = `${fixture('movie.html')}<article class="ftv-download-server"><strong>Download</strong><a href="${downloadUrl}"></a></article>`;
+    const extractorCalls = [];
+    const { plugin, calls } = loadPlugin({ [page]: html }, {
+      async __yume_extract_v1(raw) {
+        extractorCalls.push(JSON.parse(raw));
+        return JSON.stringify({ streams: [{ url: 'https://cdn.example/file.mp4', type: 'mp4' }] });
+      },
+    });
+    const listed = await plugin.getStreams({ id });
+    const option = listed.options.find(row => JSON.parse(row.token).url === downloadUrl);
+    const token = JSON.parse(option.token);
+    assert.equal(token.kind, 'download');
+    await plugin.resolveStreamOption({ id, token: JSON.stringify(token) });
+    assert.equal(calls.filter(call => call.options.method === 'POST').length, 0, `${host} download must not call ftv_71_access_url`);
+    assert.equal(extractorCalls[0].url, downloadUrl, 'the original download URL must be passed unchanged');
+  }
+});
+
+test('unplayable 71Stream and Ultra4Vid download links are not reported as video sources', async () => {
+  const id = '5tv:movie:home-alone-1990';
+  const page = 'https://5tv.rest/movie/home-alone-1990/';
+  for (const host of ['71stream.one', 'ult4vid.one']) {
+    const downloadUrl = `https://${host}/download/file`;
+    const html = `${fixture('movie.html')}<article class="ftv-download-server"><strong>Download</strong><a href="${downloadUrl}"></a></article>`;
+    const { plugin, calls } = loadPlugin({ [page]: html }, {
+      async __yume_extract_v1() { return JSON.stringify({ streams: [] }); },
+    });
+    const listed = await plugin.getStreams({ id });
+    const option = listed.options.find(row => JSON.parse(row.token).url === downloadUrl);
+    await assert.rejects(() => plugin.resolveStreamOption({ id, token: option.token }), /5TV_NO_PLAYABLE_STREAM/);
+    assert.equal(calls.filter(call => call.options.method === 'POST').length, 0);
+  }
+});
+
+test('stale rc.4 watch token refreshes metadata once and matches the current link and kind', async () => {
+  const id = '5tv:movie:home-alone-1990';
+  const page = 'https://5tv.rest/movie/home-alone-1990/';
+  const embed = 'https://71stream.one/embed/PD4AEWZuud';
+  const signed = `${embed}?ftv_exp=4102444800&ftv_sig=private-short-lived-value`;
+  const token = { v: 1, id, url: embed, page, ordinal: 0, name: '71Stream', kind: 'server' };
+  const calls = [];
+  const diagnostics = [];
+  const { plugin } = loadPlugin({}, {
+    async fetch(url, options = {}) {
+      calls.push({ url, options });
+      if (options.method === 'POST') return htmlResponse(JSON.stringify({ success: true, data: { url: signed } }), url);
+      if (url === page) return htmlResponse(fixture('movie.html'), url);
+      throw new Error(`unexpected route ${url}`);
+    },
+    __yume_diagnostic(value) { diagnostics.push(JSON.parse(value)); },
+    async __yume_extract_v1(raw) {
+      assert.equal(JSON.parse(raw).url, signed);
+      return JSON.stringify({ streams: [{ url: 'https://cdn.example/file.mp4', type: 'mp4' }] });
+    },
+  });
+  await plugin.resolveStreamOption({ id, token: JSON.stringify(token) });
+  assert.equal(calls.filter(call => call.url === page).length, 1, 'one bounded refresh fetches the current page');
+  const params = new URLSearchParams(calls.find(call => call.options.method === 'POST').options.body);
+  assert.equal(params.get('object_id'), '110058');
+  assert.equal(params.get('server_id'), '542395');
+  const correlated = diagnostics.filter(event => event.attemptId);
+  assert.ok(correlated.length >= 5);
+  assert.equal(new Set(correlated.map(event => event.attemptId)).size, 1);
+  assert.ok(!JSON.stringify(diagnostics).includes('private-short-lived-value'));
+  assert.ok(!JSON.stringify(diagnostics).includes('ftv_sig='));
+});
+
+test('stale signed option fails specifically when link or kind cannot be matched', async () => {
+  const id = '5tv:movie:home-alone-1990';
+  const page = 'https://5tv.rest/movie/home-alone-1990/';
+  const tokenBase = { v: 1, id, page, ordinal: 0, name: '71Stream', kind: 'server' };
+  const { plugin: mismatchPlugin, calls: mismatchCalls } = loadPlugin({ [page]: fixture('movie.html') }, {
+    async __yume_extract_v1() { return JSON.stringify({ streams: [] }); },
+  });
+  await assert.rejects(() => mismatchPlugin.resolveStreamOption({ id, token: JSON.stringify({ ...tokenBase, url: 'https://71stream.one/embed/no-longer-listed' }) }), /5TV_SIGNED_OPTION_REFRESH_NOT_MATCHED/);
+  assert.equal(mismatchCalls.filter(call => call.options.method === 'POST').length, 0);
+
+  const legacyToken = { ...tokenBase, kind: undefined, url: 'https://71stream.one/embed/PD4AEWZuud' };
+  const { plugin: legacyPlugin, calls: legacyCalls } = loadPlugin({ [page]: fixture('movie.html') }, {
+    async __yume_extract_v1() { return JSON.stringify({ streams: [] }); },
+  });
+  await assert.rejects(() => legacyPlugin.resolveStreamOption({ id, token: JSON.stringify(legacyToken) }), /5TV_SIGNED_OPTION_TYPE_MISSING/);
+  assert.equal(legacyCalls.filter(call => call.options.method === 'POST').length, 0);
+});
+
+test('stale signed option with missing current server metadata fails before the signing request', async () => {
+  const id = '5tv:movie:home-alone-1990';
+  const page = 'https://5tv.rest/movie/home-alone-1990/';
+  const currentPage = fixture('movie.html').replace('data-server-id="542395"', '');
+  const token = { v: 1, id, url: 'https://71stream.one/embed/PD4AEWZuud', page, ordinal: 0, name: '71Stream', kind: 'server' };
+  const { plugin, calls } = loadPlugin({ [page]: currentPage }, {
+    async __yume_extract_v1() { return JSON.stringify({ streams: [] }); },
+  });
+  await assert.rejects(() => plugin.resolveStreamOption({ id, token: JSON.stringify(token) }), /5TV_ACCESS_METADATA_MISSING/);
+  assert.equal(calls.filter(call => call.options.method === 'POST').length, 0);
+});
+
+test('movie and episode pages without server controls report NO_STREAM_OPTIONS with page context', async () => {
+  const cases = [
+    ['5tv:movie:missing', 'https://5tv.rest/movie/missing/'],
+    ['5tv:episode:missing-1x1', 'https://5tv.rest/episode/missing-1x1/'],
+  ];
+  for (const [id, url] of cases) {
+    const { plugin, diagnostics } = loadPlugin({ [url]: '<html><body><main>Page has no player or server blocks</main></body></html>' });
+    await assert.rejects(() => plugin.getStreams({ id }), /5TV_NO_STREAM_OPTIONS/);
+    const event = diagnostics.find(row => row.stage === 'stream_options_result');
+    assert.equal(event.responseKind, 'html_without_options');
+    assert.equal(event.sourceCount, 0);
+    assert.equal(event.httpStatus, 200);
+    assert.ok(event.attemptId);
+  }
+});
+
+test('extractor diagnostics report safe HTTP, candidate, accepted, and rejection summaries per attempt', async () => {
+  const id = '5tv:movie:home-alone-1990';
+  const page = 'https://5tv.rest/movie/home-alone-1990/';
+  const embed = 'https://71stream.one/embed/x';
+  const token = JSON.stringify({ v: 1, id, url: embed, page, ordinal: 0, name: '71Stream', kind: 'server', objectId: 1, serverId: 2 });
+  const { plugin, diagnostics } = loadPlugin({}, {
+    async fetch(url) { return htmlResponse(JSON.stringify({ success: true, data: { url: `${embed}?ftv_exp=4102444800&ftv_sig=hidden` } }), url); },
+    async __yume_extract_v1() {
+      return JSON.stringify({ streams: [], diagnostics: [
+        { stage: 'PARSE', outcome: 'CANDIDATES', candidateCount: 2 },
+        { stage: 'REQUEST', outcome: 'HTTP_FAILURE', httpStatus: 403, candidateCount: 2, acceptedCount: 0, errorKind: 'HTTP_403' },
+        { stage: 'VERIFY', outcome: 'EMPTY', candidateCount: 2, validCount: 0 },
+      ], errorCode: 'HTTP_REFUSED' });
+    },
+  });
+  await assert.rejects(() => plugin.resolveStreamOption({ id, token }), /NO_PLAYABLE_STREAM/);
+  const event = diagnostics.find(row => row.stage === 'extractor_result');
+  assert.equal(event.httpStatus, 403);
+  assert.equal(event.candidateCount, 2);
+  assert.equal(event.acceptedCount, 0);
+  assert.equal(event.extractorStage, 'REQUEST');
+  assert.equal(event.extractorOutcome, 'HTTP_FAILURE');
+  assert.equal(event.extractorErrorKind, 'HTTP_403');
+  assert.equal(event.failureCode, 'HTTP_REFUSED');
+  assert.ok(!JSON.stringify(diagnostics).includes('ftv_sig='));
+});
+
 test('signed access rejects expired, rejected, and malformed responses without calling the extractor', async () => {
   const embed = 'https://71stream.one/embed/example';
   assert.throws(() => pluginSignedAccessForTest(embed), /ACCESS_URL_EXPIRED/);
@@ -361,7 +506,7 @@ test('signed access rejects expired, rejected, and malformed responses without c
   async function attempt(responseBody, expectedError) {
     const id = '5tv:movie:home-alone-1990';
     const page = 'https://5tv.rest/movie/home-alone-1990/';
-    const token = JSON.stringify({ v: 1, id, url: embed, page, ordinal: 0, name: '71Stream', objectId: 110058, serverId: 542395 });
+    const token = JSON.stringify({ v: 1, id, url: embed, page, ordinal: 0, name: '71Stream', kind: 'server', objectId: 110058, serverId: 542395 });
     let extractorCalled = false;
     const { plugin } = loadPlugin({}, {
       async fetch() { return htmlResponse(responseBody, 'https://5tv.rest/wp-admin/admin-ajax.php'); },

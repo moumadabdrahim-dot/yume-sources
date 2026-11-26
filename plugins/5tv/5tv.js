@@ -2,7 +2,7 @@
   "use strict";
 
   var PLUGIN_ID = "5tv";
-  var PLUGIN_VERSION = "0.2.0-rc.5";
+  var PLUGIN_VERSION = "0.2.0-rc.6";
   var BASE = "https://5tv.rest";
   var USER_AGENT = "Mozilla/5.0 (Linux; Android 16) AppleWebKit/537.36 Chrome/131 Mobile Safari/537.36";
   var TIMEOUT_MS = 15000;
@@ -10,6 +10,7 @@
   var MAX_BODY = 4000000;
   var MAX_ITEMS = 100;
   var MAX_EPISODES = 2000;
+  var diagnosticSequence = 0;
 
   var CATALOGS = {
     "korean-drama": { path: "/category/%D8%A7%D9%84%D8%AF%D8%B1%D8%A7%D9%85%D8%A7-%D8%A7%D9%84%D9%83%D9%88%D8%B1%D9%8A%D8%A9/", type: "series", title: "الدراما الكورية", home: true },
@@ -111,11 +112,16 @@
     if (expiry <= (nowSeconds == null ? Math.floor(Date.now() / 1000) : nowSeconds)) fail("5TV_ACCESS_URL_EXPIRED");
     return url;
   }
-  async function requestSignedAccessUrl(token) {
-    if (!positiveInt(token.objectId) || !positiveInt(token.serverId) || !signedWatchHost(token.url)) fail("5TV_ACCESS_METADATA_MISSING");
+  async function requestSignedAccessUrl(token, attemptId) {
+    var host = hostFromUrl(token.url), started = Date.now();
+    if (!positiveInt(token.objectId) || !positiveInt(token.serverId) || !signedWatchHost(token.url)) {
+      diagnostic("access_failed", { attemptId: attemptId, host: host, optionKind: token.kind, metadataPresent: false, failureCode: "5TV_ACCESS_METADATA_MISSING" });
+      fail("5TV_ACCESS_METADATA_MISSING");
+    }
     var body = "action=ftv_71_access_url&object_id=" + encodeURIComponent(String(token.objectId)) +
       "&server_id=" + encodeURIComponent(String(token.serverId)) + "&server_type=watch";
     var response;
+    diagnostic("access_request_start", { attemptId: attemptId, host: host, optionKind: token.kind, metadataPresent: true });
     try {
       response = await fetch(BASE + "/wp-admin/admin-ajax.php", {
         method: "POST", timeoutMs: ACCESS_URL_TIMEOUT_MS,
@@ -128,13 +134,34 @@
         },
         body: body
       });
-    } catch (_) { fail("5TV_ACCESS_URL_NETWORK_ERROR"); }
-    if (!response.ok) fail("5TV_ACCESS_URL_HTTP_" + Number(response.status || 0));
+    } catch (_) {
+      diagnostic("access_failed", { attemptId: attemptId, host: host, optionKind: token.kind, failureCode: "5TV_ACCESS_URL_NETWORK_ERROR", elapsedMs: Date.now() - started });
+      fail("5TV_ACCESS_URL_NETWORK_ERROR");
+    }
+    if (!response.ok) {
+      var httpFailure = "5TV_ACCESS_URL_HTTP_" + Number(response.status || 0);
+      diagnostic("access_failed", { attemptId: attemptId, host: host, optionKind: token.kind, httpStatus: Number(response.status) || 0, failureCode: httpFailure, elapsedMs: Date.now() - started });
+      fail(httpFailure);
+    }
     var payload;
-    try { payload = JSON.parse(await response.text()); } catch (_) { fail("5TV_ACCESS_URL_INVALID_JSON"); }
-    if (!payload || payload.success !== true) fail("5TV_ACCESS_URL_REJECTED");
+    try { payload = JSON.parse(await response.text()); } catch (_) {
+      diagnostic("access_failed", { attemptId: attemptId, host: host, optionKind: token.kind, httpStatus: Number(response.status) || 0, failureCode: "5TV_ACCESS_URL_INVALID_JSON", elapsedMs: Date.now() - started });
+      fail("5TV_ACCESS_URL_INVALID_JSON");
+    }
+    if (!payload || payload.success !== true) {
+      diagnostic("access_failed", { attemptId: attemptId, host: host, optionKind: token.kind, httpStatus: Number(response.status) || 0, failureCode: "5TV_ACCESS_URL_REJECTED", elapsedMs: Date.now() - started });
+      fail("5TV_ACCESS_URL_REJECTED");
+    }
     var signed = payload.data && typeof payload.data.url === "string" ? payload.data.url : "";
-    return signedAccessUrl(token.url, signed);
+    try {
+      var validated = signedAccessUrl(token.url, signed);
+      diagnostic("access_signed", { attemptId: attemptId, host: host, optionKind: token.kind, httpStatus: Number(response.status) || 0, elapsedMs: Date.now() - started });
+      return validated;
+    } catch (error) {
+      var failureCode = error && /^5TV_[A-Z0-9_]+$/.test(String(error.message || "")) ? String(error.message) : "5TV_ACCESS_URL_INVALID";
+      diagnostic("access_failed", { attemptId: attemptId, host: host, optionKind: token.kind, httpStatus: Number(response.status) || 0, failureCode: failureCode, elapsedMs: Date.now() - started });
+      throw error;
+    }
   }
   function pathParts(url) {
     var match = /^https:\/\/5tv\.rest\/(movie|series|episode)\/([^\/?#]+)\/?(?:[?#].*)?$/i.exec(siteUrl(url));
@@ -167,8 +194,12 @@
   function diagnostic(stage, data) {
     if (typeof root.__yume_diagnostic !== "function") return;
     var safe = { pluginId: PLUGIN_ID, version: PLUGIN_VERSION, stage: stage }; data = data || {};
-    ["host", "httpStatus", "responseKind", "itemCount", "episodeCount", "sourceCount", "streamCount", "failureCode", "elapsedMs"].forEach(function (key) { if (data[key] != null) safe[key] = data[key]; });
+    ["attemptId", "host", "optionKind", "httpStatus", "responseKind", "itemCount", "episodeCount", "watchOptionCount", "downloadOptionCount", "sourceCount", "streamCount", "candidateCount", "acceptedCount", "metadataPresent", "extractorStage", "extractorOutcome", "extractorErrorKind", "failureCode", "elapsedMs"].forEach(function (key) { if (data[key] != null) safe[key] = data[key]; });
     try { root.__yume_diagnostic(JSON.stringify(safe)); } catch (_) {}
+  }
+  function newDiagnosticAttemptId() {
+    diagnosticSequence += 1;
+    return Date.now().toString(36) + "-" + Math.floor(Math.random() * 0x100000000).toString(36) + "-" + diagnosticSequence.toString(36);
   }
   function isVerificationPage(body) {
     var value = String(body || "");
@@ -190,7 +221,7 @@
     }
     if (!/<(?:html|section|article)\b/i.test(body)) fail("5TV_EXPECTED_HTML");
     diagnostic(stage, { host: "5tv.rest", httpStatus: response.status, responseKind: "html", elapsedMs: Date.now() - started });
-    return { html: body, finalUrl: siteUrl(response.url) || url };
+    return { html: body, finalUrl: siteUrl(response.url) || url, httpStatus: Number(response.status) || 0 };
   }
   function posterCard(block, forcedType) {
     var href = siteUrl(attr(firstMatchRaw(block, /<a\b[^>]*class=["'][^"']*(?:ftv-home-poster-card__(?:image|title)|ftv-status-row__link)[^"']*["'][^>]*>/i), "href"));
@@ -437,15 +468,69 @@
     return out;
   }
   async function getStreams(args) {
+    var attemptId = newDiagnosticAttemptId();
     var id = text(args && args.id), parsed = parseId(id); if (parsed.kind !== "m" && parsed.kind !== "e") fail("5TV_STREAM_ID_REQUIRED");
-    var pageUrl = urlForId(parsed), page = await requestHtml(pageUrl, "stream_options"), options = serverOptions(page.html, id, page.finalUrl);
+    var pageUrl = urlForId(parsed), page, options;
+    try {
+      page = await requestHtml(pageUrl, "stream_options");
+      options = serverOptions(page.html, id, page.finalUrl);
+    } catch (error) {
+      var pageFailure = error && /^5TV_[A-Z0-9_]+$/.test(String(error.message || "")) ? String(error.message) : "5TV_STREAM_OPTIONS_FAILED";
+      diagnostic("stream_options_failed", { attemptId: attemptId, host: "5tv.rest", failureCode: pageFailure });
+      throw error;
+    }
+    var watchTabCount = (page.html.match(/<button\b[^>]*class=["'][^"']*\bftv-watch-tab\b[^"']*["']/gi) || []).length;
+    var downloadOptionCount = (page.html.match(/<article\b[^>]*class=["'][^"']*\bftv-download-server\b[^"']*["']/gi) || []).length;
+    var frontendIdPresent = frontendObjectId(page.html) != null;
+    diagnostic("stream_options_result", {
+      attemptId: attemptId, host: "5tv.rest", httpStatus: page.httpStatus, responseKind: options.length ? "options" : "html_without_options",
+      sourceCount: options.length, watchOptionCount: watchTabCount, downloadOptionCount: downloadOptionCount, metadataPresent: frontendIdPresent,
+      failureCode: options.length ? undefined : "5TV_NO_STREAM_OPTIONS",
+    });
     if (!options.length) fail("5TV_NO_STREAM_OPTIONS");
-    diagnostic("stream_options", { sourceCount: options.length }); return { options: options };
+    return { options: options };
   }
   function parseToken(value, id) {
     var token; try { token = JSON.parse(text(value)); } catch (_) { fail("5TV_INVALID_STREAM_TOKEN"); }
     if (!token || token.v !== 1 || token.id !== id || !safePublicUrl(token.url) || !siteUrl(token.page) || !Number.isInteger(token.ordinal) || token.ordinal < 0 || token.ordinal > 50) fail("5TV_INVALID_STREAM_TOKEN");
+    if (token.kind != null && ["player", "server", "download"].indexOf(token.kind) < 0) fail("5TV_INVALID_STREAM_TOKEN");
     return token;
+  }
+  async function refreshSignedServerOption(token, id, attemptId) {
+    diagnostic("option_refresh_start", { attemptId: attemptId, host: hostFromUrl(token.url), optionKind: token.kind || "unknown", metadataPresent: false });
+    var page;
+    try { page = await requestHtml(token.page, "signed_option_refresh"); }
+    catch (error) {
+      var refreshFailure = error && /^5TV_[A-Z0-9_]+$/.test(String(error.message || "")) ? String(error.message) : "5TV_SIGNED_OPTION_REFRESH_FAILED";
+      diagnostic("option_refresh_failed", { attemptId: attemptId, host: hostFromUrl(token.url), optionKind: token.kind || "unknown", failureCode: refreshFailure });
+      throw error;
+    }
+    var refreshed = serverOptions(page.html, id, page.finalUrl).map(function (option) {
+      return { option: option, token: parseToken(option.token, id) };
+    }).filter(function (entry) {
+      return entry.token.url === token.url && hostFromUrl(entry.token.url) === hostFromUrl(token.url);
+    });
+    if (refreshed.length !== 1) {
+      var matchFailure = refreshed.length ? "5TV_SIGNED_OPTION_REFRESH_AMBIGUOUS" : "5TV_SIGNED_OPTION_REFRESH_NOT_MATCHED";
+      diagnostic("option_refresh_failed", { attemptId: attemptId, host: hostFromUrl(token.url), optionKind: token.kind || "unknown", sourceCount: refreshed.length, failureCode: matchFailure });
+      fail(matchFailure);
+    }
+    var current = refreshed[0].token;
+    if (token.kind != null && token.kind !== current.kind) {
+      diagnostic("option_refresh_failed", { attemptId: attemptId, host: hostFromUrl(token.url), optionKind: token.kind, failureCode: "5TV_SIGNED_OPTION_TYPE_CHANGED" });
+      fail("5TV_SIGNED_OPTION_TYPE_CHANGED");
+    }
+    if (token.kind == null) {
+      diagnostic("option_refresh_failed", { attemptId: attemptId, host: hostFromUrl(token.url), optionKind: "unknown", failureCode: "5TV_SIGNED_OPTION_TYPE_MISSING" });
+      fail("5TV_SIGNED_OPTION_TYPE_MISSING");
+    }
+    if (current.kind === "server" && signedWatchHost(current.url) &&
+        (!positiveInt(current.objectId) || !positiveInt(current.serverId))) {
+      diagnostic("option_refresh_failed", { attemptId: attemptId, host: hostFromUrl(current.url), optionKind: current.kind, metadataPresent: false, failureCode: "5TV_ACCESS_METADATA_MISSING" });
+      fail("5TV_ACCESS_METADATA_MISSING");
+    }
+    diagnostic("option_refresh_result", { attemptId: attemptId, host: hostFromUrl(current.url), optionKind: current.kind, sourceCount: 1, metadataPresent: current.kind === "server" && positiveInt(current.objectId) != null && positiveInt(current.serverId) != null, httpStatus: page.httpStatus });
+    return current;
   }
   function mapExtracted(payload, title) {
     var rows = payload && Array.isArray(payload.streams) ? payload.streams : [];
@@ -457,15 +542,59 @@
   }
   async function resolveStreamOption(args) {
     var id = text(args && args.id), parsed = parseId(id); if (parsed.kind !== "m" && parsed.kind !== "e") fail("5TV_STREAM_ID_REQUIRED");
-    var token = parseToken(args && args.token, id); if (typeof root.__yume_extract_v1 !== "function") fail("5TV_EXTRACTOR_UNAVAILABLE");
-    var playbackUrl = signedWatchHost(token.url) ? await requestSignedAccessUrl(token) : token.url;
-    var raw; try { raw = await root.__yume_extract_v1(JSON.stringify({ scopeId: PLUGIN_ID, url: playbackUrl, referrer: token.page, headers: { "User-Agent": USER_AGENT, "Referer": token.page }, timeoutMs: 20000, perAttemptTimeoutMs: 6000 })); } catch (_) { fail("5TV_EXTRACTION_FAILED"); }
-    var payload; try { payload = typeof raw === "string" ? JSON.parse(raw) : raw; } catch (_) { fail("5TV_INVALID_EXTRACTOR_RESPONSE"); }
-    var streams = mapExtracted(payload, "سيرفر " + (token.ordinal + 1)); if (!streams.length) fail("5TV_NO_PLAYABLE_STREAM");
-    diagnostic("stream_resolved", { sourceCount: 1, streamCount: streams.length }); return { streams: streams };
+    var attemptId = newDiagnosticAttemptId(), token = parseToken(args && args.token, id), stageHost = hostFromUrl(token.url);
+    diagnostic("resolve_start", { attemptId: attemptId, host: stageHost, optionKind: token.kind || "unknown", metadataPresent: positiveInt(token.objectId) != null && positiveInt(token.serverId) != null });
+    try {
+      if (typeof root.__yume_extract_v1 !== "function") fail("5TV_EXTRACTOR_UNAVAILABLE");
+      if (signedWatchHost(token.url) && token.kind !== "download" && token.kind !== "player" &&
+          (token.kind !== "server" || !positiveInt(token.objectId) || !positiveInt(token.serverId))) {
+        token = await refreshSignedServerOption(token, id, attemptId);
+      }
+      var playbackUrl = token.kind === "server" && signedWatchHost(token.url)
+        ? await requestSignedAccessUrl(token, attemptId)
+        : token.url;
+      diagnostic("extractor_start", { attemptId: attemptId, host: hostFromUrl(playbackUrl), optionKind: token.kind || "unknown" });
+      var raw;
+      try { raw = await root.__yume_extract_v1(JSON.stringify({ scopeId: PLUGIN_ID, url: playbackUrl, referrer: token.page, headers: { "User-Agent": USER_AGENT, "Referer": token.page }, timeoutMs: 20000, perAttemptTimeoutMs: 6000 })); }
+      catch (_) {
+        diagnostic("extractor_failed", { attemptId: attemptId, host: hostFromUrl(playbackUrl), optionKind: token.kind || "unknown", failureCode: "5TV_EXTRACTION_FAILED" });
+        fail("5TV_EXTRACTION_FAILED");
+      }
+      var payload;
+      try { payload = typeof raw === "string" ? JSON.parse(raw) : raw; }
+      catch (_) {
+        diagnostic("extractor_failed", { attemptId: attemptId, host: hostFromUrl(playbackUrl), optionKind: token.kind || "unknown", failureCode: "5TV_INVALID_EXTRACTOR_RESPONSE" });
+        fail("5TV_INVALID_EXTRACTOR_RESPONSE");
+      }
+      var engineStreams = payload && Array.isArray(payload.streams) ? payload.streams : [];
+      var engineDiagnostics = payload && Array.isArray(payload.diagnostics) ? payload.diagnostics : [];
+      var parseDiagnostic = engineDiagnostics.filter(function (row) { return row && row.stage === "PARSE"; }).pop();
+      var verifyDiagnostic = engineDiagnostics.filter(function (row) { return row && row.stage === "VERIFY"; }).pop();
+      var candidateCount = positiveInt(parseDiagnostic && parseDiagnostic.candidateCount) || 0;
+      var acceptedCount = positiveInt(verifyDiagnostic && (verifyDiagnostic.validCount != null ? verifyDiagnostic.validCount : verifyDiagnostic.acceptedCount)) || 0;
+      var lastHttpStatus = engineDiagnostics.reduce(function (status, row) { return positiveInt(row && row.httpStatus) || status; }, 0);
+      var lastDiagnostic = engineDiagnostics.slice().reverse().find(function (row) { return row && row.errorKind; }) || (engineDiagnostics.length ? engineDiagnostics[engineDiagnostics.length - 1] : null);
+      var streams = mapExtracted(payload, "سيرفر " + (token.ordinal + 1));
+      diagnostic("extractor_result", {
+        attemptId: attemptId, host: hostFromUrl(playbackUrl), optionKind: token.kind || "unknown",
+        sourceCount: engineStreams.length, streamCount: streams.length, candidateCount: candidateCount, acceptedCount: acceptedCount,
+        httpStatus: lastHttpStatus || undefined,
+        extractorStage: lastDiagnostic && lastDiagnostic.stage,
+        extractorOutcome: lastDiagnostic && lastDiagnostic.outcome,
+        extractorErrorKind: lastDiagnostic && lastDiagnostic.errorKind,
+        failureCode: payload && (payload.bridgeFailureCode || payload.errorCode) ? String(payload.bridgeFailureCode || payload.errorCode) : undefined,
+      });
+      if (!streams.length) fail("5TV_NO_PLAYABLE_STREAM");
+      diagnostic("resolve_success", { attemptId: attemptId, host: hostFromUrl(playbackUrl), optionKind: token.kind || "unknown", sourceCount: engineStreams.length, streamCount: streams.length });
+      return { streams: streams };
+    } catch (error) {
+      var code = error && /^5TV_[A-Z0-9_]+$/.test(String(error.message || "")) ? String(error.message) : "5TV_RESOLVE_FAILED";
+      diagnostic("resolve_failed", { attemptId: attemptId, host: stageHost, optionKind: token.kind || "unknown", failureCode: code });
+      throw error;
+    }
   }
 
   var plugin = { getHome: getHome, getCatalog: getCatalog, getCatalogFilters: getCatalogFilters, search: search, getDetails: getDetails, getStreams: getStreams, resolveStreamOption: resolveStreamOption };
   if (root && root.module) root.module.exports = plugin;
-  if (root && root.__YUME_5TV_TESTING__ && root.module) root.module.exports.__test = { decodeEntities: decodeEntities, normalizeDigits: normalizeDigits, pathParts: pathParts, idFor: idFor, parseId: parseId, posterCard: posterCard, catalogItems: catalogItems, parseDetailsPage: parseDetailsPage, parseSeasonPanels: parseSeasonPanels, serverOptions: serverOptions, parseToken: parseToken, mapExtracted: mapExtracted, signedAccessUrl: signedAccessUrl, requestSignedAccessUrl: requestSignedAccessUrl, hasNextPage: hasNextPage, isVerificationPage: isVerificationPage, searchFormOptions: searchFormOptions, categoryOptions: categoryOptions, discoverSearchPath: discoverSearchPath, homeCatalogIds: HOME_CATALOG_IDS.slice() };
+  if (root && root.__YUME_5TV_TESTING__ && root.module) root.module.exports.__test = { decodeEntities: decodeEntities, normalizeDigits: normalizeDigits, pathParts: pathParts, idFor: idFor, parseId: parseId, posterCard: posterCard, catalogItems: catalogItems, parseDetailsPage: parseDetailsPage, parseSeasonPanels: parseSeasonPanels, serverOptions: serverOptions, parseToken: parseToken, mapExtracted: mapExtracted, signedAccessUrl: signedAccessUrl, requestSignedAccessUrl: requestSignedAccessUrl, refreshSignedServerOption: refreshSignedServerOption, hasNextPage: hasNextPage, isVerificationPage: isVerificationPage, searchFormOptions: searchFormOptions, categoryOptions: categoryOptions, discoverSearchPath: discoverSearchPath, homeCatalogIds: HOME_CATALOG_IDS.slice() };
 })(typeof globalThis !== "undefined" ? globalThis : this);

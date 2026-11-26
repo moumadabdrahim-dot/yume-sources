@@ -2,10 +2,11 @@
   "use strict";
 
   var PLUGIN_ID = "5tv";
-  var PLUGIN_VERSION = "0.2.0-rc.4";
+  var PLUGIN_VERSION = "0.2.0-rc.5";
   var BASE = "https://5tv.rest";
   var USER_AGENT = "Mozilla/5.0 (Linux; Android 16) AppleWebKit/537.36 Chrome/131 Mobile Safari/537.36";
   var TIMEOUT_MS = 15000;
+  var ACCESS_URL_TIMEOUT_MS = 10000;
   var MAX_BODY = 4000000;
   var MAX_ITEMS = 100;
   var MAX_EPISODES = 2000;
@@ -84,6 +85,57 @@
     return String(value || "").replace(/[٠-٩۰-۹]/g, function (d) { var code = d.charCodeAt(0); return String(code >= 1776 ? code - 1776 : code - 1632); });
   }
   function positiveInt(value) { var n = Number(normalizeDigits(value)); return isFinite(n) && n > 0 && Math.floor(n) === n ? n : null; }
+  function signedWatchHost(url) {
+    var host = hostFromUrl(url);
+    return host === "71stream.one" || host === "ult4vid.one" || host === "ultra4vid.cam";
+  }
+  function frontendObjectId(html) {
+    var match = /window\.FTV_SERVER_FRONTEND\s*=\s*(\{[^;\n]{1,8000}\})\s*;/i.exec(html || "");
+    if (!match) return null;
+    try { return positiveInt(JSON.parse(match[1]).objectId); } catch (_) { return null; }
+  }
+  function signedAccessUrl(rawUrl, value, nowSeconds) {
+    var url = safePublicUrl(value), raw = /^https:\/\/([^/?#]+)(\/[^?#]*)(?:\?([^#]*))?$/.exec(text(rawUrl));
+    var signed = url && /^https:\/\/([^/?#]+)(\/[^?#]*)(?:\?([^#]*))?$/.exec(url);
+    if (!signedWatchHost(rawUrl) || !raw || !signed || raw[1].toLowerCase() !== hostFromUrl(rawUrl) || raw[1].toLowerCase() !== signed[1].toLowerCase() || raw[2] !== signed[2] || !signed[3]) fail("5TV_ACCESS_URL_HOST_OR_PATH_MISMATCH");
+    var params = Object.create(null);
+    signed[3].split("&").forEach(function (part) {
+      var pair = part.split("="), key, item;
+      try { key = decodeURIComponent(pair[0].replace(/\+/g, " ")); item = decodeURIComponent((pair.slice(1).join("=") || "").replace(/\+/g, " ")); } catch (_) { return; }
+      if (key) { if (!params[key]) params[key] = []; params[key].push(item); }
+    });
+    if (!params.ftv_sig || params.ftv_sig.length !== 1 || !params.ftv_sig[0] || !params.ftv_exp || params.ftv_exp.length !== 1) fail("5TV_ACCESS_URL_SIGNATURE_MISSING");
+    var expiry = Number(params.ftv_exp[0]);
+    if (!isFinite(expiry) || expiry <= 0 || Math.floor(expiry) !== expiry) fail("5TV_ACCESS_URL_EXPIRY_INVALID");
+    if (expiry > 1000000000000) expiry = Math.floor(expiry / 1000);
+    if (expiry <= (nowSeconds == null ? Math.floor(Date.now() / 1000) : nowSeconds)) fail("5TV_ACCESS_URL_EXPIRED");
+    return url;
+  }
+  async function requestSignedAccessUrl(token) {
+    if (!positiveInt(token.objectId) || !positiveInt(token.serverId) || !signedWatchHost(token.url)) fail("5TV_ACCESS_METADATA_MISSING");
+    var body = "action=ftv_71_access_url&object_id=" + encodeURIComponent(String(token.objectId)) +
+      "&server_id=" + encodeURIComponent(String(token.serverId)) + "&server_type=watch";
+    var response;
+    try {
+      response = await fetch(BASE + "/wp-admin/admin-ajax.php", {
+        method: "POST", timeoutMs: ACCESS_URL_TIMEOUT_MS,
+        headers: {
+          "User-Agent": USER_AGENT,
+          "Accept": "application/json, text/javascript, */*; q=0.01",
+          "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+          "Origin": BASE,
+          "Referer": token.page
+        },
+        body: body
+      });
+    } catch (_) { fail("5TV_ACCESS_URL_NETWORK_ERROR"); }
+    if (!response.ok) fail("5TV_ACCESS_URL_HTTP_" + Number(response.status || 0));
+    var payload;
+    try { payload = JSON.parse(await response.text()); } catch (_) { fail("5TV_ACCESS_URL_INVALID_JSON"); }
+    if (!payload || payload.success !== true) fail("5TV_ACCESS_URL_REJECTED");
+    var signed = payload.data && typeof payload.data.url === "string" ? payload.data.url : "";
+    return signedAccessUrl(token.url, signed);
+  }
   function pathParts(url) {
     var match = /^https:\/\/5tv\.rest\/(movie|series|episode)\/([^\/?#]+)\/?(?:[?#].*)?$/i.exec(siteUrl(url));
     if (!match) return null;
@@ -352,11 +404,18 @@
   }
   function serverOptions(html, nativeId, pageUrl) {
     var out = [], seen = Object.create(null);
-    function addOption(url, name, quality, kind) {
+    var objectId = frontendObjectId(html);
+    function addOption(url, name, quality, kind, serverId) {
       url = absoluteUrl(url); if (!url || seen[url]) return;
+      if (hostFromUrl(url) === "send.now" && /^https:\/\/send\.now\/undef(?:[\/?#]|$)/i.test(url)) return;
       seen[url] = true;
       var ordinal = out.length, label = kind === "download" ? "رابط تنزيل " + (ordinal + 1) : "سيرفر " + (ordinal + 1);
-      var token = JSON.stringify({ v: 1, id: nativeId, url: url, page: pageUrl, ordinal: ordinal, name: name, kind: kind });
+      var tokenValue = { v: 1, id: nativeId, url: url, page: pageUrl, ordinal: ordinal, name: name, kind: kind };
+      if (kind === "server" && signedWatchHost(url)) {
+        tokenValue.objectId = objectId;
+        tokenValue.serverId = positiveInt(serverId);
+      }
+      var token = JSON.stringify(tokenValue);
       out.push({ pluginId: PLUGIN_ID, nativeId: nativeId, token: token, title: label, name: bounded(name, 100) || label, quality: bounded(quality, 40) || undefined, provider: "5TV" });
     }
     var iframe = firstMatchRaw(html, /<iframe\b[^>]*class=["'][^"']*\bftv-player-iframe\b[^"']*["'][^>]*>/i);
@@ -365,7 +424,8 @@
     blocks.forEach(function (block, index) {
       var name = firstMatch(block, /<strong\b[^>]*>([\s\S]*?)<\/strong>/i) || ("سيرفر " + (index + 1));
       var quality = firstMatch(block, /<small\b[^>]*>([\s\S]*?)<\/small>/i);
-      addOption(attr(firstMatchRaw(block, /<button\b[^>]*>/i), "data-server-url"), name, quality, "server");
+      var button = firstMatchRaw(block, /<button\b[^>]*>/i);
+      addOption(attr(button, "data-server-url"), name, quality, "server", attr(button, "data-server-id"));
     });
     var downloads = allBlocks(html, "article", "ftv-download-server");
     downloads.forEach(function (block, index) {
@@ -398,7 +458,8 @@
   async function resolveStreamOption(args) {
     var id = text(args && args.id), parsed = parseId(id); if (parsed.kind !== "m" && parsed.kind !== "e") fail("5TV_STREAM_ID_REQUIRED");
     var token = parseToken(args && args.token, id); if (typeof root.__yume_extract_v1 !== "function") fail("5TV_EXTRACTOR_UNAVAILABLE");
-    var raw; try { raw = await root.__yume_extract_v1(JSON.stringify({ scopeId: PLUGIN_ID, url: token.url, referrer: token.page, headers: { "User-Agent": USER_AGENT, "Referer": token.page }, timeoutMs: 20000, perAttemptTimeoutMs: 6000 })); } catch (_) { fail("5TV_EXTRACTION_FAILED"); }
+    var playbackUrl = signedWatchHost(token.url) ? await requestSignedAccessUrl(token) : token.url;
+    var raw; try { raw = await root.__yume_extract_v1(JSON.stringify({ scopeId: PLUGIN_ID, url: playbackUrl, referrer: token.page, headers: { "User-Agent": USER_AGENT, "Referer": token.page }, timeoutMs: 20000, perAttemptTimeoutMs: 6000 })); } catch (_) { fail("5TV_EXTRACTION_FAILED"); }
     var payload; try { payload = typeof raw === "string" ? JSON.parse(raw) : raw; } catch (_) { fail("5TV_INVALID_EXTRACTOR_RESPONSE"); }
     var streams = mapExtracted(payload, "سيرفر " + (token.ordinal + 1)); if (!streams.length) fail("5TV_NO_PLAYABLE_STREAM");
     diagnostic("stream_resolved", { sourceCount: 1, streamCount: streams.length }); return { streams: streams };
@@ -406,5 +467,5 @@
 
   var plugin = { getHome: getHome, getCatalog: getCatalog, getCatalogFilters: getCatalogFilters, search: search, getDetails: getDetails, getStreams: getStreams, resolveStreamOption: resolveStreamOption };
   if (root && root.module) root.module.exports = plugin;
-  if (root && root.__YUME_5TV_TESTING__ && root.module) root.module.exports.__test = { decodeEntities: decodeEntities, normalizeDigits: normalizeDigits, pathParts: pathParts, idFor: idFor, parseId: parseId, posterCard: posterCard, catalogItems: catalogItems, parseDetailsPage: parseDetailsPage, parseSeasonPanels: parseSeasonPanels, serverOptions: serverOptions, parseToken: parseToken, mapExtracted: mapExtracted, hasNextPage: hasNextPage, isVerificationPage: isVerificationPage, searchFormOptions: searchFormOptions, categoryOptions: categoryOptions, discoverSearchPath: discoverSearchPath, homeCatalogIds: HOME_CATALOG_IDS.slice() };
+  if (root && root.__YUME_5TV_TESTING__ && root.module) root.module.exports.__test = { decodeEntities: decodeEntities, normalizeDigits: normalizeDigits, pathParts: pathParts, idFor: idFor, parseId: parseId, posterCard: posterCard, catalogItems: catalogItems, parseDetailsPage: parseDetailsPage, parseSeasonPanels: parseSeasonPanels, serverOptions: serverOptions, parseToken: parseToken, mapExtracted: mapExtracted, signedAccessUrl: signedAccessUrl, requestSignedAccessUrl: requestSignedAccessUrl, hasNextPage: hasNextPage, isVerificationPage: isVerificationPage, searchFormOptions: searchFormOptions, categoryOptions: categoryOptions, discoverSearchPath: discoverSearchPath, homeCatalogIds: HOME_CATALOG_IDS.slice() };
 })(typeof globalThis !== "undefined" ? globalThis : this);

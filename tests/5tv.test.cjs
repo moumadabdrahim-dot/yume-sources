@@ -63,7 +63,8 @@ function loadPlugin(routes = {}, extra = {}) {
 test('manifest declares an isolated API v2 release candidate with stable catalogs', () => {
   const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
   assert.equal(manifest.apiVersion, 2);
-  assert.equal(manifest.version, '0.2.0-rc.4');
+  assert.equal(manifest.version, '0.2.0-rc.5');
+  assert.equal(manifest.scrapers[0].version, '0.2.0-rc.5');
   assert.equal(manifest.scrapers.length, 1);
   const source = manifest.scrapers[0];
   assert.equal(source.id, '5tv');
@@ -225,6 +226,9 @@ test('stream options preserve source order, exact selected URL, and proven label
   assert.equal(second.url, 'https://ult4vid.one/embed/7SmMlbb4jjlgbPk');
   assert.equal(first.id, id);
   assert.equal(first.page, page);
+  assert.equal(first.objectId, 110058);
+  assert.equal(first.serverId, 542395);
+  assert.equal(second.serverId, 542396);
 });
 
 test('stream options include the main player and playable download choices without duplicates', () => {
@@ -246,9 +250,21 @@ test('stream options include the main player and playable download choices witho
   assert.equal(options[1].quality, '720p');
 });
 
+test('stream options reject the observed broken Send undef download without hiding valid Send links', () => {
+  const id = '5tv:movie:sample';
+  const page = 'https://5tv.rest/movie/sample/';
+  const html = `
+    <article class="ftv-download-server"><strong>Broken</strong><a href="https://send.now/undef"></a></article>
+    <article class="ftv-download-server"><strong>Valid</strong><a href="https://send.now/1AbCd"></a></article>`;
+  const { plugin } = loadPlugin();
+  const options = plugin.__test.serverOptions(html, id, page);
+  assert.equal(options.length, 1);
+  assert.equal(JSON.parse(options[0].token).url, 'https://send.now/1AbCd');
+});
+
 test('resolver sends only the selected option to the central extractor and preserves media headers', async () => {
   const id = '5tv:movie:home-alone-1990';
-  const token = JSON.stringify({ v: 1, id, url: 'https://71stream.one/embed/PD4AEWZuud', page: 'https://5tv.rest/movie/home-alone-1990/', ordinal: 0, name: '71Stream' });
+  const token = JSON.stringify({ v: 1, id, url: 'https://one.example/embed/PD4AEWZuud', page: 'https://5tv.rest/movie/home-alone-1990/', ordinal: 0, name: 'One' });
   const extractorCalls = [];
   const { plugin } = loadPlugin({}, {
     async __yume_extract_v1(raw) {
@@ -258,12 +274,111 @@ test('resolver sends only the selected option to the central extractor and prese
   });
   const result = await plugin.resolveStreamOption({ id, token });
   assert.equal(extractorCalls.length, 1);
-  assert.equal(extractorCalls[0].url, 'https://71stream.one/embed/PD4AEWZuud');
+  assert.equal(extractorCalls[0].url, 'https://one.example/embed/PD4AEWZuud');
   assert.equal(extractorCalls[0].referrer, 'https://5tv.rest/movie/home-alone-1990/');
   assert.equal(result.streams[0].type, 'hls');
   assert.equal(result.streams[0].quality, undefined);
   assert.equal(result.streams[0].headers.Referer, 'https://71stream.one/');
 });
+
+test('selected 71Stream requests a fresh signed embed URL and forwards it to the central extractor', async () => {
+  const id = '5tv:movie:home-alone-1990';
+  const page = 'https://5tv.rest/movie/home-alone-1990/';
+  const embed = 'https://71stream.one/embed/PD4AEWZuud';
+  const signed = `${embed}?ftv_exp=4102444800&ftv_sig=short-lived-test-signature`;
+  const routes = { [page]: fixture('movie.html') };
+  const extractorCalls = [];
+  const { plugin, calls } = loadPlugin(routes, {
+    async fetch(url, options = {}) {
+      calls.push({ url, options });
+      if (url.endsWith('/wp-admin/admin-ajax.php')) {
+        assert.equal(options.method, 'POST');
+        assert.equal(options.headers.Origin, 'https://5tv.rest');
+        assert.equal(options.headers.Referer, page);
+        return htmlResponse(JSON.stringify({ success: true, data: { url: signed } }), url);
+      }
+      const route = routes[url];
+      if (!route) throw new Error(`unexpected route ${url}`);
+      return htmlResponse(route, url);
+    },
+    async __yume_extract_v1(raw) {
+      extractorCalls.push(JSON.parse(raw));
+      return JSON.stringify({ streams: [{ url: 'https://cdn.example/video.mp4', type: 'mp4' }] });
+    },
+  });
+  const options = await plugin.getStreams({ id });
+  assert.equal(calls.filter(call => call.options.method === 'POST').length, 0, 'listing options must not request or cache signatures');
+  const token = options.options.map(option => JSON.parse(option.token)).find(value => value.url === embed);
+  const result = await plugin.resolveStreamOption({ id, token: JSON.stringify(token) });
+  const access = calls.find(call => call.options.method === 'POST');
+  assert.equal(calls.filter(call => call.options.method === 'POST').length, 1, 'only the selected server should be signed');
+  const params = new URLSearchParams(access.options.body);
+  assert.equal(access.url, 'https://5tv.rest/wp-admin/admin-ajax.php');
+  assert.deepEqual([...params.entries()], [
+    ['action', 'ftv_71_access_url'], ['object_id', '110058'], ['server_id', '542395'], ['server_type', 'watch'],
+  ]);
+  assert.equal(extractorCalls.length, 1);
+  assert.equal(extractorCalls[0].url, signed);
+  assert.equal(extractorCalls[0].scopeId, '5tv');
+  assert.equal(result.streams[0].url, 'https://cdn.example/video.mp4');
+  assert.ok(!JSON.stringify(options).includes('ftv_sig='), 'the short-lived signature must not be stored in the option token');
+});
+
+test('selected Ultra4Vid uses its page server ID and validates the signed host and path', async () => {
+  const id = '5tv:movie:home-alone-1990';
+  const page = 'https://5tv.rest/movie/home-alone-1990/';
+  const changedPage = fixture('movie.html').replace('"objectId":110058', '"objectId":901234').replace('data-server-id="542396"', 'data-server-id="987654"');
+  const embed = 'https://ult4vid.one/embed/7SmMlbb4jjlgbPk';
+  const signed = `${embed}?ftv_exp=4102444800&ftv_sig=another-short-lived-signature`;
+  const routes = { [page]: changedPage };
+  const extractorCalls = [];
+  const { plugin, calls } = loadPlugin(routes, {
+    async fetch(url, options = {}) {
+      calls.push({ url, options });
+      if (options.method === 'POST') return htmlResponse(JSON.stringify({ success: true, data: { url: signed } }), url);
+      return htmlResponse(routes[url], url);
+    },
+    async __yume_extract_v1(raw) {
+      extractorCalls.push(JSON.parse(raw));
+      return JSON.stringify({ streams: [{ url: 'https://cdn.example/video.mp4', type: 'mp4' }] });
+    },
+  });
+  const options = await plugin.getStreams({ id });
+  const token = options.options.map(option => JSON.parse(option.token)).find(value => value.url === embed);
+  await plugin.resolveStreamOption({ id, token: JSON.stringify(token) });
+  const params = new URLSearchParams(calls.find(call => call.options.method === 'POST').options.body);
+  assert.equal(params.get('object_id'), '901234');
+  assert.equal(params.get('server_id'), '987654');
+  assert.equal(extractorCalls[0].url, signed);
+  assert.throws(() => plugin.__test.signedAccessUrl(embed, 'https://evil.example/embed/7SmMlbb4jjlgbPk?ftv_exp=4102444800&ftv_sig=x', 1), /HOST_OR_PATH_MISMATCH/);
+  assert.throws(() => plugin.__test.signedAccessUrl(embed, 'https://ult4vid.one/embed/other?ftv_exp=4102444800&ftv_sig=x', 1), /HOST_OR_PATH_MISMATCH/);
+});
+
+test('signed access rejects expired, rejected, and malformed responses without calling the extractor', async () => {
+  const embed = 'https://71stream.one/embed/example';
+  assert.throws(() => pluginSignedAccessForTest(embed), /ACCESS_URL_EXPIRED/);
+
+  async function attempt(responseBody, expectedError) {
+    const id = '5tv:movie:home-alone-1990';
+    const page = 'https://5tv.rest/movie/home-alone-1990/';
+    const token = JSON.stringify({ v: 1, id, url: embed, page, ordinal: 0, name: '71Stream', objectId: 110058, serverId: 542395 });
+    let extractorCalled = false;
+    const { plugin } = loadPlugin({}, {
+      async fetch() { return htmlResponse(responseBody, 'https://5tv.rest/wp-admin/admin-ajax.php'); },
+      async __yume_extract_v1() { extractorCalled = true; return JSON.stringify({ streams: [] }); },
+    });
+    await assert.rejects(() => plugin.resolveStreamOption({ id, token }), expectedError);
+    assert.equal(extractorCalled, false);
+  }
+  await attempt(JSON.stringify({ success: false, data: { url: '' } }), /ACCESS_URL_REJECTED/);
+  await attempt('not-json', /ACCESS_URL_INVALID_JSON/);
+  await attempt(JSON.stringify({ success: true, data: { url: `${embed}?ftv_exp=1&ftv_sig=expired` } }), /ACCESS_URL_EXPIRED/);
+});
+
+function pluginSignedAccessForTest(embed) {
+  const { plugin } = loadPlugin();
+  return plugin.__test.signedAccessUrl(embed, `${embed}?ftv_exp=1&ftv_sig=expired`, 2);
+}
 
 test('resolver rejects cross-item, insecure, and malformed option tokens', async () => {
   const { plugin } = loadPlugin({}, { async __yume_extract_v1() { throw new Error('must not run'); } });

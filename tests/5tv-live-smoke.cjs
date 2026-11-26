@@ -26,7 +26,8 @@ const plugin = context.module.exports;
 
 async function main() {
   const home = await plugin.getHome();
-  assert.ok(home.sections.length >= 5, `expected rich Home, got ${home.sections.length}`);
+  assert.equal(home.sections.length, 7, `expected seven custom catalogs, got ${home.sections.length}`);
+  assert.deepEqual(Array.from(home.sections, section => section.id), ['korean-drama', 'chinese-drama', 'japanese-drama', 'foreign-movies', 'korean-movies', 'asian-programs', 'anime-series']);
   assert.ok(!home.sections.some(section => section.id === 'latest-episodes'), 'removed latest-episodes catalog returned from Home');
   const movie = home.sections.flatMap(section => section.items).find(item => item.type === 'movie');
   const series = { nativeId: '5tv:series:attack-on-titan' };
@@ -61,12 +62,25 @@ async function main() {
   const filters = await plugin.getCatalogFilters({ catalogId: 'discover-series', contentType: 'series', selectedFilters: {} });
   const yearFilter = filters.filters.find(filter => filter.key === 'year');
   assert.ok(yearFilter && yearFilter.options.some(option => option.value === '2026'));
-  const firstPage = await plugin.getCatalog({ catalogId: 'latest-series', type: 'series' });
-  const secondPage = await plugin.getCatalog({ catalogId: 'latest-series', type: 'series', cursor: '2' });
-  const thirdPage = await plugin.getCatalog({ catalogId: 'latest-series', type: 'series', cursor: '3' });
+  const firstPage = await plugin.getCatalog({ catalogId: 'korean-drama', type: 'series' });
+  const secondPage = await plugin.getCatalog({ catalogId: 'korean-drama', type: 'series', cursor: '2' });
+  const thirdPage = await plugin.getCatalog({ catalogId: 'korean-drama', type: 'series', cursor: '3' });
   assert.ok(firstPage.items.length > 0 && secondPage.items.length > 0 && thirdPage.items.length > 0);
   assert.notEqual(firstPage.items[0].nativeId, secondPage.items[0].nativeId);
   assert.notEqual(secondPage.items[0].nativeId, thirdPage.items[0].nativeId);
+  const customCatalogs = [
+    ['korean-drama', 'series'], ['chinese-drama', 'series'], ['japanese-drama', 'series'],
+    ['foreign-movies', 'movie'], ['korean-movies', 'movie'], ['asian-programs', 'series'], ['anime-series', 'series'],
+  ];
+  const customCounts = [];
+  for (const [catalogId, type] of customCatalogs) {
+    const pages = [];
+    for (const cursor of [undefined, '2', '3']) pages.push(await plugin.getCatalog({ catalogId, type, cursor }));
+    assert.ok(pages.every(page => page.items.length > 0));
+    assert.ok(pages.every(page => page.items.every(item => item.type === type && item.poster)));
+    assert.equal(new Set(pages.map(page => page.items[0].nativeId)).size, 3);
+    customCounts.push(`${catalogId}:${pages.map(page => page.items.length).join('/')}`);
+  }
   const genre = filters.filters.find(filter => filter.key === 'genre').options.find(option => option.label === 'دراما');
   assert.ok(genre);
   const filteredPages = [];
@@ -75,11 +89,8 @@ async function main() {
   }
   assert.ok(filteredPages.every(page => page.items.length > 0));
   assert.equal(new Set(filteredPages.map(page => page.items[0].nativeId)).size, 3);
-  const newMovies = await plugin.getCatalog({ catalogId: 'new-movies', type: 'movie' });
-  const newSeries = await plugin.getCatalog({ catalogId: 'new-series', type: 'series' });
-  assert.ok(newMovies.items.length > 0 && newMovies.items.every(item => item.type === 'movie'));
-  assert.ok(newSeries.items.length > 0 && newSeries.items.every(item => item.type === 'series'));
-  console.log(`CATALOG pages=${firstPage.items.length}/${secondPage.items.length}/${thirdPage.items.length} filtered=${filteredPages.map(page => page.items.length).join('/')} new=${newMovies.items.length}/${newSeries.items.length} filters=${filters.filters.map(filter => filter.key).join(',')}`);
+  console.log(`CATALOG pages=${firstPage.items.length}/${secondPage.items.length}/${thirdPage.items.length} filtered=${filteredPages.map(page => page.items.length).join('/')} filters=${filters.filters.map(filter => filter.key).join(',')}`);
+  console.log(`CUSTOM_CATALOGS ${customCounts.join(' ')}`);
 
   const movieOptions = await plugin.getStreams({ id: movie.nativeId, mode: 'options' });
   assert.ok(movieOptions.options.length > 0);

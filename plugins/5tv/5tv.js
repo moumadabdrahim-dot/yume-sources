@@ -2,7 +2,7 @@
   "use strict";
 
   var PLUGIN_ID = "5tv";
-  var PLUGIN_VERSION = "0.2.0-rc.2";
+  var PLUGIN_VERSION = "0.2.0-rc.3";
   var BASE = "https://5tv.rest";
   var USER_AGENT = "Mozilla/5.0 (Linux; Android 16) AppleWebKit/537.36 Chrome/131 Mobile Safari/537.36";
   var TIMEOUT_MS = 15000;
@@ -11,26 +11,27 @@
   var MAX_EPISODES = 2000;
 
   var CATALOGS = {
-    "latest-series": { path: "/latest-series/", type: "series", card: "poster" },
-    "latest-movies": { path: "/latest-movies/", type: "movie", card: "poster" },
-    "asian-programs": { path: "/category/%D8%A7%D9%84%D8%A8%D8%B1%D8%A7%D9%85%D8%AC-%D8%A7%D9%84%D8%A3%D8%B3%D9%8A%D9%88%D9%8A%D8%A9/", type: "series", card: "poster" },
-    "anime-series": { path: "/category/%D8%A3%D9%86%D9%85%D9%8A/", type: "series", card: "poster" },
-    "korean-picks": { path: "/search/?q=&genre%5B%5D=32&country%5B%5D=7&category%5B%5D=15&category%5B%5D=60", type: "series", card: "poster" },
-    "romance-series": { path: "/search/?q=&genre%5B%5D=23&category%5B%5D=18&category%5B%5D=15&category%5B%5D=60", type: "series", card: "poster" },
-    "asian-drama": { path: "/search/?q=&category%5B%5D=24&category%5B%5D=87&category%5B%5D=93&category%5B%5D=12&category%5B%5D=69&category%5B%5D=18&category%5B%5D=80&category%5B%5D=15&category%5B%5D=60", type: "series", card: "poster" },
-    "new-movies": { path: "/new-rows/", type: "movie", card: "poster" },
-    "new-series": { path: "/new-rows/", type: "series", card: "poster" },
-    "discover-movies": { path: "/latest-movies/", type: "movie", card: "poster", discover: true },
-    "discover-series": { path: "/latest-series/", type: "series", card: "poster", discover: true }
+    "korean-drama": { path: "/category/%D8%A7%D9%84%D8%AF%D8%B1%D8%A7%D9%85%D8%A7-%D8%A7%D9%84%D9%83%D9%88%D8%B1%D9%8A%D8%A9/", type: "series", title: "الدراما الكورية", home: true },
+    "chinese-drama": { path: "/category/%D8%A7%D9%84%D8%AF%D8%B1%D8%A7%D9%85%D8%A7-%D8%A7%D9%84%D8%B5%D9%8A%D9%86%D9%8A%D8%A9/", type: "series", title: "الدراما الصينية", home: true },
+    "japanese-drama": { path: "/category/%D8%A7%D9%84%D8%AF%D8%B1%D8%A7%D9%85%D8%A7-%D8%A7%D9%84%D9%8A%D8%A7%D8%A8%D8%A7%D9%86%D9%8A%D8%A9/", type: "series", title: "الدراما اليابانية", home: true },
+    "foreign-movies": { path: "/category/%D8%A7%D9%84%D8%A3%D9%81%D9%84%D8%A7%D9%85-%D8%A7%D9%84%D8%A3%D8%AC%D9%86%D8%A8%D9%8A%D8%A9/", type: "movie", title: "الأفلام الأجنبية", home: true },
+    "korean-movies": { path: "/category/%D8%A7%D9%84%D8%A3%D9%81%D9%84%D8%A7%D9%85-%D8%A7%D9%84%D9%83%D9%88%D8%B1%D9%8A%D8%A9/", type: "movie", title: "الأفلام الكورية", home: true },
+    "asian-programs": { path: "/category/%D8%A7%D9%84%D8%A8%D8%B1%D8%A7%D9%85%D8%AC-%D8%A7%D9%84%D8%A3%D8%B3%D9%8A%D9%88%D9%8A%D8%A9/", type: "series", title: "البرامج الآسيوية", home: true },
+    "anime-series": { path: "/category/%D8%A3%D9%86%D9%85%D9%8A/", type: "series", title: "مسلسلات الأنمي", home: true },
+    "discover-movies": { path: "/latest-movies/", type: "movie", title: "استكشاف الأفلام", discover: true },
+    "discover-series": { path: "/latest-series/", type: "series", title: "استكشاف المسلسلات", discover: true }
   };
-  var HOME_TITLES = {
-    "جديد الدراما": "latest-series", "جديد الأفلام": "latest-movies",
-    "تعرض قريبا ..": "upcoming-series", "تعرض قريباً ..": "upcoming-series",
-    "جديد البرامج الأسيوية": "asian-programs", "جديد البرامج الآسيوية": "asian-programs",
-    "جديد الأنمي": "anime-series", "غير موودك": "korean-picks", "غير مودك": "korean-picks",
-    "رومانسية ؟": "romance-series", "رومانسية؟": "romance-series",
-    "باقي الدراما الاسيوية": "asian-drama", "باقي الدراما الآسيوية": "asian-drama"
+  var LEGACY_CATALOGS = {
+    "latest-series": { path: "/latest-series/", type: "series" },
+    "latest-movies": { path: "/latest-movies/", type: "movie" },
+    "new-movies": { path: "/new-rows/", type: "movie" },
+    "new-series": { path: "/new-rows/", type: "series" },
+    "korean-picks": { path: "/search/?q=&genre%5B%5D=32&country%5B%5D=7&category%5B%5D=15&category%5B%5D=60", type: "series" },
+    "romance-series": { path: "/search/?q=&genre%5B%5D=23&category%5B%5D=18&category%5B%5D=15&category%5B%5D=60", type: "series" },
+    "asian-drama": { path: "/search/?q=&category%5B%5D=24&category%5B%5D=87&category%5B%5D=93&category%5B%5D=12&category%5B%5D=69&category%5B%5D=18&category%5B%5D=80&category%5B%5D=15&category%5B%5D=60", type: "series" }
   };
+  var HOME_CATALOG_IDS = ["korean-drama", "chinese-drama", "japanese-drama", "foreign-movies", "korean-movies", "asian-programs", "anime-series"];
+  var HOME_CONCURRENCY = 4;
 
   function fail(code) { throw new Error(code); }
   function text(value) { return value == null ? "" : String(value).replace(/\s+/g, " ").trim(); }
@@ -153,24 +154,35 @@
     while ((match = re.exec(html || ""))) { var url = siteUrl(match[2]); if (pathParts(url)) return url; }
     return "";
   }
-  function sectionBlocks(html) {
-    var starts = [], re = /<section\b[^>]*class=["'][^"']*\bftv-home-section\b[^"']*["'][^>]*>/gi, m;
-    while ((m = re.exec(html))) starts.push(m.index);
-    return starts.map(function (start, index) { return html.slice(start, index + 1 < starts.length ? starts[index + 1] : html.length); });
+  function catalogItems(html, type) {
+    var blocks = allBlocks(html, "article", "ftv-home-poster-card").concat(allBlocks(html, "article", "ftv-tax-card"));
+    return dedupe(blocks.map(function (block) { return posterCard(block, type); }).filter(function (item) { return item && item.poster; }), function (item) { return item.nativeId; }).slice(0, MAX_ITEMS);
   }
-  function sectionTitle(block) { return firstMatch(block, /<h2\b[^>]*>([\s\S]*?)<\/h2>/i) || firstMatch(block, /ftv-home-section__title[^>]*>([\s\S]*?)<\//i); }
-  function mapHomeSection(block) {
-    var rawTitle = sectionTitle(block), id = HOME_TITLES[rawTitle]; if (!id) return null;
-    var config = CATALOGS[id], items;
-    if (id === "upcoming-series") items = allBlocks(block, "article", "ftv-status-row__card").map(function (row) { return posterCard(row, "series"); });
-    else items = allBlocks(block, "article", "ftv-home-poster-card").map(function (row) { return posterCard(row, config && config.type); });
-    items = dedupe(items.filter(Boolean), function (item) { return item.nativeId; }).slice(0, MAX_ITEMS);
-    if (!items.length) return null;
-    return { id: id, title: rawTitle, items: items, hasMore: !!config };
+  async function mapConcurrent(values, limit, worker) {
+    var results = new Array(values.length), next = 0;
+    async function run() {
+      while (true) {
+        var index = next++; if (index >= values.length) return;
+        results[index] = await worker(values[index], index);
+      }
+    }
+    var workers = [], count = Math.min(limit, values.length);
+    for (var i = 0; i < count; i++) workers.push(run());
+    await Promise.all(workers); return results;
   }
   async function getHome() {
-    var page = await requestHtml(BASE + "/", "home");
-    var sections = sectionBlocks(page.html).map(mapHomeSection).filter(Boolean);
+    var sections = await mapConcurrent(HOME_CATALOG_IDS, HOME_CONCURRENCY, async function (id) {
+      var config = CATALOGS[id];
+      try {
+        var page = await requestHtml(BASE + config.path, "home_catalog");
+        var items = catalogItems(page.html, config.type); if (!items.length) return null;
+        return { id: id, title: config.title, items: items, hasMore: hasNextPage(page.html, 1) };
+      } catch (error) {
+        diagnostic("home_catalog_failed", { failureCode: bounded(error && error.message, 80) || "UNKNOWN_ERROR" });
+        return null;
+      }
+    });
+    sections = sections.filter(Boolean);
     diagnostic("home_mapped", { itemCount: sections.reduce(function (n, section) { return n + section.items.length; }, 0) });
     return { sections: sections };
   }
@@ -220,15 +232,13 @@
     return definition;
   }
   async function getCatalog(args) {
-    args = args || {}; var id = text(args.catalogId), config = CATALOGS[id]; if (!config) fail("5TV_UNKNOWN_CATALOG");
+    args = args || {}; var id = text(args.catalogId), config = CATALOGS[id] || LEGACY_CATALOGS[id]; if (!config) fail("5TV_UNKNOWN_CATALOG");
     if (text(args.type) !== config.type) fail("5TV_CATALOG_TYPE_MISMATCH");
     var path = config.path;
     if (config.discover) path = selectedDiscoverRoute(args.filters) || path;
     else if (args.filters && Object.keys(args.filters).length) fail("5TV_INVALID_FILTER");
     var page = pageNumber(args.cursor), response = await requestHtml(pagedUrl(path, page), "catalog");
-    var blocks = allBlocks(response.html, "article", "ftv-home-poster-card").concat(allBlocks(response.html, "article", "ftv-tax-card"));
-    var items = blocks.map(function (block) { return posterCard(block, config.type); }).filter(Boolean);
-    items = dedupe(items, function (item) { return item.nativeId; }).slice(0, MAX_ITEMS);
+    var items = catalogItems(response.html, config.type);
     var more = hasNextPage(response.html, page);
     return { catalogId: id, items: items, page: { nextCursor: more ? String(page + 1) : null, hasMore: more } };
   }
@@ -357,5 +367,5 @@
 
   var plugin = { getHome: getHome, getCatalog: getCatalog, getCatalogFilters: getCatalogFilters, search: search, getDetails: getDetails, getStreams: getStreams, resolveStreamOption: resolveStreamOption };
   if (root && root.module) root.module.exports = plugin;
-  if (root && root.__YUME_5TV_TESTING__ && root.module) root.module.exports.__test = { decodeEntities: decodeEntities, normalizeDigits: normalizeDigits, pathParts: pathParts, idFor: idFor, parseId: parseId, posterCard: posterCard, mapHomeSection: mapHomeSection, parseDetailsPage: parseDetailsPage, parseSeasonPanels: parseSeasonPanels, serverOptions: serverOptions, parseToken: parseToken, mapExtracted: mapExtracted, hasNextPage: hasNextPage, isVerificationPage: isVerificationPage };
+  if (root && root.__YUME_5TV_TESTING__ && root.module) root.module.exports.__test = { decodeEntities: decodeEntities, normalizeDigits: normalizeDigits, pathParts: pathParts, idFor: idFor, parseId: parseId, posterCard: posterCard, catalogItems: catalogItems, parseDetailsPage: parseDetailsPage, parseSeasonPanels: parseSeasonPanels, serverOptions: serverOptions, parseToken: parseToken, mapExtracted: mapExtracted, hasNextPage: hasNextPage, isVerificationPage: isVerificationPage, homeCatalogIds: HOME_CATALOG_IDS.slice() };
 })(typeof globalThis !== "undefined" ? globalThis : this);

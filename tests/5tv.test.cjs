@@ -63,7 +63,7 @@ function loadPlugin(routes = {}, extra = {}) {
 test('manifest declares an isolated API v2 release candidate with stable catalogs', () => {
   const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
   assert.equal(manifest.apiVersion, 2);
-  assert.equal(manifest.version, '0.2.0-rc.3');
+  assert.equal(manifest.version, '0.2.0-rc.4');
   assert.equal(manifest.scrapers.length, 1);
   const source = manifest.scrapers[0];
   assert.equal(source.id, '5tv');
@@ -76,6 +76,8 @@ test('manifest declares an isolated API v2 release candidate with stable catalog
   assert.ok(!source.catalogs.some(row => ['latest-series', 'latest-movies', 'upcoming-series', 'korean-picks', 'romance-series', 'asian-drama'].includes(row.id)));
   assert.ok(source.catalogs.some(row => row.id === 'discover-movies' && row.filters.every(filter => filter.dynamic)));
   assert.ok(source.catalogs.some(row => row.id === 'discover-series' && row.filters.every(filter => filter.dynamic)));
+  assert.deepEqual(source.catalogs.find(row => row.id === 'discover-movies').filters.map(filter => filter.key), ['category', 'genre', 'year']);
+  assert.deepEqual(source.catalogs.find(row => row.id === 'discover-series').filters.map(filter => filter.key), ['category', 'genre', 'year']);
 });
 
 test('native identities are reversible, source-scoped, and separate all kinds', () => {
@@ -314,27 +316,125 @@ test('catalog failures distinguish HTTP errors, invalid HTML, and access verific
   await assert.rejects(() => loadPlugin({ [url]: '<html>Please wait while your request is being verified</html>' }).plugin.getCatalog({ catalogId: 'korean-drama', type: 'series' }), /ACCESS_VERIFICATION_REQUIRED/);
 });
 
-test('discover filters are derived from live route shapes and reject unsupported combinations', async () => {
-  const discoverUrl = 'https://5tv.rest/discover/';
-  const genreUrl = 'https://5tv.rest/genre/%D8%AF%D8%B1%D8%A7%D9%85%D8%A7/';
-  const genrePage2Url = 'https://5tv.rest/genre/%D8%AF%D8%B1%D8%A7%D9%85%D8%A7/page/2/';
-  const { plugin, calls } = loadPlugin({
-    [discoverUrl]: fixture('discover.html'),
-    [genreUrl]: fixture('tax-catalog.html'),
-    [genrePage2Url]: fixture('tax-catalog.html').replace('/page/2/', '/page/3/'),
-  });
-  const filters = await plugin.getCatalogFilters({ catalogId: 'discover-series', contentType: 'series', selectedFilters: {} });
-  assert.deepEqual(Array.from(filters.filters, filter => filter.key), ['category', 'genre', 'country', 'year']);
-  assert.equal(filters.filters.find(filter => filter.key === 'category').options[0].label, 'الأفلام الأجنبية');
-  assert.ok(filters.filters.find(filter => filter.key === 'genre').options.some(option => option.label === 'دراما'));
-  const page = await plugin.getCatalog({ catalogId: 'discover-series', type: 'series', filters: { genre: 'دراما' } });
-  assert.ok(page.items.every(item => item.type === 'series'));
-  assert.equal(calls.at(-1).url, genreUrl);
-  const secondPage = await plugin.getCatalog({ catalogId: 'discover-series', type: 'series', filters: { genre: 'دراما' }, cursor: '2' });
-  assert.equal(calls.at(-1).url, genrePage2Url);
-  assert.equal(secondPage.page.nextCursor, '3');
-  await assert.rejects(
-    () => plugin.getCatalog({ catalogId: 'discover-series', type: 'series', filters: { genre: 'دراما', year: '2026' } }),
-    /FILTER_COMBINATION_UNSUPPORTED/,
-  );
+test('advanced discover filters come from the real search form and are type specific', async () => {
+  const searchUrl = 'https://5tv.rest/search/';
+  const { plugin } = loadPlugin({ [searchUrl]: fixture('discover.html') });
+  const series = await plugin.getCatalogFilters({ catalogId: 'discover-series', contentType: 'series', selectedFilters: {} });
+  const movies = await plugin.getCatalogFilters({ catalogId: 'discover-movies', contentType: 'movie', selectedFilters: {} });
+  assert.deepEqual(Array.from(series.filters, filter => filter.key), ['category', 'genre', 'year']);
+  assert.deepEqual(Array.from(movies.filters, filter => filter.key), ['category', 'genre', 'year']);
+  const seriesCategories = series.filters.find(filter => filter.key === 'category').options;
+  const movieCategories = movies.filters.find(filter => filter.key === 'category').options;
+  assert.ok(seriesCategories.some(option => option.label === 'الدراما الكورية'));
+  assert.ok(seriesCategories.some(option => option.label === 'البرامج الأسيوية'));
+  assert.ok(seriesCategories.some(option => option.label === 'أنمي'));
+  assert.ok(seriesCategories.every(option => !option.label.startsWith('الأفلام ')));
+  assert.ok(movieCategories.some(option => option.label === 'الأفلام الأجنبية'));
+  assert.ok(movieCategories.every(option => option.label.startsWith('الأفلام ')));
+  assert.ok(!seriesCategories.some(option => option.label === 'اسيوي'));
+  assert.ok(!movieCategories.some(option => option.label === 'اسيوي'));
+  assert.ok(!series.filters.find(filter => filter.key === 'genre').options.some(option => option.label === 'فيلم تلفزيوني'));
+  assert.ok(!movies.filters.find(filter => filter.key === 'genre').options.some(option => option.label === 'مسلسل يومي'));
+  assert.deepEqual(Array.from(series.filters.find(filter => filter.key === 'year').options, option => [option.value, option.label]), [['11', '2026'], ['79', '2025']]);
+});
+
+function filteredSearchPage(body, nextPage) {
+  const withoutPager = body.replace(/<a\b[^>]*class=["'][^"']*page-numbers[^"']*["'][^>]*>[\s\S]*?<\/a>/gi, '');
+  const pager = nextPage == null ? '' : `<a class="next page-numbers" href="https://www.5tv.rest/search/?q=&amp;category%5B0%5D=15&amp;genre%5B0%5D=23&amp;ftv_year_filter%5B0%5D=79&amp;pg=${nextPage}">التالي</a>`;
+  return withoutPager.replace('</body>', `${pager}</body>`);
+}
+
+test('advanced discover combines filters and preserves them through pages one, two, and three', async () => {
+  const routes = {};
+  const { plugin, calls } = loadPlugin(routes);
+  const filters = { category: '15', genre: '23', year: '79' };
+  const urls = [1, 2, 3].map(page => `https://5tv.rest${plugin.__test.discoverSearchPath('series', filters, page)}`);
+  routes[urls[0]] = filteredSearchPage(fixture('tax-catalog.html'), 2);
+  routes[urls[1]] = filteredSearchPage(fixture('tax-catalog.html').replaceAll('devils-crest', 'second-page'), 3);
+  routes[urls[2]] = filteredSearchPage(fixture('tax-catalog.html').replaceAll('devils-crest', 'third-page'), null);
+  const first = await plugin.getCatalog({ catalogId: 'discover-series', type: 'series', filters });
+  const second = await plugin.getCatalog({ catalogId: 'discover-series', type: 'series', filters, cursor: '2' });
+  const third = await plugin.getCatalog({ catalogId: 'discover-series', type: 'series', filters, cursor: '3' });
+  assert.deepEqual(Array.from(calls, call => call.url), urls);
+  assert.ok(urls[0].includes('category%5B%5D=15') && urls[0].includes('genre%5B%5D=23') && urls[0].includes('ftv_year_filter%5B%5D=79'));
+  assert.ok(!urls[0].includes('pg='));
+  assert.ok(urls[1].endsWith('&pg=2'));
+  assert.ok(urls[2].endsWith('&pg=3'));
+  assert.equal(first.page.nextCursor, '2');
+  assert.equal(second.page.nextCursor, '3');
+  assert.equal(third.page.hasMore, false);
+  assert.ok(first.items.every(item => item.type === 'series'));
+  assert.notEqual(first.items[0].nativeId, second.items[0].nativeId);
+  assert.notEqual(second.items[0].nativeId, third.items[0].nativeId);
+});
+
+test('genre or year-only discover requests inject all categories for the selected content type', () => {
+  const { plugin } = loadPlugin();
+  const moviePath = plugin.__test.discoverSearchPath('movie', { genre: '6', year: '74' }, 1);
+  const seriesPath = plugin.__test.discoverSearchPath('series', { genre: '25', year: '11' }, 2);
+  const movieCategories = new URL(`https://5tv.rest${moviePath}`).searchParams.getAll('category[]');
+  const seriesCategories = new URL(`https://5tv.rest${seriesPath}`).searchParams.getAll('category[]');
+  assert.ok(movieCategories.includes('88'));
+  assert.ok(movieCategories.includes('68'));
+  assert.ok(!movieCategories.includes('15'));
+  assert.ok(seriesCategories.includes('15'));
+  assert.ok(seriesCategories.includes('174'));
+  assert.ok(!seriesCategories.includes('88'));
+  assert.ok(seriesPath.includes('genre%5B%5D=25'));
+  assert.ok(seriesPath.includes('ftv_year_filter%5B%5D=11'));
+  assert.ok(seriesPath.endsWith('&pg=2'));
+});
+
+test('every visible filter option is forwarded under the matching live form field', () => {
+  const { plugin } = loadPlugin();
+  const html = fixture('discover.html');
+  for (const type of ['movie', 'series']) {
+    const filters = plugin.__test.categoryOptions(html, type);
+    const genres = plugin.__test.searchFormOptions(html, 'genre').filter(option =>
+      type === 'movie' ? option.label !== 'مسلسل يومي' : option.label !== 'فيلم تلفزيوني',
+    );
+    const years = plugin.__test.searchFormOptions(html, 'ftv_year_filter');
+    for (const option of filters) {
+      const params = new URL(`https://5tv.rest${plugin.__test.discoverSearchPath(type, { category: option.value }, 1)}`).searchParams;
+      assert.deepEqual(params.getAll('category[]'), [option.value]);
+    }
+    for (const option of genres) {
+      const params = new URL(`https://5tv.rest${plugin.__test.discoverSearchPath(type, { genre: option.value }, 1)}`).searchParams;
+      assert.deepEqual(params.getAll('genre[]'), [option.value]);
+      assert.ok(params.getAll('category[]').length > 0);
+    }
+    for (const option of years) {
+      const params = new URL(`https://5tv.rest${plugin.__test.discoverSearchPath(type, { year: option.value }, 1)}`).searchParams;
+      assert.deepEqual(params.getAll('ftv_year_filter[]'), [option.value]);
+      assert.ok(params.getAll('category[]').length > 0);
+    }
+  }
+});
+
+test('search pagination parser recognizes the actual pg query links', () => {
+  const { plugin } = loadPlugin();
+  assert.equal(plugin.__test.hasNextPage('<a class="page-numbers" href="https://www.5tv.rest/search/?q&amp;genre%5B0%5D=23&amp;pg=2">2</a>', 1), true);
+  assert.equal(plugin.__test.hasNextPage('<a class="page-numbers" href="https://www.5tv.rest/search/?q&amp;genre%5B0%5D=23&amp;pg=3">3</a>', 1), false);
+});
+
+test('an incompatible category is cleared without a technical combination error', async () => {
+  const url = 'https://5tv.rest/latest-series/';
+  const { plugin, calls } = loadPlugin({ [url]: filteredSearchPage(fixture('tax-catalog.html'), null) });
+  const result = await plugin.getCatalog({ catalogId: 'discover-series', type: 'series', filters: { category: '88' } });
+  assert.equal(calls[0].url, url);
+  assert.ok(result.items.every(item => item.type === 'series'));
+  assert.equal(result.page.hasMore, false);
+});
+
+test('empty filtered results are successful while network failures remain errors', async () => {
+  const routes = {};
+  const { plugin } = loadPlugin(routes);
+  const filters = { category: '68', genre: '25' };
+  const url = `https://5tv.rest${plugin.__test.discoverSearchPath('movie', filters, 1)}`;
+  routes[url] = '<html><body><div class="ftv-search-empty">لا توجد نتائج مطابقة</div></body></html>';
+  const empty = await plugin.getCatalog({ catalogId: 'discover-movies', type: 'movie', filters });
+  assert.deepEqual(Array.from(empty.items), []);
+  assert.equal(empty.page.hasMore, false);
+  const failed = loadPlugin().plugin;
+  await assert.rejects(() => failed.getCatalog({ catalogId: 'discover-movies', type: 'movie', filters }), /NETWORK_ERROR/);
 });

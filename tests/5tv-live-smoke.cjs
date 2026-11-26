@@ -60,8 +60,31 @@ async function main() {
   console.log(`SEARCH arabicSeries=${arabic.items.length} englishMovies=${english.items.length} mixedSeries=${mixed.items.length} details=verified`);
 
   const filters = await plugin.getCatalogFilters({ catalogId: 'discover-series', contentType: 'series', selectedFilters: {} });
+  const movieFilters = await plugin.getCatalogFilters({ catalogId: 'discover-movies', contentType: 'movie', selectedFilters: {} });
   const yearFilter = filters.filters.find(filter => filter.key === 'year');
-  assert.ok(yearFilter && yearFilter.options.some(option => option.value === '2026'));
+  assert.ok(yearFilter && yearFilter.options.some(option => option.value === '11' && option.label === '2026'));
+  assert.deepEqual(Array.from(filters.filters, filter => filter.key), ['category', 'genre', 'year']);
+  assert.deepEqual(Array.from(movieFilters.filters, filter => filter.key), ['category', 'genre', 'year']);
+  assert.ok(filters.filters.find(filter => filter.key === 'category').options.every(option => !option.label.startsWith('الأفلام ')));
+  assert.ok(movieFilters.filters.find(filter => filter.key === 'category').options.every(option => option.label.startsWith('الأفلام ')));
+  const advancedScenarios = [
+    ['series-category', 'discover-series', 'series', { category: '15' }],
+    ['series-genre', 'discover-series', 'series', { genre: '25' }],
+    ['series-year', 'discover-series', 'series', { year: '11' }],
+    ['series-category-genre', 'discover-series', 'series', { category: '15', genre: '23' }],
+    ['series-genre-year', 'discover-series', 'series', { genre: '25', year: '79' }],
+    ['movie-category', 'discover-movies', 'movie', { category: '88' }],
+    ['movie-genre', 'discover-movies', 'movie', { genre: '6' }],
+    ['movie-year', 'discover-movies', 'movie', { year: '74' }],
+    ['movie-category-genre', 'discover-movies', 'movie', { category: '68', genre: '25' }],
+  ];
+  const advancedCounts = [];
+  for (const [name, catalogId, type, selected] of advancedScenarios) {
+    const result = await plugin.getCatalog({ catalogId, type, filters: selected });
+    assert.ok(result.items.length > 0, `${name} returned no items`);
+    assert.ok(result.items.every(item => item.type === type), `${name} mixed content types`);
+    advancedCounts.push(`${name}:${result.items.length}`);
+  }
   const firstPage = await plugin.getCatalog({ catalogId: 'korean-drama', type: 'series' });
   const secondPage = await plugin.getCatalog({ catalogId: 'korean-drama', type: 'series', cursor: '2' });
   const thirdPage = await plugin.getCatalog({ catalogId: 'korean-drama', type: 'series', cursor: '3' });
@@ -81,15 +104,18 @@ async function main() {
     assert.equal(new Set(pages.map(page => page.items[0].nativeId)).size, 3);
     customCounts.push(`${catalogId}:${pages.map(page => page.items.length).join('/')}`);
   }
-  const genre = filters.filters.find(filter => filter.key === 'genre').options.find(option => option.label === 'دراما');
-  assert.ok(genre);
+  const genre = filters.filters.find(filter => filter.key === 'genre').options.find(option => option.label === 'رومانسي');
+  const category = filters.filters.find(filter => filter.key === 'category').options.find(option => option.label === 'الدراما الكورية');
+  assert.ok(genre && category);
   const filteredPages = [];
   for (const cursor of [undefined, '2', '3']) {
-    filteredPages.push(await plugin.getCatalog({ catalogId: 'discover-series', type: 'series', filters: { genre: genre.value }, cursor }));
+    filteredPages.push(await plugin.getCatalog({ catalogId: 'discover-series', type: 'series', filters: { category: category.value, genre: genre.value }, cursor }));
   }
   assert.ok(filteredPages.every(page => page.items.length > 0));
+  assert.ok(filteredPages.every(page => page.items.every(item => item.type === 'series')));
   assert.equal(new Set(filteredPages.map(page => page.items[0].nativeId)).size, 3);
   console.log(`CATALOG pages=${firstPage.items.length}/${secondPage.items.length}/${thirdPage.items.length} filtered=${filteredPages.map(page => page.items.length).join('/')} filters=${filters.filters.map(filter => filter.key).join(',')}`);
+  console.log(`ADVANCED_FILTERS ${advancedCounts.join(' ')}`);
   console.log(`CUSTOM_CATALOGS ${customCounts.join(' ')}`);
 
   const movieOptions = await plugin.getStreams({ id: movie.nativeId, mode: 'options' });

@@ -2,7 +2,7 @@
   "use strict";
 
   var PLUGIN_ID = "5tv";
-  var PLUGIN_VERSION = "0.2.0-rc.3";
+  var PLUGIN_VERSION = "0.2.0-rc.4";
   var BASE = "https://5tv.rest";
   var USER_AGENT = "Mozilla/5.0 (Linux; Android 16) AppleWebKit/537.36 Chrome/131 Mobile Safari/537.36";
   var TIMEOUT_MS = 15000;
@@ -32,6 +32,10 @@
   };
   var HOME_CATALOG_IDS = ["korean-drama", "chinese-drama", "japanese-drama", "foreign-movies", "korean-movies", "asian-programs", "anime-series"];
   var HOME_CONCURRENCY = 4;
+  var DISCOVER_CATEGORY_IDS = {
+    movie: ["88", "134", "124", "97", "113", "132", "192", "118", "183", "72", "73", "65", "71", "131", "85", "157", "68", "94", "141", "151", "64"],
+    series: ["174", "209", "76", "89", "176", "175", "110", "199", "87", "160", "93", "168", "12", "69", "145", "18", "185", "80", "144", "15", "119", "139", "60"]
+  };
 
   function fail(code) { throw new Error(code); }
   function text(value) { return value == null ? "" : String(value).replace(/\s+/g, " ").trim(); }
@@ -195,36 +199,68 @@
   }
   function hasNextPage(html, page) {
     var re = /<a\b[^>]*class=["'][^"']*\b(?:next\s+)?page-numbers\b[^"']*["'][^>]*href=["']([^"']+)["']/gi, m;
-    while ((m = re.exec(html || ""))) if (new RegExp("/page/" + (page + 1) + "/(?:[?\"']|$)").test(m[1])) return true;
+    while ((m = re.exec(html || ""))) {
+      var href = decodeEntities(m[1]);
+      if (new RegExp("/page/" + (page + 1) + "/(?:[?\"']|$)").test(href) || new RegExp("[?&]pg=" + (page + 1) + "(?:&|$)").test(href)) return true;
+    }
     return false;
   }
-  function selectedDiscoverRoute(filters) {
+  function normalizeDiscoverFilters(filters, type) {
     filters = filters && typeof filters === "object" && !Array.isArray(filters) ? filters : {};
-    var allowed = ["category", "genre", "country", "year"], selected = [];
+    var allowed = ["category", "genre", "year"], selected = {};
     Object.keys(filters).forEach(function (key) {
       if (allowed.indexOf(key) < 0) fail("5TV_INVALID_FILTER");
       var value = text(filters[key]);
       if (!value) return;
-      if (key === "year") {
-        if (!/^(?:19|20)[0-9]{2}$/.test(value)) fail("5TV_INVALID_FILTER");
-      } else if (!/^[^\s\/?#]{1,160}$/.test(value)) fail("5TV_INVALID_FILTER");
-      selected.push({ key: key, value: value });
+      if (!/^[1-9][0-9]{0,5}$/.test(value)) fail("5TV_INVALID_FILTER");
+      if (key === "category" && DISCOVER_CATEGORY_IDS[type].indexOf(value) < 0) return;
+      selected[key] = value;
     });
-    if (selected.length > 1) fail("5TV_FILTER_COMBINATION_UNSUPPORTED");
-    if (!selected.length) return null;
-    return "/" + selected[0].key + "/" + encodeURIComponent(selected[0].value).replace(/%2D/gi, "-") + "/";
+    return selected;
   }
-  function taxonomyOptions(html, key) {
-    var re = new RegExp("<a\\b[^>]*href=[\\\"']https:\\/\\/5tv\\.rest\\/" + key + "\\/([^\\\"'\\/?#]+)\\/?[\\\"'][^>]*>([\\s\\S]*?)<\\/a>", "gi");
-    var out = [], match;
-    while ((match = re.exec(html || ""))) {
-      var value;
-      try { value = decodeURIComponent(match[1]); } catch (_) { continue; }
-      var label = decodeEntities(match[2]).replace(/\s+[0-9٠-٩۰-۹٬,]+\s*←\s*$/, "");
-      if (!value || !label || value.length > 160 || label.length > 120) continue;
+  function discoverSearchPath(type, filters, page) {
+    var selected = normalizeDiscoverFilters(filters, type), keys = Object.keys(selected);
+    if (!keys.length) return null;
+    var categories = selected.category ? [selected.category] : DISCOVER_CATEGORY_IDS[type];
+    var pairs = [["q", ""]];
+    categories.forEach(function (value) { pairs.push(["category[]", value]); });
+    if (selected.genre) pairs.push(["genre[]", selected.genre]);
+    if (selected.year) pairs.push(["ftv_year_filter[]", selected.year]);
+    if (page > 1) pairs.push(["pg", String(page)]);
+    return "/search/?" + pairs.map(function (pair) { return encodeURIComponent(pair[0]) + "=" + encodeURIComponent(pair[1]); }).join("&");
+  }
+  function searchFormOptions(html, field) {
+    var blocks = (html || "").match(/<label\b[^>]*class=["'][^"']*\bftv-filter-chip\b[^"']*["'][^>]*>[\s\S]*?<\/label>/gi) || [];
+    var out = [];
+    blocks.forEach(function (block) {
+      var input = firstMatchRaw(block, /<input\b[^>]*>/i);
+      if (attr(input, "name") !== field + "[]") return;
+      var value = attr(input, "value"), label = firstMatch(block, /<span\b[^>]*>([\s\S]*?)<\/span>/i);
+      if (!/^[1-9][0-9]{0,5}$/.test(value) || !label || label.length > 120) return;
       out.push({ value: value, label: label });
-    }
-    return dedupe(out, function (option) { return option.value; }).slice(0, 500);
+    });
+    return dedupe(out, function (option) { return option.value; });
+  }
+  function categoryOptions(html, type) {
+    return searchFormOptions(html, "category").filter(function (option) {
+      if (DISCOVER_CATEGORY_IDS[type].indexOf(option.value) < 0) return false;
+      if (type === "movie") return option.label.indexOf("الأفلام ") === 0;
+      return option.label === "أنمي" || option.label.indexOf("الدراما ") === 0 || option.label.indexOf("البرامج ") === 0;
+    });
+  }
+  function genreOptions(html, type) {
+    return searchFormOptions(html, "genre").filter(function (option) {
+      return type === "movie" ? option.label !== "مسلسل يومي" : option.label !== "فيلم تلفزيوني";
+    });
+  }
+  function yearOptions(html) {
+    return searchFormOptions(html, "ftv_year_filter");
+  }
+  function filterOptionsForKey(html, key, type) {
+    if (key === "category") return categoryOptions(html, type);
+    if (key === "genre") return genreOptions(html, type);
+    if (key === "year") return yearOptions(html);
+    return [];
   }
   function filterDefinition(key, label, options, role, priority) {
     var definition = { key: key, kind: "select", label: label, required: false, dynamic: true, dependsOn: [], options: options, discoverPresentation: { priority: priority } };
@@ -235,9 +271,10 @@
     args = args || {}; var id = text(args.catalogId), config = CATALOGS[id] || LEGACY_CATALOGS[id]; if (!config) fail("5TV_UNKNOWN_CATALOG");
     if (text(args.type) !== config.type) fail("5TV_CATALOG_TYPE_MISMATCH");
     var path = config.path;
-    if (config.discover) path = selectedDiscoverRoute(args.filters) || path;
-    else if (args.filters && Object.keys(args.filters).length) fail("5TV_INVALID_FILTER");
-    var page = pageNumber(args.cursor), response = await requestHtml(pagedUrl(path, page), "catalog");
+    var page = pageNumber(args.cursor), discoverPath = config.discover ? discoverSearchPath(config.type, args.filters, page) : null;
+    if (discoverPath) path = discoverPath;
+    else if (!config.discover && args.filters && Object.keys(args.filters).length) fail("5TV_INVALID_FILTER");
+    var response = await requestHtml(discoverPath ? BASE + path : pagedUrl(path, page), "catalog");
     var items = catalogItems(response.html, config.type);
     var more = hasNextPage(response.html, page);
     return { catalogId: id, items: items, page: { nextCursor: more ? String(page + 1) : null, hasMore: more } };
@@ -246,15 +283,17 @@
     args = args || {}; var id = text(args.catalogId), config = CATALOGS[id];
     if (!config) fail("5TV_UNKNOWN_CATALOG");
     if (!config.discover) return { catalogId: id, filters: [] };
-    selectedDiscoverRoute(args.selectedFilters);
-    var page = await requestHtml(BASE + "/discover/", "catalog_filters");
+    normalizeDiscoverFilters(args.selectedFilters, config.type);
+    var page = await requestHtml(BASE + "/search/", "catalog_filters");
+    var category = filterOptionsForKey(page.html, "category", config.type);
+    var genre = filterOptionsForKey(page.html, "genre", config.type);
+    var year = filterOptionsForKey(page.html, "year", config.type);
     return {
       catalogId: id,
       filters: [
-        filterDefinition("category", "التصنيف", taxonomyOptions(page.html, "category"), "category", 10),
-        filterDefinition("genre", "النوع الفني", taxonomyOptions(page.html, "genre"), "genre", 20),
-        filterDefinition("country", "الدولة", taxonomyOptions(page.html, "country"), null, 30),
-        filterDefinition("year", "السنة", taxonomyOptions(page.html, "year"), null, 40)
+        filterDefinition("category", "التصنيف", category, "category", 10),
+        filterDefinition("genre", "النوع الفني", genre, "genre", 20),
+        filterDefinition("year", "السنة", year, null, 30)
       ]
     };
   }
@@ -367,5 +406,5 @@
 
   var plugin = { getHome: getHome, getCatalog: getCatalog, getCatalogFilters: getCatalogFilters, search: search, getDetails: getDetails, getStreams: getStreams, resolveStreamOption: resolveStreamOption };
   if (root && root.module) root.module.exports = plugin;
-  if (root && root.__YUME_5TV_TESTING__ && root.module) root.module.exports.__test = { decodeEntities: decodeEntities, normalizeDigits: normalizeDigits, pathParts: pathParts, idFor: idFor, parseId: parseId, posterCard: posterCard, catalogItems: catalogItems, parseDetailsPage: parseDetailsPage, parseSeasonPanels: parseSeasonPanels, serverOptions: serverOptions, parseToken: parseToken, mapExtracted: mapExtracted, hasNextPage: hasNextPage, isVerificationPage: isVerificationPage, homeCatalogIds: HOME_CATALOG_IDS.slice() };
+  if (root && root.__YUME_5TV_TESTING__ && root.module) root.module.exports.__test = { decodeEntities: decodeEntities, normalizeDigits: normalizeDigits, pathParts: pathParts, idFor: idFor, parseId: parseId, posterCard: posterCard, catalogItems: catalogItems, parseDetailsPage: parseDetailsPage, parseSeasonPanels: parseSeasonPanels, serverOptions: serverOptions, parseToken: parseToken, mapExtracted: mapExtracted, hasNextPage: hasNextPage, isVerificationPage: isVerificationPage, searchFormOptions: searchFormOptions, categoryOptions: categoryOptions, discoverSearchPath: discoverSearchPath, homeCatalogIds: HOME_CATALOG_IDS.slice() };
 })(typeof globalThis !== "undefined" ? globalThis : this);

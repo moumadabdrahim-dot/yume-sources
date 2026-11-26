@@ -1,6 +1,6 @@
 {
   "name": "5TV",
-  "version": "0.2.0-rc.3",
+  "version": "0.2.0-rc.4",
   "description": "مصدر 5TV للأفلام والمسلسلات والمواسم والحلقات مع اختيار السيرفر.",
   "apiVersion": 2,
   "scrapers": [
@@ -9,7 +9,7 @@
       "pluginId": "5tv",
       "name": "5TV",
       "description": "أفلام ومسلسلات آسيوية وعالمية مع مواسم وحلقات مستقلة.",
-      "version": "0.2.0-rc.3",
+      "version": "0.2.0-rc.4",
       "filename": "5tv.js",
       "supportedTypes": ["movie", "tv"],
       "enabled": true,
@@ -29,14 +29,12 @@
         {"id":"discover-movies","type":"movie","title":"استكشاف الأفلام","capabilities":["browse","pagination"],"filters":[
           {"key":"category","kind":"select","label":"التصنيف","required":false,"dynamic":true,"options":[],"discoverPresentation":{"role":"category","priority":10}},
           {"key":"genre","kind":"select","label":"النوع الفني","required":false,"dynamic":true,"options":[],"discoverPresentation":{"role":"genre","priority":20}},
-          {"key":"country","kind":"select","label":"الدولة","required":false,"dynamic":true,"options":[],"discoverPresentation":{"priority":30}},
-          {"key":"year","kind":"select","label":"السنة","required":false,"dynamic":true,"options":[],"discoverPresentation":{"priority":40}}
+          {"key":"year","kind":"select","label":"السنة","required":false,"dynamic":true,"options":[],"discoverPresentation":{"priority":30}}
         ],"discoverType":"movie","presentation":{"posterShape":"portrait"}},
         {"id":"discover-series","type":"series","title":"استكشاف المسلسلات","capabilities":["browse","pagination"],"filters":[
           {"key":"category","kind":"select","label":"التصنيف","required":false,"dynamic":true,"options":[],"discoverPresentation":{"role":"category","priority":10}},
           {"key":"genre","kind":"select","label":"النوع الفني","required":false,"dynamic":true,"options":[],"discoverPresentation":{"role":"genre","priority":20}},
-          {"key":"country","kind":"select","label":"الدولة","required":false,"dynamic":true,"options":[],"discoverPresentation":{"priority":30}},
-          {"key":"year","kind":"select","label":"السنة","required":false,"dynamic":true,"options":[],"discoverPresentation":{"priority":40}}
+          {"key":"year","kind":"select","label":"السنة","required":false,"dynamic":true,"options":[],"discoverPresentation":{"priority":30}}
         ],"discoverType":"series","presentation":{"posterShape":"portrait"}}
       ],
       "searchGroups": [

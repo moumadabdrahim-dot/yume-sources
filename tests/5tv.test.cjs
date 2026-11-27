@@ -72,8 +72,8 @@ function loadPlugin(routes = {}, extra = {}) {
 test('manifest declares an isolated API v2 release candidate with stable catalogs', () => {
   const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
   assert.equal(manifest.apiVersion, 2);
-  assert.equal(manifest.version, '0.2.0-rc.8');
-  assert.equal(manifest.scrapers[0].version, '0.2.0-rc.8');
+  assert.equal(manifest.version, '0.2.0-rc.9');
+  assert.equal(manifest.scrapers[0].version, '0.2.0-rc.9');
   assert.equal(manifest.scrapers.length, 1);
   const source = manifest.scrapers[0];
   assert.equal(source.id, '5tv');
@@ -435,15 +435,89 @@ test('71Stream parses the original data-page MP4 and sends it unchanged to the c
   assert.ok(!JSON.stringify(diagnostics).includes('ftv_sig='));
 });
 
-test('71Stream data-page parser decodes attributes and rejects malformed, unavailable, or untrusted media', () => {
+test('71Stream data-page parser preserves signed MP4 and rejects malformed or untrusted media', () => {
   const { plugin } = loadPlugin();
-  const parser = plugin.__test.extract71StreamMp4FromHtml;
+  const parser = plugin.__test.extract71StreamMediaFromHtml;
   const media = 'https://bucket.r2.cloudflarestorage.com/video.mp4?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Content-Sha256=UNSIGNED-PAYLOAD&X-Amz-Credential=fake&X-Amz-Date=20261126T230000Z&X-Amz-Expires=10800&X-Amz-Signature=fake&X-Amz-SignedHeaders=host';
-  assert.equal(parser(dataPageResponse(media)).url, media);
+  assert.deepEqual({ ...parser(dataPageResponse(media)) }, { url: media, type: 'mp4', host: 'bucket.r2.cloudflarestorage.com' });
   assert.throws(() => parser('<html><div id="app" data-page="not-json"></div></html>'), /DATA_PAGE_JSON_INVALID/);
   assert.throws(() => parser(dataPageResponse(media, { has_source: false })), /MEDIA_NOT_READY/);
   assert.throws(() => parser(dataPageResponse(media.replace('bucket.r2.cloudflarestorage.com', 'untrusted.example'))), /MEDIA_URL_INVALID/);
   assert.throws(() => parser(dataPageResponse(`${media}&ftv_exp=1&ftv_sig=wrong-domain-signature`)), /MIXED_SIGNATURES/);
+});
+
+test('71Stream data-page parser accepts only the trusted multi-quality HLS master URL and MIME', () => {
+  const { plugin } = loadPlugin();
+  const parser = plugin.__test.extract71StreamMediaFromHtml;
+  const playlist = 'https://cdnvid.dramalvr.com/hls/season-one/episode-one/playlist.m3u8?asset=fixture';
+  const parsed = parser(dataPageResponse(playlist, {
+    mime: 'application/vnd.apple.mpegurl',
+    downloadAccessUrl: 'https://cdnvid.dramalvr.com/hls/other/download.m3u8',
+  }));
+  assert.deepEqual({ ...parsed }, { url: playlist, type: 'hls', host: 'cdnvid.dramalvr.com' });
+  assert.throws(() => parser(dataPageResponse(playlist.replace('cdnvid.dramalvr.com', 'attacker.example'), {
+    mime: 'application/vnd.apple.mpegurl',
+  })), /MEDIA_URL_INVALID/);
+  assert.throws(() => parser(dataPageResponse(playlist.replace('/hls/', '/other/'), {
+    mime: 'application/vnd.apple.mpegurl',
+  })), /MEDIA_URL_INVALID/);
+  assert.throws(() => parser(dataPageResponse(playlist.replace('https://', 'http://'), {
+    mime: 'application/vnd.apple.mpegurl',
+  })), /MEDIA_URL_INVALID/);
+  assert.throws(() => parser(dataPageResponse(playlist, { mime: 'video/mp4' })), /MEDIA_URL_INVALID/);
+  assert.throws(() => parser(dataPageResponse(playlist, {
+    mime: 'application/vnd.apple.mpegurl', status: 'processing',
+  })), /MEDIA_NOT_READY/);
+});
+
+test('71Stream HLS forwards one original master to central verification and preserves adaptive quality headers', async () => {
+  const id = '5tv:movie:home-alone-1990';
+  const page = 'https://5tv.rest/movie/home-alone-1990/';
+  const embed = 'https://71stream.one/embed/PD4AEWZuud';
+  const signedEmbed = `${embed}?ftv_exp=4102444800&ftv_sig=short-lived-hls-fixture`;
+  const playlist = 'https://cdnvid.dramalvr.com/hls/story-untold/s01e01/playlist.m3u8';
+  const html = dataPageResponse(playlist, {
+    mime: 'application/vnd.apple.mpegurl',
+    downloadAccessUrl: 'https://cdnvid.dramalvr.com/hls/story-untold/download.m3u8',
+  });
+  const extractorCalls = [];
+  const playbackHeaders = { 'User-Agent': 'fixture-agent', Referer: 'https://71stream.one/' };
+  const { plugin, calls, diagnostics } = loadPlugin({ [page]: fixture('movie.html') }, {
+    async fetch(url, options = {}) {
+      calls.push({ url, options });
+      if (options.method === 'POST') return htmlResponse(JSON.stringify({ success: true, data: { url: signedEmbed } }), url);
+      if (url === signedEmbed) return htmlResponse(html, url);
+      if (url === page) return htmlResponse(fixture('movie.html'), url);
+      throw new Error('unexpected HLS test request');
+    },
+    async __yume_extract_v1(raw) {
+      extractorCalls.push(JSON.parse(raw));
+      return JSON.stringify({ streams: [
+        { url: playlist, type: 'hls', quality: 'Auto', headers: playbackHeaders },
+        { url: 'https://cdnvid.dramalvr.com/hls/story-untold/s01e01/1080.m3u8', type: 'hls', quality: '1080p', headers: playbackHeaders },
+        { url: 'https://cdnvid.dramalvr.com/hls/story-untold/s01e01/720.m3u8', type: 'hls', quality: '720p', headers: playbackHeaders },
+        { url: 'https://cdnvid.dramalvr.com/hls/story-untold/s01e01/480.m3u8', type: 'hls', quality: '480p', headers: playbackHeaders },
+        { url: 'https://cdnvid.dramalvr.com/hls/story-untold/s01e01/360.m3u8', type: 'hls', quality: '360p', headers: playbackHeaders },
+      ] });
+    },
+  });
+  const listed = await plugin.getStreams({ id });
+  const option = listed.options.map(row => JSON.parse(row.token)).find(row => row.url === embed);
+  const result = await plugin.resolveStreamOption({ id, token: JSON.stringify(option) });
+  assert.equal(extractorCalls.length, 1, 'one master playlist request enters central verification');
+  assert.equal(extractorCalls[0].url, playlist, 'props.url is passed through unchanged, not downloadAccessUrl');
+  assert.equal(extractorCalls[0].scopeId, '5tv');
+  assert.equal(extractorCalls[0].referrer, 'https://71stream.one/');
+  assert.equal(extractorCalls[0].headers.Referer, 'https://71stream.one/');
+  assert.equal(extractorCalls[0].headers.Origin, undefined, 'browser CORS Origin is not assumed necessary for native playback');
+  assert.equal(result.streams.length, 5, 'the plugin only forwards central-engine master and verified renditions');
+  assert.equal(result.streams.filter(row => row.url === playlist).length, 1);
+  assert.equal(result.streams.find(row => row.url === playlist).type, 'hls');
+  assert.deepEqual(Array.from(result.streams, row => row.quality), ['Auto', '1080p', '720p', '480p', '360p']);
+  assert.ok(result.streams.every(row => row.type === 'hls' && row.headers.Referer === 'https://71stream.one/'));
+  assert.ok(!JSON.stringify(diagnostics).includes('short-lived-hls-fixture'));
+  assert.ok(!JSON.stringify(diagnostics).includes('playlist.m3u8'));
+  assert.equal(calls.filter(call => call.options.method === 'POST').length, 1);
 });
 
 test('71Stream stops safely on an embed 403 or invalid data-page without calling the central verifier', async () => {

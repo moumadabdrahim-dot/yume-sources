@@ -38,6 +38,15 @@ function htmlResponse(body, url, status = 200) {
   return { ok: status >= 200 && status < 300, status, url, async text() { return body; } };
 }
 
+function dataPageResponse(mediaUrl, props = {}) {
+  const data = JSON.stringify({
+    component: 'Video/Embed',
+    props: { url: mediaUrl, title: 'Fixture', mime: 'video/mp4', has_source: true, status: 'ready', ...props },
+  });
+  const encoded = data.replaceAll('&', '&amp;').replaceAll('"', '&quot;').replaceAll('<', '&lt;').replaceAll('>', '&gt;');
+  return `<html><div id="app" data-page="${encoded}"></div></html>`;
+}
+
 function loadPlugin(routes = {}, extra = {}) {
   const calls = [];
   const diagnostics = [];
@@ -63,8 +72,8 @@ function loadPlugin(routes = {}, extra = {}) {
 test('manifest declares an isolated API v2 release candidate with stable catalogs', () => {
   const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
   assert.equal(manifest.apiVersion, 2);
-  assert.equal(manifest.version, '0.2.0-rc.6');
-  assert.equal(manifest.scrapers[0].version, '0.2.0-rc.6');
+  assert.equal(manifest.version, '0.2.0-rc.7');
+  assert.equal(manifest.scrapers[0].version, '0.2.0-rc.7');
   assert.equal(manifest.scrapers.length, 1);
   const source = manifest.scrapers[0];
   assert.equal(source.id, '5tv');
@@ -281,11 +290,12 @@ test('resolver sends only the selected option to the central extractor and prese
   assert.equal(result.streams[0].headers.Referer, 'https://71stream.one/');
 });
 
-test('selected 71Stream requests a fresh signed embed URL and forwards it to the central extractor', async () => {
+test('selected 71Stream fetches the signed embed and forwards the original data-page MP4 to the central extractor', async () => {
   const id = '5tv:movie:home-alone-1990';
   const page = 'https://5tv.rest/movie/home-alone-1990/';
   const embed = 'https://71stream.one/embed/PD4AEWZuud';
   const signed = `${embed}?ftv_exp=4102444800&ftv_sig=short-lived-test-signature`;
+  const originalMp4 = 'https://bucket.r2.cloudflarestorage.com/video.mp4?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Content-Sha256=UNSIGNED-PAYLOAD&X-Amz-Credential=fixture&X-Amz-Date=20261126T230000Z&X-Amz-Expires=10800&X-Amz-Signature=fixture&X-Amz-SignedHeaders=host';
   const routes = { [page]: fixture('movie.html') };
   const extractorCalls = [];
   const { plugin, calls } = loadPlugin(routes, {
@@ -297,6 +307,7 @@ test('selected 71Stream requests a fresh signed embed URL and forwards it to the
         assert.equal(options.headers.Referer, page);
         return htmlResponse(JSON.stringify({ success: true, data: { url: signed } }), url);
       }
+      if (url === signed) return htmlResponse(dataPageResponse(originalMp4), url);
       const route = routes[url];
       if (!route) throw new Error(`unexpected route ${url}`);
       return htmlResponse(route, url);
@@ -318,10 +329,94 @@ test('selected 71Stream requests a fresh signed embed URL and forwards it to the
     ['action', 'ftv_71_access_url'], ['object_id', '110058'], ['server_id', '542395'], ['server_type', 'watch'],
   ]);
   assert.equal(extractorCalls.length, 1);
-  assert.equal(extractorCalls[0].url, signed);
+  assert.equal(extractorCalls[0].url, originalMp4);
   assert.equal(extractorCalls[0].scopeId, '5tv');
   assert.equal(result.streams[0].url, 'https://cdn.example/video.mp4');
   assert.ok(!JSON.stringify(options).includes('ftv_sig='), 'the short-lived signature must not be stored in the option token');
+});
+
+test('71Stream parses the original data-page MP4 and sends it unchanged to the central verifier', async () => {
+  const id = '5tv:movie:home-alone-1990';
+  const page = 'https://5tv.rest/movie/home-alone-1990/';
+  const embed = 'https://71stream.one/embed/PD4AEWZuud';
+  const signedEmbed = `${embed}?ftv_exp=4102444800&ftv_sig=short-lived-fixture`;
+  const originalMp4 = 'https://1234abcd.r2.cloudflarestorage.com/object/video.mp4?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Content-Sha256=UNSIGNED-PAYLOAD&X-Amz-Credential=fake%2Fscope&X-Amz-Date=20261126T230000Z&X-Amz-Expires=10800&X-Amz-Signature=fake-signature&X-Amz-SignedHeaders=host';
+  const html = dataPageResponse(originalMp4, { downloadAccessUrl: 'https://71stream.one/download/file?ftv_exp=1&ftv_sig=not-media' });
+  const routes = { [page]: fixture('movie.html') };
+  const extractorCalls = [];
+  const { plugin, calls, diagnostics } = loadPlugin(routes, {
+    async fetch(url, options = {}) {
+      calls.push({ url, options });
+      if (options.method === 'POST') return htmlResponse(JSON.stringify({ success: true, data: { url: signedEmbed } }), url);
+      if (url === signedEmbed) return htmlResponse(html, url);
+      const body = routes[url];
+      if (body) return htmlResponse(body, url);
+      throw new Error('unexpected test request');
+    },
+    async __yume_extract_v1(raw) {
+      extractorCalls.push(JSON.parse(raw));
+      return JSON.stringify({ streams: [{ url: originalMp4, type: 'mp4' }] });
+    },
+  });
+
+  const listed = await plugin.getStreams({ id });
+  const option = listed.options.map(row => JSON.parse(row.token)).find(row => row.url === embed);
+  const resolved = await plugin.resolveStreamOption({ id, token: JSON.stringify(option) });
+  const embedCall = calls.find(call => call.url === signedEmbed);
+  assert.equal(embedCall.options.timeoutMs, 15000);
+  assert.equal(embedCall.options.headers.Referer, page);
+  assert.equal(extractorCalls.length, 1);
+  assert.equal(extractorCalls[0].url, originalMp4, 'props.url must retain every original X-Amz byte');
+  assert.equal(extractorCalls[0].scopeId, '5tv');
+  assert.equal(extractorCalls[0].referrer, page);
+  assert.equal(extractorCalls[0].headers.Referer, page);
+  assert.equal(extractorCalls[0].perAttemptTimeoutMs, 6000, 'the ordinary central verification budget remains enabled');
+  assert.ok(!extractorCalls[0].url.includes('ftv_sig'));
+  assert.ok(extractorCalls[0].url.includes('X-Amz-Signature=fake-signature'));
+  assert.equal(resolved.streams[0].url, originalMp4);
+  assert.equal(resolved.streams[0].type, 'mp4');
+  assert.ok(!JSON.stringify(diagnostics).includes('short-lived-fixture'));
+  assert.ok(!JSON.stringify(diagnostics).includes('fake-signature'));
+  assert.ok(!JSON.stringify(diagnostics).includes('X-Amz-'));
+  assert.ok(!JSON.stringify(diagnostics).includes('ftv_sig='));
+});
+
+test('71Stream data-page parser decodes attributes and rejects malformed, unavailable, or untrusted media', () => {
+  const { plugin } = loadPlugin();
+  const parser = plugin.__test.extract71StreamMp4FromHtml;
+  const media = 'https://bucket.r2.cloudflarestorage.com/video.mp4?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Content-Sha256=UNSIGNED-PAYLOAD&X-Amz-Credential=fake&X-Amz-Date=20261126T230000Z&X-Amz-Expires=10800&X-Amz-Signature=fake&X-Amz-SignedHeaders=host';
+  assert.equal(parser(dataPageResponse(media)).url, media);
+  assert.throws(() => parser('<html><div id="app" data-page="not-json"></div></html>'), /DATA_PAGE_JSON_INVALID/);
+  assert.throws(() => parser(dataPageResponse(media, { has_source: false })), /MEDIA_NOT_READY/);
+  assert.throws(() => parser(dataPageResponse(media.replace('bucket.r2.cloudflarestorage.com', 'untrusted.example'))), /MEDIA_URL_INVALID/);
+  assert.throws(() => parser(dataPageResponse(`${media}&ftv_exp=1&ftv_sig=wrong-domain-signature`)), /MIXED_SIGNATURES/);
+});
+
+test('71Stream stops safely on an embed 403 or invalid data-page without calling the central verifier', async () => {
+  const id = '5tv:movie:home-alone-1990';
+  const page = 'https://5tv.rest/movie/home-alone-1990/';
+  const embed = 'https://71stream.one/embed/PD4AEWZuud';
+  const signedEmbed = `${embed}?ftv_exp=4102444800&ftv_sig=hidden-fixture`;
+  const token = JSON.stringify({ v: 1, id, url: embed, page, ordinal: 0, kind: 'server', objectId: 1, serverId: 2 });
+
+  for (const scenario of [
+    { name: 'HTTP 403', status: 403, body: '<html>denied</html>', failure: /5TV_71STREAM_EMBED_HTTP_403/ },
+    { name: 'invalid page', status: 200, body: '<html><div id="app" data-page="bad-json"></div></html>', failure: /5TV_71STREAM_DATA_PAGE_JSON_INVALID/ },
+    { name: 'no source', status: 200, body: dataPageResponse('https://bucket.r2.cloudflarestorage.com/video.mp4?X-Amz-Algorithm=A&X-Amz-Content-Sha256=B&X-Amz-Credential=C&X-Amz-Date=D&X-Amz-Expires=1&X-Amz-Signature=E&X-Amz-SignedHeaders=host', { has_source: false }), failure: /5TV_71STREAM_MEDIA_NOT_READY/ },
+  ]) {
+    let extractorCalled = false;
+    const { plugin, diagnostics } = loadPlugin({}, {
+      async fetch(url, options = {}) {
+        if (options.method === 'POST') return htmlResponse(JSON.stringify({ success: true, data: { url: signedEmbed } }), url);
+        if (url === signedEmbed) return htmlResponse(scenario.body, url, scenario.status);
+        throw new Error('unexpected test request');
+      },
+      async __yume_extract_v1() { extractorCalled = true; return JSON.stringify({ streams: [] }); },
+    });
+    await assert.rejects(() => plugin.resolveStreamOption({ id, token }), scenario.failure, scenario.name);
+    assert.equal(extractorCalled, false, `${scenario.name} must not bypass or invoke central extraction`);
+    assert.ok(!JSON.stringify(diagnostics).includes('hidden-fixture'));
+  }
 });
 
 test('selected Ultra4Vid uses its page server ID and validates the signed host and path', async () => {
@@ -350,6 +445,7 @@ test('selected Ultra4Vid uses its page server ID and validates the signed host a
   assert.equal(params.get('object_id'), '901234');
   assert.equal(params.get('server_id'), '987654');
   assert.equal(extractorCalls[0].url, signed);
+  assert.equal(calls.some(call => call.url === signed), false, 'Ultra4Vid must retain its original no-embed-fetch path');
   assert.throws(() => plugin.__test.signedAccessUrl(embed, 'https://evil.example/embed/7SmMlbb4jjlgbPk?ftv_exp=4102444800&ftv_sig=x', 1), /HOST_OR_PATH_MISMATCH/);
   assert.throws(() => plugin.__test.signedAccessUrl(embed, 'https://ult4vid.one/embed/other?ftv_exp=4102444800&ftv_sig=x', 1), /HOST_OR_PATH_MISMATCH/);
 });
@@ -398,6 +494,7 @@ test('stale rc.4 watch token refreshes metadata once and matches the current lin
   const page = 'https://5tv.rest/movie/home-alone-1990/';
   const embed = 'https://71stream.one/embed/PD4AEWZuud';
   const signed = `${embed}?ftv_exp=4102444800&ftv_sig=private-short-lived-value`;
+  const originalMp4 = 'https://bucket.r2.cloudflarestorage.com/video.mp4?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Content-Sha256=UNSIGNED-PAYLOAD&X-Amz-Credential=fixture&X-Amz-Date=20261126T230000Z&X-Amz-Expires=10800&X-Amz-Signature=fixture&X-Amz-SignedHeaders=host';
   const token = { v: 1, id, url: embed, page, ordinal: 0, name: '71Stream', kind: 'server' };
   const calls = [];
   const diagnostics = [];
@@ -405,12 +502,13 @@ test('stale rc.4 watch token refreshes metadata once and matches the current lin
     async fetch(url, options = {}) {
       calls.push({ url, options });
       if (options.method === 'POST') return htmlResponse(JSON.stringify({ success: true, data: { url: signed } }), url);
+      if (url === signed) return htmlResponse(dataPageResponse(originalMp4), url);
       if (url === page) return htmlResponse(fixture('movie.html'), url);
       throw new Error(`unexpected route ${url}`);
     },
     __yume_diagnostic(value) { diagnostics.push(JSON.parse(value)); },
     async __yume_extract_v1(raw) {
-      assert.equal(JSON.parse(raw).url, signed);
+      assert.equal(JSON.parse(raw).url, originalMp4);
       return JSON.stringify({ streams: [{ url: 'https://cdn.example/file.mp4', type: 'mp4' }] });
     },
   });
@@ -476,9 +574,15 @@ test('extractor diagnostics report safe HTTP, candidate, accepted, and rejection
   const id = '5tv:movie:home-alone-1990';
   const page = 'https://5tv.rest/movie/home-alone-1990/';
   const embed = 'https://71stream.one/embed/x';
+  const signed = `${embed}?ftv_exp=4102444800&ftv_sig=hidden`;
+  const originalMp4 = 'https://bucket.r2.cloudflarestorage.com/video.mp4?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Content-Sha256=UNSIGNED-PAYLOAD&X-Amz-Credential=fixture&X-Amz-Date=20261126T230000Z&X-Amz-Expires=10800&X-Amz-Signature=fixture&X-Amz-SignedHeaders=host';
   const token = JSON.stringify({ v: 1, id, url: embed, page, ordinal: 0, name: '71Stream', kind: 'server', objectId: 1, serverId: 2 });
   const { plugin, diagnostics } = loadPlugin({}, {
-    async fetch(url) { return htmlResponse(JSON.stringify({ success: true, data: { url: `${embed}?ftv_exp=4102444800&ftv_sig=hidden` } }), url); },
+    async fetch(url, options = {}) {
+      if (options.method === 'POST') return htmlResponse(JSON.stringify({ success: true, data: { url: signed } }), url);
+      if (url === signed) return htmlResponse(dataPageResponse(originalMp4), url);
+      throw new Error('unexpected test request');
+    },
     async __yume_extract_v1() {
       return JSON.stringify({ streams: [], diagnostics: [
         { stage: 'PARSE', outcome: 'CANDIDATES', candidateCount: 2 },

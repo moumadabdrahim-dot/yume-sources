@@ -2,7 +2,7 @@
   "use strict";
 
   var PLUGIN_ID = "5tv";
-  var PLUGIN_VERSION = "0.2.0-rc.6";
+  var PLUGIN_VERSION = "0.2.0-rc.7";
   var BASE = "https://5tv.rest";
   var USER_AGENT = "Mozilla/5.0 (Linux; Android 16) AppleWebKit/537.36 Chrome/131 Mobile Safari/537.36";
   var TIMEOUT_MS = 15000;
@@ -532,6 +532,75 @@
     diagnostic("option_refresh_result", { attemptId: attemptId, host: hostFromUrl(current.url), optionKind: current.kind, sourceCount: 1, metadataPresent: current.kind === "server" && positiveInt(current.objectId) != null && positiveInt(current.serverId) != null, httpStatus: page.httpStatus });
     return current;
   }
+  function decodeHtmlAttributeEntities(input) {
+    return String(input || '').replace(/&(?:#(x[0-9a-f]+|[0-9]+)|([a-z]+));/gi,
+      function (raw, numeric, named) {
+        if (numeric) {
+          var n = numeric.charAt(0).toLowerCase() === 'x'
+            ? parseInt(numeric.slice(1), 16) : parseInt(numeric, 10);
+          if (!isFinite(n) || n < 0 || n > 0x10ffff || (n >= 0xd800 && n <= 0xdfff)) return raw;
+          // Avoid reliance on String.fromCodePoint in embedded runtimes.
+          if (n <= 0xffff) return String.fromCharCode(n);
+          n -= 0x10000;
+          return String.fromCharCode(0xd800 + (n >> 10), 0xdc00 + (n & 1023));
+        }
+        var map = { amp: '&', quot: '"', apos: "'", lt: '<', gt: '>', nbsp: '\u00a0' };
+        return Object.prototype.hasOwnProperty.call(map, String(named).toLowerCase())
+          ? map[String(named).toLowerCase()] : raw;
+      });
+  }
+
+  function extract71StreamMp4FromHtml(htmlText) {
+    if (typeof htmlText !== 'string' || !htmlText || htmlText.length > 2000000) {
+      throw new Error('71STREAM_HTML_INVALID');
+    }
+    // Limit matching to the opening tag of the actual Inertia app element.
+    var tag = /<(?:div|main|section)\b(?=[^>]{0,40000}\bid\s*=\s*(["'])app\1)[^>]{0,40000}>/i.exec(htmlText);
+    if (!tag) throw new Error('71STREAM_APP_ELEMENT_MISSING');
+    var attr = /\bdata-page\s*=\s*(["'])([\s\S]*?)\1/i.exec(tag[0]);
+    if (!attr) throw new Error('71STREAM_DATA_PAGE_MISSING');
+
+    var data;
+    try {
+      data = JSON.parse(decodeHtmlAttributeEntities(attr[2]));
+    } catch (_) { throw new Error('71STREAM_DATA_PAGE_JSON_INVALID'); }
+    if (!data || data.component !== 'Video/Embed' || !data.props || typeof data.props !== 'object') {
+      throw new Error('71STREAM_DATA_PAGE_SCHEMA_MISMATCH');
+    }
+    var p = data.props;
+    if (p.has_source !== true || p.status !== 'ready' || p.mime !== 'video/mp4') {
+      throw new Error('71STREAM_MEDIA_NOT_READY');
+    }
+    var url = p.url;
+    if (typeof url !== 'string' || url.length > 12000 || !url || /[\s\u0000-\u001f]/.test(url)) {
+      throw new Error('71STREAM_MEDIA_URL_INVALID');
+    }
+    var parts = /^https:\/\/([^/?#]+)(\/[^?#]+)\?([^#]+)$/i.exec(url);
+    if (!parts || !/^(?:[a-z0-9-]+\.)*r2\.cloudflarestorage\.com$/i.test(parts[1]) ||
+        !/\.mp4$/i.test(parts[2]) || /&(?:amp|quot|#(?:x26|38));/i.test(url)) {
+      throw new Error('71STREAM_MEDIA_URL_INVALID');
+    }
+    var values = Object.create(null);
+    parts[3].split('&').forEach(function (piece) {
+      var eq = piece.indexOf('=');
+      if (eq === -1) return;
+      var k = piece.slice(0, eq);
+      if (!values[k]) values[k] = [];
+      values[k].push(piece.slice(eq + 1));
+    });
+    var required = ['X-Amz-Algorithm', 'X-Amz-Content-Sha256', 'X-Amz-Credential',
+      'X-Amz-Date', 'X-Amz-Expires', 'X-Amz-Signature', 'X-Amz-SignedHeaders'];
+    for (var i = 0; i < required.length; i++) {
+      if (!values[required[i]] || values[required[i]].length !== 1 || !values[required[i]][0]) {
+        throw new Error('71STREAM_MEDIA_SIGNATURE_INVALID');
+      }
+    }
+    if (values.ftv_exp || values.ftv_sig) throw new Error('71STREAM_MIXED_SIGNATURES');
+
+    // Return EXACT bytes of props.url; never reserialize, decode, append or rewrite.
+    return { url: url, type: 'mp4', host: parts[1].toLowerCase() };
+  }
+
   function mapExtracted(payload, title) {
     var rows = payload && Array.isArray(payload.streams) ? payload.streams : [];
     return rows.map(function (row) {
@@ -553,9 +622,34 @@
       var playbackUrl = token.kind === "server" && signedWatchHost(token.url)
         ? await requestSignedAccessUrl(token, attemptId)
         : token.url;
-      diagnostic("extractor_start", { attemptId: attemptId, host: hostFromUrl(playbackUrl), optionKind: token.kind || "unknown" });
+      // Special-case ONLY signed 71Stream watch embeds. Do not modify Ultra4Vid.
+      // HTML data-page contains the original R2 MP4 under props.url.
+      var extractionUrl = playbackUrl;
+      if (token.kind === "server" && hostFromUrl(playbackUrl) === "71stream.one") {
+        var embedResponse;
+        try {
+          embedResponse = await fetch(playbackUrl, {
+            timeoutMs: TIMEOUT_MS,
+            headers: { "User-Agent": USER_AGENT, "Accept": "text/html,application/xhtml+xml", "Referer": token.page }
+          });
+        } catch (_) { fail("5TV_71STREAM_EMBED_NETWORK_ERROR"); }
+        if (!embedResponse.ok) fail("5TV_71STREAM_EMBED_HTTP_" + Number(embedResponse.status || 0));
+        var embedHtml = await embedResponse.text();
+        // No signed URL, query, or HTML payload is logged.
+        var media;
+        try { media = extract71StreamMp4FromHtml(embedHtml); }
+        catch (error) {
+          var parserFailure = error && /^71STREAM_[A-Z0-9_]{1,48}$/.test(String(error.message || ""))
+            ? String(error.message) : "71STREAM_PARSE_FAILED";
+          diagnostic("extractor_failed", { attemptId: attemptId, host: hostFromUrl(playbackUrl), optionKind: token.kind, failureCode: "5TV_" + parserFailure });
+          fail("5TV_" + parserFailure);
+        }
+        extractionUrl = media.url;
+      }
+      diagnostic("extractor_start", { attemptId: attemptId, host: hostFromUrl(extractionUrl), optionKind: token.kind || "unknown" });
       var raw;
-      try { raw = await root.__yume_extract_v1(JSON.stringify({ scopeId: PLUGIN_ID, url: playbackUrl, referrer: token.page, headers: { "User-Agent": USER_AGENT, "Referer": token.page }, timeoutMs: 20000, perAttemptTimeoutMs: 6000 })); }
+      // Central engine still verifies the candidate. Never bypass verification.
+      try { raw = await root.__yume_extract_v1(JSON.stringify({ scopeId: PLUGIN_ID, url: extractionUrl, referrer: token.page, headers: { "User-Agent": USER_AGENT, "Referer": token.page }, timeoutMs: 20000, perAttemptTimeoutMs: 6000 })); }
       catch (_) {
         diagnostic("extractor_failed", { attemptId: attemptId, host: hostFromUrl(playbackUrl), optionKind: token.kind || "unknown", failureCode: "5TV_EXTRACTION_FAILED" });
         fail("5TV_EXTRACTION_FAILED");
@@ -596,5 +690,5 @@
 
   var plugin = { getHome: getHome, getCatalog: getCatalog, getCatalogFilters: getCatalogFilters, search: search, getDetails: getDetails, getStreams: getStreams, resolveStreamOption: resolveStreamOption };
   if (root && root.module) root.module.exports = plugin;
-  if (root && root.__YUME_5TV_TESTING__ && root.module) root.module.exports.__test = { decodeEntities: decodeEntities, normalizeDigits: normalizeDigits, pathParts: pathParts, idFor: idFor, parseId: parseId, posterCard: posterCard, catalogItems: catalogItems, parseDetailsPage: parseDetailsPage, parseSeasonPanels: parseSeasonPanels, serverOptions: serverOptions, parseToken: parseToken, mapExtracted: mapExtracted, signedAccessUrl: signedAccessUrl, requestSignedAccessUrl: requestSignedAccessUrl, refreshSignedServerOption: refreshSignedServerOption, hasNextPage: hasNextPage, isVerificationPage: isVerificationPage, searchFormOptions: searchFormOptions, categoryOptions: categoryOptions, discoverSearchPath: discoverSearchPath, homeCatalogIds: HOME_CATALOG_IDS.slice() };
+  if (root && root.__YUME_5TV_TESTING__ && root.module) root.module.exports.__test = { decodeEntities: decodeEntities, decodeHtmlAttributeEntities: decodeHtmlAttributeEntities, extract71StreamMp4FromHtml: extract71StreamMp4FromHtml, normalizeDigits: normalizeDigits, pathParts: pathParts, idFor: idFor, parseId: parseId, posterCard: posterCard, catalogItems: catalogItems, parseDetailsPage: parseDetailsPage, parseSeasonPanels: parseSeasonPanels, serverOptions: serverOptions, parseToken: parseToken, mapExtracted: mapExtracted, signedAccessUrl: signedAccessUrl, requestSignedAccessUrl: requestSignedAccessUrl, refreshSignedServerOption: refreshSignedServerOption, hasNextPage: hasNextPage, isVerificationPage: isVerificationPage, searchFormOptions: searchFormOptions, categoryOptions: categoryOptions, discoverSearchPath: discoverSearchPath, homeCatalogIds: HOME_CATALOG_IDS.slice() };
 })(typeof globalThis !== "undefined" ? globalThis : this);

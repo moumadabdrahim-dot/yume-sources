@@ -2,7 +2,7 @@
   "use strict";
 
   var PLUGIN_ID = "5tv";
-  var PLUGIN_VERSION = "0.2.0-rc.7";
+  var PLUGIN_VERSION = "0.2.0-rc.8";
   var BASE = "https://5tv.rest";
   var USER_AGENT = "Mozilla/5.0 (Linux; Android 16) AppleWebKit/537.36 Chrome/131 Mobile Safari/537.36";
   var TIMEOUT_MS = 15000;
@@ -449,21 +449,19 @@
       var token = JSON.stringify(tokenValue);
       out.push({ pluginId: PLUGIN_ID, nativeId: nativeId, token: token, title: label, name: bounded(name, 100) || label, quality: bounded(quality, 40) || undefined, provider: "5TV" });
     }
-    var iframe = firstMatchRaw(html, /<iframe\b[^>]*class=["'][^"']*\bftv-player-iframe\b[^"']*["'][^>]*>/i);
-    if (iframe) addOption(attr(iframe, "src"), "المشغل الرئيسي", "", "player");
     var re = /<button\b[^>]*class=["'][^"']*\bftv-watch-tab\b[^"']*["'][^>]*>[\s\S]*?<\/button>/gi, blocks = (html || "").match(re) || [];
+    var iframe = firstMatchRaw(html, /<iframe\b[^>]*class=["'][^"']*\bftv-player-iframe\b[^"']*["'][^>]*>/i);
+    var iframeUrl = iframe ? absoluteUrl(attr(iframe, "src")) : "";
+    var iframeIsWatchOption = iframeUrl && blocks.some(function (block) {
+      var button = firstMatchRaw(block, /<button\b[^>]*>/i);
+      return absoluteUrl(attr(button, "data-server-url")) === iframeUrl;
+    });
+    if (iframeUrl && !iframeIsWatchOption) addOption(iframeUrl, "المشغل الرئيسي", "", "player");
     blocks.forEach(function (block, index) {
       var name = firstMatch(block, /<strong\b[^>]*>([\s\S]*?)<\/strong>/i) || ("سيرفر " + (index + 1));
       var quality = firstMatch(block, /<small\b[^>]*>([\s\S]*?)<\/small>/i);
       var button = firstMatchRaw(block, /<button\b[^>]*>/i);
       addOption(attr(button, "data-server-url"), name, quality, "server", attr(button, "data-server-id"));
-    });
-    var downloads = allBlocks(html, "article", "ftv-download-server");
-    downloads.forEach(function (block, index) {
-      var link = firstMatchRaw(block, /<a\b[^>]*href\s*=\s*(["'])[\s\S]*?\1[^>]*>/i);
-      var name = firstMatch(block, /<strong\b[^>]*>([\s\S]*?)<\/strong>/i) || ("تنزيل " + (index + 1));
-      var quality = firstMatch(block, /<(?:small|span)\b[^>]*class=["'][^"']*(?:quality|size)[^"']*["'][^>]*>([\s\S]*?)<\/(?:small|span)>/i);
-      addOption(attr(link, "href"), name, quality, "download");
     });
     return out;
   }

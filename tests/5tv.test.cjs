@@ -72,8 +72,8 @@ function loadPlugin(routes = {}, extra = {}) {
 test('manifest declares an isolated API v2 release candidate with stable catalogs', () => {
   const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
   assert.equal(manifest.apiVersion, 2);
-  assert.equal(manifest.version, '0.2.0-rc.7');
-  assert.equal(manifest.scrapers[0].version, '0.2.0-rc.7');
+  assert.equal(manifest.version, '0.2.0-rc.8');
+  assert.equal(manifest.scrapers[0].version, '0.2.0-rc.8');
   assert.equal(manifest.scrapers.length, 1);
   const source = manifest.scrapers[0];
   assert.equal(source.id, '5tv');
@@ -240,35 +240,89 @@ test('stream options preserve source order, exact selected URL, and proven label
   assert.equal(second.serverId, 542396);
 });
 
-test('stream options include the main player and playable download choices without duplicates', () => {
+test('getStreams returns two ordered watch servers and excludes both download links', async () => {
   const id = '5tv:movie:sample';
   const page = 'https://5tv.rest/movie/sample/';
   const html = `
-    <iframe class="ftv-player-iframe" src="https://one.example/embed/a"></iframe>
-    <button class="ftv-watch-tab" data-server-url="https://one.example/embed/a"><strong>One</strong></button>
-    <button class="ftv-watch-tab" data-server-url="https://two.example/embed/b"><strong>Two</strong><small>720p</small></button>
+    <script>window.FTV_SERVER_FRONTEND = {"objectId":99};</script>
+    <button class="ftv-watch-tab" data-server-id="11" data-server-url="https://71stream.one/embed/a"><strong>One</strong><small>480p</small></button>
+    <button class="ftv-watch-tab" data-server-id="22" data-server-url="https://ult4vid.one/embed/b"><strong>Two</strong><small>720p</small></button>
     <article class="ftv-download-server"><strong>Download One</strong><a href="https://download.example/file/a"></a></article>
-    <article class="ftv-download-server"><strong>Duplicate</strong><a href="https://two.example/embed/b"></a></article>`;
-  const { plugin } = loadPlugin();
-  const options = plugin.__test.serverOptions(html, id, page);
-  assert.equal(options.length, 3);
-  assert.deepEqual(Array.from(options, option => JSON.parse(option.token).kind), ['player', 'server', 'download']);
-  assert.deepEqual(Array.from(options, option => JSON.parse(option.token).url), [
-    'https://one.example/embed/a', 'https://two.example/embed/b', 'https://download.example/file/a',
+    <article class="ftv-download-server"><strong>Download Two</strong><a href="https://download.example/file/b"></a></article>`;
+  const { plugin, diagnostics } = loadPlugin({ [page]: html });
+  const result = await plugin.getStreams({ id });
+  assert.equal(result.options.length, 2);
+  assert.deepEqual(Array.from(result.options, option => JSON.parse(option.token).kind), ['server', 'server']);
+  assert.deepEqual(Array.from(result.options, option => JSON.parse(option.token).url), [
+    'https://71stream.one/embed/a', 'https://ult4vid.one/embed/b',
   ]);
-  assert.equal(options[1].quality, '720p');
+  assert.deepEqual(Array.from(result.options, option => JSON.parse(option.token).serverId), [11, 22]);
+  assert.deepEqual(Array.from(result.options, option => JSON.parse(option.token).objectId), [99, 99]);
+  assert.deepEqual(Array.from(result.options, option => option.quality), ['480p', '720p']);
+  assert.ok(result.options.every(option => JSON.parse(option.token).kind !== 'download'));
+  const summary = diagnostics.find(row => row.stage === 'stream_options_result');
+  assert.equal(summary.watchOptionCount, 2);
+  assert.equal(summary.downloadOptionCount, 2);
+  assert.equal(summary.sourceCount, 2);
 });
 
-test('stream options reject the observed broken Send undef download without hiding valid Send links', () => {
+test('one watch server remains the only option when the page has several download links', async () => {
   const id = '5tv:movie:sample';
   const page = 'https://5tv.rest/movie/sample/';
   const html = `
-    <article class="ftv-download-server"><strong>Broken</strong><a href="https://send.now/undef"></a></article>
-    <article class="ftv-download-server"><strong>Valid</strong><a href="https://send.now/1AbCd"></a></article>`;
+    <button class="ftv-watch-tab" data-server-id="42" data-server-url="https://watch.example/embed/a"><strong>Watch</strong></button>
+    <article class="ftv-download-server"><a href="https://send.now/undef"></a></article>
+    <article class="ftv-download-server"><a href="https://send.now/1AbCd"></a></article>
+    <article class="ftv-download-server"><a href="https://download.example/file"></a></article>`;
+  const { plugin } = loadPlugin({ [page]: html });
+  const result = await plugin.getStreams({ id });
+  assert.equal(result.options.length, 1);
+  assert.equal(JSON.parse(result.options[0].token).url, 'https://watch.example/embed/a');
+  assert.equal(JSON.parse(result.options[0].token).kind, 'server');
+});
+
+test('download-only pages produce no playback options', async () => {
+  const id = '5tv:movie:sample';
+  const page = 'https://5tv.rest/movie/sample/';
+  const html = `
+    <article class="ftv-download-server"><a href="https://download.example/file/a"></a></article>
+    <article class="ftv-download-server"><a href="https://download.example/file/b"></a></article>`;
+  const { plugin, diagnostics } = loadPlugin({ [page]: html });
+  await assert.rejects(() => plugin.getStreams({ id }), /5TV_NO_STREAM_OPTIONS/);
+  const summary = diagnostics.find(row => row.stage === 'stream_options_result');
+  assert.equal(summary.sourceCount, 0);
+  assert.equal(summary.watchOptionCount, 0);
+  assert.equal(summary.downloadOptionCount, 2);
+});
+
+test('a duplicate main iframe never shadows its watch-tab identity or server metadata', () => {
+  const id = '5tv:movie:sample';
+  const page = 'https://5tv.rest/movie/sample/';
+  const html = `
+    <iframe class="ftv-player-iframe" src="https://71stream.one/embed/watch"></iframe>
+    <button class="ftv-watch-tab" data-server-id="542395" data-server-url="https://71stream.one/embed/watch"><strong>71Stream</strong></button>`;
   const { plugin } = loadPlugin();
   const options = plugin.__test.serverOptions(html, id, page);
   assert.equal(options.length, 1);
-  assert.equal(JSON.parse(options[0].token).url, 'https://send.now/1AbCd');
+  const token = JSON.parse(options[0].token);
+  assert.equal(token.kind, 'server');
+  assert.equal(token.serverId, 542395);
+  assert.equal(token.url, 'https://71stream.one/embed/watch');
+});
+
+test('an independent main player remains available once alongside ordered watch servers', () => {
+  const id = '5tv:movie:sample';
+  const page = 'https://5tv.rest/movie/sample/';
+  const html = `
+    <iframe class="ftv-player-iframe" src="https://main.example/embed/a"></iframe>
+    <button class="ftv-watch-tab" data-server-id="11" data-server-url="https://one.example/embed/a"><strong>One</strong></button>
+    <button class="ftv-watch-tab" data-server-id="22" data-server-url="https://two.example/embed/b"><strong>Two</strong></button>`;
+  const { plugin } = loadPlugin();
+  const options = plugin.__test.serverOptions(html, id, page);
+  assert.deepEqual(Array.from(options, option => JSON.parse(option.token).kind), ['player', 'server', 'server']);
+  assert.deepEqual(Array.from(options, option => JSON.parse(option.token).url), [
+    'https://main.example/embed/a', 'https://one.example/embed/a', 'https://two.example/embed/b',
+  ]);
 });
 
 test('resolver sends only the selected option to the central extractor and preserves media headers', async () => {
@@ -450,42 +504,20 @@ test('selected Ultra4Vid uses its page server ID and validates the signed host a
   assert.throws(() => plugin.__test.signedAccessUrl(embed, 'https://ult4vid.one/embed/other?ftv_exp=4102444800&ftv_sig=x', 1), /HOST_OR_PATH_MISMATCH/);
 });
 
-test('71Stream and Ultra4Vid download options never request a signed watch URL', async () => {
+test('download cards for 71Stream and Ultra4Vid never appear beside their watch options', async () => {
   const id = '5tv:movie:home-alone-1990';
   const page = 'https://5tv.rest/movie/home-alone-1990/';
   for (const host of ['71stream.one', 'ult4vid.one']) {
     const downloadUrl = `https://${host}/download/file.mp4`;
     const html = `${fixture('movie.html')}<article class="ftv-download-server"><strong>Download</strong><a href="${downloadUrl}"></a></article>`;
-    const extractorCalls = [];
-    const { plugin, calls } = loadPlugin({ [page]: html }, {
-      async __yume_extract_v1(raw) {
-        extractorCalls.push(JSON.parse(raw));
-        return JSON.stringify({ streams: [{ url: 'https://cdn.example/file.mp4', type: 'mp4' }] });
-      },
-    });
+    const { plugin } = loadPlugin({ [page]: html });
     const listed = await plugin.getStreams({ id });
-    const option = listed.options.find(row => JSON.parse(row.token).url === downloadUrl);
-    const token = JSON.parse(option.token);
-    assert.equal(token.kind, 'download');
-    await plugin.resolveStreamOption({ id, token: JSON.stringify(token) });
-    assert.equal(calls.filter(call => call.options.method === 'POST').length, 0, `${host} download must not call ftv_71_access_url`);
-    assert.equal(extractorCalls[0].url, downloadUrl, 'the original download URL must be passed unchanged');
-  }
-});
-
-test('unplayable 71Stream and Ultra4Vid download links are not reported as video sources', async () => {
-  const id = '5tv:movie:home-alone-1990';
-  const page = 'https://5tv.rest/movie/home-alone-1990/';
-  for (const host of ['71stream.one', 'ult4vid.one']) {
-    const downloadUrl = `https://${host}/download/file`;
-    const html = `${fixture('movie.html')}<article class="ftv-download-server"><strong>Download</strong><a href="${downloadUrl}"></a></article>`;
-    const { plugin, calls } = loadPlugin({ [page]: html }, {
-      async __yume_extract_v1() { return JSON.stringify({ streams: [] }); },
-    });
-    const listed = await plugin.getStreams({ id });
-    const option = listed.options.find(row => JSON.parse(row.token).url === downloadUrl);
-    await assert.rejects(() => plugin.resolveStreamOption({ id, token: option.token }), /5TV_NO_PLAYABLE_STREAM/);
-    assert.equal(calls.filter(call => call.options.method === 'POST').length, 0);
+    assert.equal(listed.options.length, 2);
+    assert.deepEqual(Array.from(listed.options, row => JSON.parse(row.token).url), [
+      'https://71stream.one/embed/PD4AEWZuud', 'https://ult4vid.one/embed/7SmMlbb4jjlgbPk',
+    ]);
+    assert.ok(listed.options.every(row => JSON.parse(row.token).kind === 'server'));
+    assert.ok(!listed.options.some(row => JSON.parse(row.token).url === downloadUrl));
   }
 });
 

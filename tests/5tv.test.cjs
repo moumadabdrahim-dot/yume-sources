@@ -72,8 +72,8 @@ function loadPlugin(routes = {}, extra = {}) {
 test('manifest declares an isolated API v2 release candidate with stable catalogs', () => {
   const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
   assert.equal(manifest.apiVersion, 2);
-  assert.equal(manifest.version, '0.2.0-rc.9');
-  assert.equal(manifest.scrapers[0].version, '0.2.0-rc.9');
+  assert.equal(manifest.version, '0.2.0-rc.10');
+  assert.equal(manifest.scrapers[0].version, '0.2.0-rc.10');
   assert.equal(manifest.scrapers.length, 1);
   const source = manifest.scrapers[0];
   assert.equal(source.id, '5tv');
@@ -342,6 +342,52 @@ test('resolver sends only the selected option to the central extractor and prese
   assert.equal(result.streams[0].type, 'hls');
   assert.equal(result.streams[0].quality, undefined);
   assert.equal(result.streams[0].headers.Referer, 'https://71stream.one/');
+});
+
+test('HGCloud watch links use the observed Audinifer player route and keep HLS in central verification', async () => {
+  const id = '5tv:episode:strange-junji-ito-episode-2';
+  const page = 'https://5tv.rest/episode/strange-junji-ito-episode-2/';
+  const watchUrl = 'https://hgcloud.to/e/mtja6nx2uvow';
+  const playerUrl = 'https://audinifer.com/e/mtja6nx2uvow';
+  const html = `
+    <button class="ftv-watch-tab" data-server-id="529620" data-server-url="${watchUrl}"><strong>HGCloud</strong></button>
+    <article class="ftv-download-server"><a href="https://hgcloud.to/mtja6nx2uvow">Download</a></article>`;
+  const engineRequests = [];
+  const { plugin, calls } = loadPlugin({ [page]: html }, {
+    async __yume_extract_v1(raw) {
+      const request = JSON.parse(raw);
+      engineRequests.push(request);
+      return JSON.stringify({ streams: [{
+        url: 'https://cdn.example/hls/variant.m3u8',
+        type: 'hls',
+        headers: { Referer: playerUrl },
+      }] });
+    },
+  });
+
+  assert.equal(plugin.__test.hgCloudPlayerUrl(watchUrl), playerUrl);
+  assert.equal(plugin.__test.hgCloudPlayerUrl('https://evil-hgcloud.to/e/mtja6nx2uvow'), '');
+  assert.equal(plugin.__test.hgCloudPlayerUrl('https://hgcloud.to/mtja6nx2uvow'), '');
+  assert.equal(plugin.__test.hgCloudPlayerUrl(`${watchUrl}?download=1`), '');
+
+  const listed = await plugin.getStreams({ id });
+  assert.equal(listed.options.length, 1);
+  const token = JSON.parse(listed.options[0].token);
+  assert.equal(token.kind, 'server');
+  assert.equal(token.url, watchUrl);
+  assert.equal(token.serverId, undefined, 'HGCloud does not use the 5TV signed-access endpoint');
+
+  const resolved = await plugin.resolveStreamOption({ id, token: JSON.stringify(token) });
+  assert.equal(calls.length, 1, 'only the 5TV episode page is fetched; no signed-access request is made');
+  assert.equal(engineRequests.length, 1);
+  assert.equal(engineRequests[0].scopeId, '5tv');
+  assert.equal(engineRequests[0].url, playerUrl);
+  assert.equal(engineRequests[0].referrer, 'https://audinifer.com/');
+  assert.equal(engineRequests[0].headers.Referer, 'https://audinifer.com/');
+  assert.equal(resolved.streams.length, 1);
+  assert.equal(resolved.streams[0].type, 'hls');
+  assert.equal(resolved.streams[0].url, 'https://cdn.example/hls/variant.m3u8');
+  assert.equal(resolved.streams[0].headers.Referer, playerUrl);
 });
 
 test('selected 71Stream fetches the signed embed and forwards the original data-page MP4 to the central extractor', async () => {

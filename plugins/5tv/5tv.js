@@ -2,7 +2,7 @@
   "use strict";
 
   var PLUGIN_ID = "5tv";
-  var PLUGIN_VERSION = "0.2.0-rc.9";
+  var PLUGIN_VERSION = "0.2.0-rc.10";
   var BASE = "https://5tv.rest";
   var USER_AGENT = "Mozilla/5.0 (Linux; Android 16) AppleWebKit/537.36 Chrome/131 Mobile Safari/537.36";
   var TIMEOUT_MS = 15000;
@@ -89,6 +89,11 @@
   function signedWatchHost(url) {
     var host = hostFromUrl(url);
     return host === "71stream.one" || host === "ult4vid.one" || host === "ultra4vid.cam";
+  }
+  function hgCloudPlayerUrl(url) {
+    if (hostFromUrl(url) !== "hgcloud.to") return "";
+    var match = /^https:\/\/hgcloud\.to\/e\/([a-z0-9_-]{1,128})\/?$/i.exec(text(url));
+    return match ? "https://audinifer.com/e/" + match[1] : "";
   }
   function frontendObjectId(html) {
     var match = /window\.FTV_SERVER_FRONTEND\s*=\s*(\{[^;\n]{1,8000}\})\s*;/i.exec(html || "");
@@ -645,6 +650,16 @@
       var extractionUrl = playbackUrl;
       var extractionReferrer = token.page;
       var extractionHeaders = { "User-Agent": USER_AGENT, "Referer": token.page };
+      if (token.kind === "server") {
+        var hgCloudUrl = hgCloudPlayerUrl(playbackUrl);
+        if (hgCloudUrl) {
+          // HGCloud's public /e/ page is a JavaScript loading shim; the observed player page
+          // serves a statically packed JWPlayer source that the central parser can verify.
+          extractionUrl = hgCloudUrl;
+          extractionReferrer = "https://audinifer.com/";
+          extractionHeaders.Referer = extractionReferrer;
+        }
+      }
       if (token.kind === "server" && hostFromUrl(playbackUrl) === "71stream.one") {
         var embedResponse;
         try {
@@ -715,5 +730,5 @@
 
   var plugin = { getHome: getHome, getCatalog: getCatalog, getCatalogFilters: getCatalogFilters, search: search, getDetails: getDetails, getStreams: getStreams, resolveStreamOption: resolveStreamOption };
   if (root && root.module) root.module.exports = plugin;
-  if (root && root.__YUME_5TV_TESTING__ && root.module) root.module.exports.__test = { decodeEntities: decodeEntities, decodeHtmlAttributeEntities: decodeHtmlAttributeEntities, extract71StreamMediaFromHtml: extract71StreamMediaFromHtml, normalizeDigits: normalizeDigits, pathParts: pathParts, idFor: idFor, parseId: parseId, posterCard: posterCard, catalogItems: catalogItems, parseDetailsPage: parseDetailsPage, parseSeasonPanels: parseSeasonPanels, serverOptions: serverOptions, parseToken: parseToken, mapExtracted: mapExtracted, signedAccessUrl: signedAccessUrl, requestSignedAccessUrl: requestSignedAccessUrl, refreshSignedServerOption: refreshSignedServerOption, hasNextPage: hasNextPage, isVerificationPage: isVerificationPage, searchFormOptions: searchFormOptions, categoryOptions: categoryOptions, discoverSearchPath: discoverSearchPath, homeCatalogIds: HOME_CATALOG_IDS.slice() };
+  if (root && root.__YUME_5TV_TESTING__ && root.module) root.module.exports.__test = { decodeEntities: decodeEntities, decodeHtmlAttributeEntities: decodeHtmlAttributeEntities, extract71StreamMediaFromHtml: extract71StreamMediaFromHtml, hgCloudPlayerUrl: hgCloudPlayerUrl, normalizeDigits: normalizeDigits, pathParts: pathParts, idFor: idFor, parseId: parseId, posterCard: posterCard, catalogItems: catalogItems, parseDetailsPage: parseDetailsPage, parseSeasonPanels: parseSeasonPanels, serverOptions: serverOptions, parseToken: parseToken, mapExtracted: mapExtracted, signedAccessUrl: signedAccessUrl, requestSignedAccessUrl: requestSignedAccessUrl, refreshSignedServerOption: refreshSignedServerOption, hasNextPage: hasNextPage, isVerificationPage: isVerificationPage, searchFormOptions: searchFormOptions, categoryOptions: categoryOptions, discoverSearchPath: discoverSearchPath, homeCatalogIds: HOME_CATALOG_IDS.slice() };
 })(typeof globalThis !== "undefined" ? globalThis : this);

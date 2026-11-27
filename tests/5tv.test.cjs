@@ -72,9 +72,9 @@ function loadPlugin(routes = {}, extra = {}) {
 test('manifest declares an isolated API v2 release candidate with stable catalogs', () => {
   const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
   assert.equal(manifest.apiVersion, 2);
-  assert.equal(manifest.version, '0.2.0-rc.11');
-  assert.equal(manifest.scrapers[0].version, '0.2.0-rc.11');
-  assert.match(script, /var PLUGIN_VERSION = "0\.2\.0-rc\.11";/);
+  assert.equal(manifest.version, '0.2.0-rc.12');
+  assert.equal(manifest.scrapers[0].version, '0.2.0-rc.12');
+  assert.match(script, /var PLUGIN_VERSION = "0\.2\.0-rc\.12";/);
   assert.equal(manifest.scrapers.length, 1);
   const source = manifest.scrapers[0];
   assert.equal(source.id, '5tv');
@@ -104,6 +104,12 @@ test('TMDB title cleanup extracts confident Latin series titles without changing
     ['مسلسل عربي S2: الحلقة 10', 'مسلسل عربي S2: الحلقة 10'],
   ];
   for (const [title, expected] of samples) assert.equal(clean(title, 'series'), expected);
+  const searchTitle = plugin.__test.searchTitleForTmdb;
+  assert.equal(searchTitle(samples[0][0], 'series'), samples[0][1]);
+  assert.equal(searchTitle(samples[1][0], 'series'), samples[1][1]);
+  assert.equal(searchTitle(samples[2][0], 'series'), samples[2][1]);
+  assert.equal(searchTitle(samples[3][0], 'series'), undefined);
+  assert.equal(searchTitle(samples[4][0], 'series'), undefined);
 
   const sourceItem = { pluginId: '5tv', nativeId: '5tv:series:the-legend', type: 'series', title: samples[0][0], year: 2022 };
   const snapshot = structuredClone(sourceItem);
@@ -127,23 +133,55 @@ test('TMDB movie title cleanup removes only a matching trusted trailing producti
   assert.equal(clean('Film 2021 Remastered', 'movie', 2021), 'Film 2021 Remastered');
   assert.equal(clean('The Batman 2022', 'series', 2022), 'The Batman 2022');
   assert.equal(clean('The Batman 2022', 'unknown', 2022), 'The Batman 2022');
+  const searchTitle = plugin.__test.searchTitleForTmdb;
+  assert.equal(searchTitle('The Batman 2022', 'movie', 2022), 'The Batman');
+  assert.equal(searchTitle('Inception 2010', 'movie', 2010), 'Inception');
+  assert.equal(searchTitle('Dune (2021)', 'movie', 2021), 'Dune');
+  assert.equal(searchTitle('Blade Runner 2049', 'movie', 2017), undefined);
+  assert.equal(searchTitle('Blade Runner 2049', 'movie', 2049), 'Blade Runner');
 });
 
-test('title normalization stays separate from catalog and details content fields', async () => {
+test('title normalization is emitted only as a separate searchTitle field', async () => {
   const { plugin } = loadPlugin({
-    'https://5tv.rest/movie/home-alone-1990/': fixture('movie.html'),
+    'https://5tv.rest/movie/home-alone-2022/': '<section class="ftv-content-hero"><h1 class="ftv-content-hero__title">Home Alone 2022</h1><div class="ftv-content-hero__year"><a>2022</a></div></section>',
   });
-  const cardHtml = '<article class="ftv-home-poster-card"><a class="ftv-home-poster-card__title" href="https://5tv.rest/movie/home-alone-1990/">Home Alone 1990</a></article>';
+  const cardHtml = '<article class="ftv-home-poster-card"><a class="ftv-home-poster-card__title" href="https://5tv.rest/movie/home-alone-2022/">Home Alone 2022</a><span class="ftv-poster-badge--year">2022</span></article>';
   const catalogItem = plugin.__test.posterCard(cardHtml);
-  const catalogSnapshot = { ...catalogItem };
-  assert.equal(plugin.__test.cleanTitleForTmdb(catalogItem.title, catalogItem.type, 1990), 'Home Alone 1990');
-  assert.deepEqual({ ...catalogItem }, catalogSnapshot);
+  assert.equal(catalogItem.title, 'Home Alone 2022');
+  assert.equal(catalogItem.searchTitle, 'Home Alone');
+  assert.equal(catalogItem.originalTitle, undefined);
 
-  const details = await plugin.getDetails({ id: '5tv:movie:home-alone-1990' });
-  const detailSnapshot = JSON.parse(JSON.stringify(details.item));
-  plugin.__test.cleanTitleForTmdb(details.item.title, details.item.type, details.item.year);
-  assert.deepEqual(JSON.parse(JSON.stringify(details.item)), detailSnapshot);
-  assert.equal(details.item.title, 'Home Alone 1990');
+  const details = await plugin.getDetails({ id: '5tv:movie:home-alone-2022' });
+  assert.equal(details.item.title, 'Home Alone 2022');
+  assert.equal(details.item.searchTitle, 'Home Alone');
+});
+
+test('clean search titles reach Home, Catalog, Search, and Details without changing display titles', async () => {
+  const seriesCard = '<article class="ftv-home-poster-card"><a class="ftv-home-poster-card__title" href="https://5tv.rest/series/legend/">أسطورة البحر الأزرق The Legend of the Blue Sea</a><img src="https://5tv.rest/legend.jpg"></article>';
+  const movieCard = '<article class="ftv-home-poster-card"><a class="ftv-home-poster-card__title" href="https://5tv.rest/movie/the-batman/">The Batman 2022</a><span class="ftv-poster-badge--year">2022</span><img src="https://5tv.rest/batman.jpg"></article>';
+  const detailPage = '<section class="ftv-content-hero"><h1 class="ftv-content-hero__title">The Batman 2022</h1><div class="ftv-content-hero__year"><a>2022</a></div></section>';
+  const routes = {};
+  for (const [id, type] of homeCatalogs) routes[`https://5tv.rest${catalogPaths[id]}`] = type === 'movie' ? movieCard : seriesCard;
+  routes['https://5tv.rest/search/?q=Legend'] = seriesCard;
+  routes['https://5tv.rest/movie/the-batman/'] = detailPage;
+  const { plugin } = loadPlugin(routes);
+
+  const home = await plugin.getHome();
+  const homeSeries = home.sections.find(section => section.id === 'korean-drama').items[0];
+  assert.equal(homeSeries.title, 'أسطورة البحر الأزرق The Legend of the Blue Sea');
+  assert.equal(homeSeries.searchTitle, 'The Legend of the Blue Sea');
+
+  const catalog = await plugin.getCatalog({ catalogId: 'korean-drama', type: 'series' });
+  assert.equal(catalog.items[0].title, homeSeries.title);
+  assert.equal(catalog.items[0].searchTitle, homeSeries.searchTitle);
+
+  const search = await plugin.search({ groupId: 'series', query: 'Legend' });
+  assert.equal(search.items[0].title, homeSeries.title);
+  assert.equal(search.items[0].searchTitle, homeSeries.searchTitle);
+
+  const details = await plugin.getDetails({ id: '5tv:movie:the-batman' });
+  assert.equal(details.item.title, 'The Batman 2022');
+  assert.equal(details.item.searchTitle, 'The Batman');
 });
 
 test('native identities are reversible, source-scoped, and separate all kinds', () => {

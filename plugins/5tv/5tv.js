@@ -2,7 +2,7 @@
   "use strict";
 
   var PLUGIN_ID = "5tv";
-  var PLUGIN_VERSION = "0.2.0-rc.11";
+  var PLUGIN_VERSION = "0.2.0-rc.12";
   var BASE = "https://5tv.rest";
   var USER_AGENT = "Mozilla/5.0 (Linux; Android 16) AppleWebKit/537.36 Chrome/131 Mobile Safari/537.36";
   var TIMEOUT_MS = 15000;
@@ -116,6 +116,11 @@
     }
 
     return original;
+  }
+  function searchTitleForTmdb(title, type, year) {
+    var source = title == null ? "" : String(title).trim();
+    var cleaned = cleanTitleForTmdb(source, type, year).trim();
+    return cleaned && cleaned !== source ? bounded(cleaned, 180) : undefined;
   }
   function signedWatchHost(url) {
     var host = hostFromUrl(url);
@@ -269,7 +274,11 @@
     if (!title) return null;
     var img = firstMatchRaw(block, /<img\b[^>]*>/i);
     var year = positiveInt(firstMatch(block, /(?:ftv-poster-badge--year|ftv-tax-card__year)[^>]*>([\s\S]*?)<\/span>/i));
-    return { pluginId: PLUGIN_ID, nativeId: idFor(type === "movie" ? "m" : "s", parts.slug), type: type, title: bounded(title, 180), poster: imageUrl(attr(img, "src")), year: year || undefined };
+    title = bounded(title, 180);
+    var searchTitle = searchTitleForTmdb(title, type, year);
+    var item = { pluginId: PLUGIN_ID, nativeId: idFor(type === "movie" ? "m" : "s", parts.slug), type: type, title: title, poster: imageUrl(attr(img, "src")), year: year || undefined };
+    if (searchTitle) item.searchTitle = searchTitle;
+    return item;
   }
   function firstMatchRaw(html, pattern) { var match = pattern.exec(html || ""); return match ? match[0] : ""; }
   function firstSiteHref(html) {
@@ -432,7 +441,12 @@
     var backdrop = firstMatch(styleTag, /--ftv-backdrop\s*:\s*url\s*\(\s*['"]?([^'"\)]+)['"]?\s*\)/i);
     var genres = [], genreRe = /ftv-content-chip--genre[^>]*>([\s\S]*?)<\/a>/gi, gm; while ((gm = genreRe.exec(hero))) genres.push(decodeEntities(gm[1]));
     var runtimeText = firstMatch(hero, /(?:المدة|الوقت|مدة العرض)[^0-9٠-٩۰-۹]{0,30}([0-9٠-٩۰-۹]{1,4})/i);
-    return { pluginId: PLUGIN_ID, nativeId: nativeId, type: type, title: bounded(title, 300), poster: imageUrl(attr(posterTag, "src")), backdrop: imageUrl(backdrop), description: bounded(firstMatch(hero, /ftv-content-hero__description[^>]*>([\s\S]*?)<\/div>/i), 10000) || undefined, year: positiveInt(firstMatch(hero, /ftv-content-hero__year[\s\S]*?<a\b[^>]*>([\s\S]*?)<\/a>/i)) || undefined, genres: dedupe(genres.filter(Boolean), function (v) { return v; }).slice(0, 30), runtime: positiveInt(runtimeText) || undefined, hasParentStreams: type === "movie", episodes: [] };
+    title = bounded(title, 300);
+    var year = positiveInt(firstMatch(hero, /ftv-content-hero__year[\s\S]*?<a\b[^>]*>([\s\S]*?)<\/a>/i)) || undefined;
+    var searchTitle = searchTitleForTmdb(title, type, year);
+    var details = { pluginId: PLUGIN_ID, nativeId: nativeId, type: type, title: title, poster: imageUrl(attr(posterTag, "src")), backdrop: imageUrl(backdrop), description: bounded(firstMatch(hero, /ftv-content-hero__description[^>]*>([\s\S]*?)<\/div>/i), 10000) || undefined, year: year, genres: dedupe(genres.filter(Boolean), function (v) { return v; }).slice(0, 30), runtime: positiveInt(runtimeText) || undefined, hasParentStreams: type === "movie", episodes: [] };
+    if (searchTitle) details.searchTitle = searchTitle;
+    return details;
   }
   function parseEpisodeNumber(value) { var match = /(?:الحلقة|episode|ep)\s*([0-9٠-٩۰-۹]{1,4})/i.exec(normalizeDigits(decodeEntities(value))); return match ? positiveInt(match[1]) : null; }
   function parseSeasonPanels(html) {
@@ -761,5 +775,5 @@
 
   var plugin = { getHome: getHome, getCatalog: getCatalog, getCatalogFilters: getCatalogFilters, search: search, getDetails: getDetails, getStreams: getStreams, resolveStreamOption: resolveStreamOption };
   if (root && root.module) root.module.exports = plugin;
-  if (root && root.__YUME_5TV_TESTING__ && root.module) root.module.exports.__test = { decodeEntities: decodeEntities, decodeHtmlAttributeEntities: decodeHtmlAttributeEntities, extract71StreamMediaFromHtml: extract71StreamMediaFromHtml, hgCloudPlayerUrl: hgCloudPlayerUrl, normalizeDigits: normalizeDigits, cleanTitleForTmdb: cleanTitleForTmdb, pathParts: pathParts, idFor: idFor, parseId: parseId, posterCard: posterCard, catalogItems: catalogItems, parseDetailsPage: parseDetailsPage, parseSeasonPanels: parseSeasonPanels, serverOptions: serverOptions, parseToken: parseToken, mapExtracted: mapExtracted, signedAccessUrl: signedAccessUrl, requestSignedAccessUrl: requestSignedAccessUrl, refreshSignedServerOption: refreshSignedServerOption, hasNextPage: hasNextPage, isVerificationPage: isVerificationPage, searchFormOptions: searchFormOptions, categoryOptions: categoryOptions, discoverSearchPath: discoverSearchPath, homeCatalogIds: HOME_CATALOG_IDS.slice() };
+  if (root && root.__YUME_5TV_TESTING__ && root.module) root.module.exports.__test = { decodeEntities: decodeEntities, decodeHtmlAttributeEntities: decodeHtmlAttributeEntities, extract71StreamMediaFromHtml: extract71StreamMediaFromHtml, hgCloudPlayerUrl: hgCloudPlayerUrl, normalizeDigits: normalizeDigits, cleanTitleForTmdb: cleanTitleForTmdb, searchTitleForTmdb: searchTitleForTmdb, pathParts: pathParts, idFor: idFor, parseId: parseId, posterCard: posterCard, catalogItems: catalogItems, parseDetailsPage: parseDetailsPage, parseSeasonPanels: parseSeasonPanels, serverOptions: serverOptions, parseToken: parseToken, mapExtracted: mapExtracted, signedAccessUrl: signedAccessUrl, requestSignedAccessUrl: requestSignedAccessUrl, refreshSignedServerOption: refreshSignedServerOption, hasNextPage: hasNextPage, isVerificationPage: isVerificationPage, searchFormOptions: searchFormOptions, categoryOptions: categoryOptions, discoverSearchPath: discoverSearchPath, homeCatalogIds: HOME_CATALOG_IDS.slice() };
 })(typeof globalThis !== "undefined" ? globalThis : this);

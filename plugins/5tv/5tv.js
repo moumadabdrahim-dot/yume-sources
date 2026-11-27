@@ -2,7 +2,7 @@
   "use strict";
 
   var PLUGIN_ID = "5tv";
-  var PLUGIN_VERSION = "0.2.0-rc.10";
+  var PLUGIN_VERSION = "0.2.0-rc.11";
   var BASE = "https://5tv.rest";
   var USER_AGENT = "Mozilla/5.0 (Linux; Android 16) AppleWebKit/537.36 Chrome/131 Mobile Safari/537.36";
   var TIMEOUT_MS = 15000;
@@ -86,6 +86,37 @@
     return String(value || "").replace(/[٠-٩۰-۹]/g, function (d) { var code = d.charCodeAt(0); return String(code >= 1776 ? code - 1776 : code - 1632); });
   }
   function positiveInt(value) { var n = Number(normalizeDigits(value)); return isFinite(n) && n > 0 && Math.floor(n) === n ? n : null; }
+  function cleanTitleForTmdb(title, type, year) {
+    var original = title == null ? "" : String(title);
+    var normalizedType = String(type || "").toLowerCase();
+    if (!original) return original;
+
+    if (normalizedType === "series" || normalizedType === "tv") {
+      var lastArabicIndex = -1;
+      var arabic = /[\u0600-\u06ff\u0750-\u077f\u08a0-\u08ff\ufb50-\ufdff\ufe70-\ufeff]/;
+      for (var i = 0; i < original.length; i++) if (arabic.test(original.charAt(i))) lastArabicIndex = i;
+      if (lastArabicIndex < 0) return original;
+
+      var candidate = original.slice(lastArabicIndex + 1).replace(/^[\s:：|\u2013\u2014-]+/, "").trim();
+      if (!candidate || arabic.test(candidate)) return original;
+      var latinWords = candidate.match(/[A-Za-z\u00c0-\u024f]+/g) || [];
+      if (latinWords.length < 2) return original;
+      return candidate;
+    }
+
+    if (normalizedType === "movie") {
+      var trustedYear = normalizeDigits(year == null ? "" : year).trim();
+      if (!/^20\d{2}$/.test(trustedYear)) return original;
+      var ending = /(?:\s+\(([^()]{4})\)|\s+([0-9٠-٩۰-۹]{4}))\s*$/.exec(original);
+      if (!ending) return original;
+      var titleYear = normalizeDigits(ending[1] || ending[2]);
+      if (titleYear !== trustedYear) return original;
+      var withoutYear = original.slice(0, ending.index).trim();
+      return withoutYear || original;
+    }
+
+    return original;
+  }
   function signedWatchHost(url) {
     var host = hostFromUrl(url);
     return host === "71stream.one" || host === "ult4vid.one" || host === "ultra4vid.cam";
@@ -730,5 +761,5 @@
 
   var plugin = { getHome: getHome, getCatalog: getCatalog, getCatalogFilters: getCatalogFilters, search: search, getDetails: getDetails, getStreams: getStreams, resolveStreamOption: resolveStreamOption };
   if (root && root.module) root.module.exports = plugin;
-  if (root && root.__YUME_5TV_TESTING__ && root.module) root.module.exports.__test = { decodeEntities: decodeEntities, decodeHtmlAttributeEntities: decodeHtmlAttributeEntities, extract71StreamMediaFromHtml: extract71StreamMediaFromHtml, hgCloudPlayerUrl: hgCloudPlayerUrl, normalizeDigits: normalizeDigits, pathParts: pathParts, idFor: idFor, parseId: parseId, posterCard: posterCard, catalogItems: catalogItems, parseDetailsPage: parseDetailsPage, parseSeasonPanels: parseSeasonPanels, serverOptions: serverOptions, parseToken: parseToken, mapExtracted: mapExtracted, signedAccessUrl: signedAccessUrl, requestSignedAccessUrl: requestSignedAccessUrl, refreshSignedServerOption: refreshSignedServerOption, hasNextPage: hasNextPage, isVerificationPage: isVerificationPage, searchFormOptions: searchFormOptions, categoryOptions: categoryOptions, discoverSearchPath: discoverSearchPath, homeCatalogIds: HOME_CATALOG_IDS.slice() };
+  if (root && root.__YUME_5TV_TESTING__ && root.module) root.module.exports.__test = { decodeEntities: decodeEntities, decodeHtmlAttributeEntities: decodeHtmlAttributeEntities, extract71StreamMediaFromHtml: extract71StreamMediaFromHtml, hgCloudPlayerUrl: hgCloudPlayerUrl, normalizeDigits: normalizeDigits, cleanTitleForTmdb: cleanTitleForTmdb, pathParts: pathParts, idFor: idFor, parseId: parseId, posterCard: posterCard, catalogItems: catalogItems, parseDetailsPage: parseDetailsPage, parseSeasonPanels: parseSeasonPanels, serverOptions: serverOptions, parseToken: parseToken, mapExtracted: mapExtracted, signedAccessUrl: signedAccessUrl, requestSignedAccessUrl: requestSignedAccessUrl, refreshSignedServerOption: refreshSignedServerOption, hasNextPage: hasNextPage, isVerificationPage: isVerificationPage, searchFormOptions: searchFormOptions, categoryOptions: categoryOptions, discoverSearchPath: discoverSearchPath, homeCatalogIds: HOME_CATALOG_IDS.slice() };
 })(typeof globalThis !== "undefined" ? globalThis : this);

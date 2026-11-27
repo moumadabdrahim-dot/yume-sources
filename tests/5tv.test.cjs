@@ -72,8 +72,9 @@ function loadPlugin(routes = {}, extra = {}) {
 test('manifest declares an isolated API v2 release candidate with stable catalogs', () => {
   const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
   assert.equal(manifest.apiVersion, 2);
-  assert.equal(manifest.version, '0.2.0-rc.10');
-  assert.equal(manifest.scrapers[0].version, '0.2.0-rc.10');
+  assert.equal(manifest.version, '0.2.0-rc.11');
+  assert.equal(manifest.scrapers[0].version, '0.2.0-rc.11');
+  assert.match(script, /var PLUGIN_VERSION = "0\.2\.0-rc\.11";/);
   assert.equal(manifest.scrapers.length, 1);
   const source = manifest.scrapers[0];
   assert.equal(source.id, '5tv');
@@ -88,6 +89,61 @@ test('manifest declares an isolated API v2 release candidate with stable catalog
   assert.ok(source.catalogs.some(row => row.id === 'discover-series' && row.filters.every(filter => filter.dynamic)));
   assert.deepEqual(source.catalogs.find(row => row.id === 'discover-movies').filters.map(filter => filter.key), ['category', 'genre', 'year']);
   assert.deepEqual(source.catalogs.find(row => row.id === 'discover-series').filters.map(filter => filter.key), ['category', 'genre', 'year']);
+});
+
+test('TMDB title cleanup extracts confident Latin series titles without changing the source title', () => {
+  const { plugin } = loadPlugin();
+  const clean = plugin.__test.cleanTitleForTmdb;
+  const samples = [
+    ['أسطورة البحر الأزرق The Legend of the Blue Sea', 'The Legend of the Blue Sea'],
+    ['أصدقائي الأعزاء Dear My Friends', 'Dear My Friends'],
+    ["غريب: حكايات جونجي إيتو للليالي التي لا نوم فيها Strange: Junji Ito's Tales for Sleepless Nights", "Strange: Junji Ito's Tales for Sleepless Nights"],
+    ['Attack on Titan', 'Attack on Titan'],
+    ['مسلسل عربي فقط', 'مسلسل عربي فقط'],
+    ['مسلسل Alpha', 'مسلسل Alpha'],
+    ['مسلسل عربي S2: الحلقة 10', 'مسلسل عربي S2: الحلقة 10'],
+  ];
+  for (const [title, expected] of samples) assert.equal(clean(title, 'series'), expected);
+
+  const sourceItem = { pluginId: '5tv', nativeId: '5tv:series:the-legend', type: 'series', title: samples[0][0], year: 2022 };
+  const snapshot = structuredClone(sourceItem);
+  assert.equal(clean(sourceItem.title, sourceItem.type, sourceItem.year), 'The Legend of the Blue Sea');
+  assert.deepEqual(sourceItem, snapshot);
+});
+
+test('TMDB movie title cleanup removes only a matching trusted trailing production year', () => {
+  const { plugin } = loadPlugin();
+  const clean = plugin.__test.cleanTitleForTmdb;
+  assert.equal(clean('The Batman 2022', 'movie', 2022), 'The Batman');
+  assert.equal(clean('Inception 2010', 'movie', '2010'), 'Inception');
+  assert.equal(clean('Avatar 2026', 'movie', 2026), 'Avatar');
+  assert.equal(clean('Dune (2021)', 'movie', 2021), 'Dune');
+  assert.equal(clean('Dune (٢٠٢١)', 'movie', 2021), 'Dune');
+  assert.equal(clean('Interstellar', 'movie', 2014), 'Interstellar');
+  assert.equal(clean('The Batman 2022', 'movie'), 'The Batman 2022');
+  assert.equal(clean('The Batman 2022', 'movie', 2021), 'The Batman 2022');
+  assert.equal(clean('2001: A Space Odyssey', 'movie', 1968), '2001: A Space Odyssey');
+  assert.equal(clean('Blade Runner 2049', 'movie', 2017), 'Blade Runner 2049');
+  assert.equal(clean('Film 2021 Remastered', 'movie', 2021), 'Film 2021 Remastered');
+  assert.equal(clean('The Batman 2022', 'series', 2022), 'The Batman 2022');
+  assert.equal(clean('The Batman 2022', 'unknown', 2022), 'The Batman 2022');
+});
+
+test('title normalization stays separate from catalog and details content fields', async () => {
+  const { plugin } = loadPlugin({
+    'https://5tv.rest/movie/home-alone-1990/': fixture('movie.html'),
+  });
+  const cardHtml = '<article class="ftv-home-poster-card"><a class="ftv-home-poster-card__title" href="https://5tv.rest/movie/home-alone-1990/">Home Alone 1990</a></article>';
+  const catalogItem = plugin.__test.posterCard(cardHtml);
+  const catalogSnapshot = { ...catalogItem };
+  assert.equal(plugin.__test.cleanTitleForTmdb(catalogItem.title, catalogItem.type, 1990), 'Home Alone 1990');
+  assert.deepEqual({ ...catalogItem }, catalogSnapshot);
+
+  const details = await plugin.getDetails({ id: '5tv:movie:home-alone-1990' });
+  const detailSnapshot = JSON.parse(JSON.stringify(details.item));
+  plugin.__test.cleanTitleForTmdb(details.item.title, details.item.type, details.item.year);
+  assert.deepEqual(JSON.parse(JSON.stringify(details.item)), detailSnapshot);
+  assert.equal(details.item.title, 'Home Alone 1990');
 });
 
 test('native identities are reversible, source-scoped, and separate all kinds', () => {
